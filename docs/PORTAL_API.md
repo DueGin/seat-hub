@@ -1,0 +1,225 @@
+# Portal API 契约（/api）
+
+前后端唯一契约。后端（Go）照此实现，前端（React）照此调用。改动必须先改本文。
+
+## 约定
+
+- JSON。成功 `{"ok":true,"data":…}`；失败 `{"ok":false,"error":{"code":"snake_case","message":"中文可读文案"}}`，HTTP 状态码有意义（400/401/403/404/409/422/429/500/502）。
+- 会话：Cookie `portal_session`。前端 `fetch(..., {credentials:"include"})`。
+- 写请求（POST/PUT/PATCH/DELETE）必须 `Content-Type: application/json`（无 body 时发 `{}`），否则 415 `unsupported_media_type`。
+- 时间：RFC3339 UTC 字符串。金额：整数「分」`*_cents` + `currency`（`CNY`）。vm2api 来源的费用：浮点 `cost_usd`。
+- 分页：`?page=1&page_size=20`（≤100）→ `data: {items:[…], total, page, page_size}`。
+- ID：门面自有实体 `id` 为整数；`order_no` 为字符串（`PT` + 时间戳 + 随机）。
+- 未登录调需登录接口 401 `unauthorized`；非 admin 调 `/api/admin/*` 403 `forbidden`。
+
+## 公共
+
+### `GET /api/public/config`
+```json
+{"site_name":"…","base_url":"https://portal.example.com","registration_open":true,
+ "payment_providers":[{"id":"epay","name":"在线支付"},{"id":"manual","name":"人工转账"},{"id":"mock","name":"模拟支付"}],
+ "dev":false}
+```
+`base_url` 为空时前端用 `location.origin`。
+
+### `GET /api/public/products`
+```json
+{"items":[Product]}
+```
+`Product`:
+```json
+{"id":1,"kind":"concurrency|hosted_seat|rental_account","name":"5 路并发 · 30 天","description":"…",
+ "unit_quantity":5,"duration_days":30,"price_cents":9900,"currency":"CNY",
+ "min_qty":1,"max_qty":20,"enabled":true,"sort_order":0,"badge":"热销",
+ "stock":12}
+```
+`stock` 只有 `rental_account` 有值（整数），其它为 `null`。只返回 `enabled=true`。
+
+## 认证
+
+| 方法 | 路径 | 请求 | 响应 data |
+|---|---|---|---|
+| POST | `/api/auth/register` | `{email,password}`（密码 8–128） | `{user:User}`，同时登录。注册关闭 403 `registration_closed`；邮箱已存在 409 `email_taken` |
+| POST | `/api/auth/login` | `{email,password}` | `{user:User}`。错误 401 `invalid_credentials`；停用 403 `user_disabled`；限速 429 `too_many_attempts` |
+| POST | `/api/auth/logout` | `{}` | `{}` |
+| GET | `/api/auth/me` | — | `{user:User}` |
+| POST | `/api/auth/password` | `{old_password,new_password}` | `{}`；撤销其它会话 |
+
+`User`: `{"id":1,"email":"a@b.c","role":"user|admin","status":"active|disabled","created_at":"…"}`
+
+## 用户：总览与订阅
+
+### `GET /api/me/overview`
+```json
+{"base_url":"https://portal.example.com",
+ "concurrency":{"total":6,"in_use":2,"base":1,"purchased":5,"from_accounts":0},
+ "hosted_seats":{"total":3,"used":2},
+ "rental_accounts":{"total":1,"used":1},
+ "accounts_active":3,
+ "keys":2,
+ "expiring_soon":[Subscription],
+ "usage_today":{"requests":120,"tokens":1234567,"cost_usd":3.21}}
+```
+`expiring_soon`：7 天内到期的 active 订阅。`usage_today` 来自 vm2api（取不到时为 `null`，不伪装 0）。
+
+### `GET /api/me/subscriptions?status=active|expired|all`
+`{items:[Subscription]}`。`Subscription`:
+```json
+{"id":3,"kind":"hosted_seat","quantity":2,"status":"active|expired|cancelled",
+ "starts_at":"…","expires_at":"…","source_order_no":"PT…",
+ "renewable":true,"renew_product_ids":[2,5]}
+```
+`renew_product_ids`：同 kind、`unit_quantity` 能整除 `quantity` 的上架商品。
+
+## 订单与支付
+
+### `POST /api/orders`
+请求 `{product_id, quantity, provider, renew_subscription_id?}`。续费时 `quantity` 忽略（按订阅推算）。
+- 库存不足 409 `out_of_stock`；数量越界 422 `invalid_quantity`；续费 kind 不符/不能整除 422 `renew_mismatch`；提供方未启用 422 `provider_unavailable`。
+- 响应 `{order:Order, payment:Payment}`。`Payment`:
+```json
+{"type":"redirect|qrcode|manual|mock","url":"https://pay…","qr":"weixin://…","instructions":"转账说明…"}
+```
+
+`Order`:
+```json
+{"order_no":"PT20261031…","product_id":1,"product_name":"…","kind":"concurrency","quantity":2,
+ "amount_cents":19800,"currency":"CNY","provider":"epay",
+ "status":"pending|paid|fulfilled|fulfill_failed|cancelled|expired|refunded",
+ "renew_subscription_id":null,"created_at":"…","paid_at":null,"fulfilled_at":null,"expires_at":"…"}
+```
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/orders?page&page_size` | 我的订单 |
+| GET | `/api/orders/{order_no}` | `{order:Order}`，前端支付后轮询 |
+| POST | `/api/orders/{order_no}/cancel` | 仅 `pending` |
+| POST | `/api/orders/{order_no}/mock-pay` | 仅 `PORTAL_DEV=1` 且 provider=mock |
+| GET/POST | `/api/payments/{provider}/notify` | 支付平台异步回调（不走会话、不要求 JSON），按提供方协议回文本 |
+| GET | `/api/payments/{provider}/return` | 同步跳回 → 302 到 `/orders/{order_no}` |
+
+## 账号（资源）
+
+`Account`:
+```json
+{"id":7,"kind":"hosted|rental","label":"主号","email_masked":"ab***@gmail.com",
+ "status":"provisioning|awaiting_auth|bootstrapping|active|needs_reauth|suspended|failed|releasing|released|allocating",
+ "status_reason":null,"tier":"pro|max|null","created_at":"…","expires_at":"…|null",
+ "usage":AccountUsage|null}
+```
+`AccountUsage`（来自 vm2api，取不到为 `null`）:
+```json
+{"available":true,"schedule_state":"on|off|unschedulable|restricted","restriction_text":null,
+ "five_hour":{"utilization":12.5,"resets_at":"…","status":"ok"},
+ "seven_day":{"utilization":34,"resets_at":"…","status":"ok"},
+ "seven_day_fable":null,
+ "estimate_5h":{"status":"ok|no_data|no_reset|log_gap|low_usage|unpriced","spent_usd":1.2,"total_usd":9.6,"remaining_usd":8.4,"used_ratio":0.125},
+ "estimate_7d":{…},
+ "today":Spend,"window_5h":Spend,"window_7d":Spend,
+ "seats_used":1,"seats_max":4,"inflight":1,
+ "fetched_at":"…"}
+```
+`Spend`: `{"requests":10,"input_tokens":1,"output_tokens":2,"cache_read_tokens":3,"cache_creation_tokens":4,"tokens":10,"cost_usd":0.12}`
+utilization 为 0–100；窗口缺失为 `null`。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/accounts?include_released=0` | `{items:[Account]}`（带 usage，后端缓存 30s） |
+| GET | `/api/accounts/{id}` | `{account:Account, daily:[DailyUsage], by_model:[ModelUsage]}` |
+| PATCH | `/api/accounts/{id}` | `{label}` 改备注 |
+
+`DailyUsage`: `{"date":"2026-10-31","requests":1,"tokens":1,"cost_usd":0.1}`；`ModelUsage`: `{"model":"claude-…","requests":1,"tokens":1,"cost_usd":0.1}`
+
+## 托管上号（仅 OAuth 授权链接）
+
+`Onboarding`:
+```json
+{"account_id":7,"status":"provisioning|awaiting_auth|bootstrapping|active|needs_reauth|failed",
+ "auth_url":"https://claude.ai/oauth/authorize?…","auth_url_expires_at":"…",
+ "bootstrap":{"state":"pending|running|succeeded|failed","message":"…"}|null,
+ "error":{"code":"…","message":"…"}|null,
+ "can_regenerate":true}
+```
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/api/hosted` | `{label?}` 新建托管账号。无空余席位 409 `no_free_seat`。响应 `{account:Account, onboarding:Onboarding}`（通常 `provisioning`） |
+| GET | `/api/hosted/{id}/onboarding` | 轮询（前端 2s） |
+| POST | `/api/hosted/{id}/auth-url` | `{}` 重新生成链接（`awaiting_auth`/`needs_reauth`/`failed` 可用） |
+| POST | `/api/hosted/{id}/auth-code` | `{code}`。码格式错 422 `invalid_code`；链接过期 409 `auth_url_expired`；vm2api 换票失败 422 `exchange_failed`（message 为可读原因） |
+| POST | `/api/hosted/{id}/retry` | `{}` `failed` 时重试建槽/初装 |
+| DELETE | `/api/hosted/{id}` | 移除托管账号（销毁凭证、释放席位）。响应 `{}` |
+
+不存在任何其它上号接口（sessionKey / setup-token / 凭证导入）。
+
+## API Key
+
+`ApiKey`: `{"id":1,"name":"默认","prefix":"sk-pt-AbC1","status":"active|disabled","created_at":"…","last_used_at":null}`
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/keys` | `{items:[ApiKey]}` |
+| POST | `/api/keys` | `{name}` → `{key:ApiKey, secret:"sk-pt-…"}`（明文只此一次）。上限 20 个 422 `key_limit` |
+| PATCH | `/api/keys/{id}` | `{name?, status?:"active|disabled"}` |
+| DELETE | `/api/keys/{id}` | |
+| GET | `/api/keys/{id}/stats` | `{daily:[DailyUsage], by_model:[ModelUsage]}`（vm2api 近 30 天） |
+
+## 用量（vm2api 实时数据）
+
+### `GET /api/usage/summary?from=&until=`（默认近 7 天）
+```json
+{"from":"…","until":"…",
+ "totals":Spend,
+ "daily":[DailyUsage],
+ "by_model":[ModelUsage],
+ "by_key":[{"key_id":1,"key_name":"默认","requests":1,"tokens":1,"cost_usd":0.1}],
+ "by_account":[{"account_id":7,"label":"主号","requests":1,"tokens":1,"cost_usd":0.1}],
+ "stats":{"success_rate":0.99,"avg_ttft_ms":820,"p95_ttft_ms":2100,"error_count":3}}
+```
+
+### `GET /api/usage/logs?page&page_size&from&until&model&key_id&status=success|error`
+```json
+{"items":[{"request_id":"…","created_at":"…","model":"…","key_id":1,"key_name":"默认",
+  "account_id":7,"account_label":"主号","stream":true,"status_code":200,"error_label":null,
+  "input_tokens":1,"output_tokens":2,"cache_read_tokens":3,"cache_creation_tokens":4,
+  "cost_usd":0.01,"duration_ms":1234,"first_token_ms":456}],
+ "total":100,"page":1,"page_size":20}
+```
+
+## 管理后台（role=admin）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/admin/dashboard` | `{users, paying_users, revenue_cents_30d, orders_pending, accounts:{hosted_active, rental_active, failed}, rental_pool:{total, available, leased, maintenance}, vm2api:{ok, version, latency_ms, error}}` |
+| GET/POST | `/api/admin/products` | 列表（含未上架）/ 新建 `Product` 字段（无 `id`、`stock`） |
+| PATCH/DELETE | `/api/admin/products/{id}` | 有订单引用时 DELETE 改为下架 |
+| GET | `/api/admin/orders?status&user_id&page` | `Order` + `user_email` |
+| POST | `/api/admin/orders/{order_no}/mark-paid` | `{trade_no?}` 人工确认收款 → 履约 |
+| POST | `/api/admin/orders/{order_no}/cancel` | pending 取消 |
+| POST | `/api/admin/orders/{order_no}/refulfill` | `fulfill_failed` 重试 |
+| GET | `/api/admin/users?q&page` | `User` + `{concurrency_total, hosted_used, hosted_total, rental_used, rental_total, vm2api_user_id}` |
+| GET | `/api/admin/users/{id}` | `{user, subscriptions, accounts, keys, orders}` |
+| PATCH | `/api/admin/users/{id}` | `{status?, role?}`；停用同步停用 vm2api 用户与密钥 |
+| POST | `/api/admin/users/{id}/grant` | `{kind, quantity, duration_days, note}` 赠送订阅（生成 provider=`grant` 的已履约订单） |
+| PATCH | `/api/admin/subscriptions/{id}` | `{expires_at?, status?:"cancelled"}` |
+| GET | `/api/admin/rental-pool` | `{items:[{vm_id, tier, status:"available|leased|maintenance", leased_to_user_id, leased_to_email, note, vm:{label, email_masked, cred_status, schedule_state, tier, five_hour, seven_day}}]}` |
+| GET | `/api/admin/rental-pool/candidates` | vm2api 中未归属、Claude、未入池的 VM：`{items:[{vm_id,label,email_masked,cred_status,schedule_state,tier}]}` |
+| POST | `/api/admin/rental-pool` | `{vm_ids:[…], note?}` 入池 |
+| PATCH | `/api/admin/rental-pool/{vm_id}` | `{status:"available|maintenance", note?}`（`leased` 不可手改） |
+| DELETE | `/api/admin/rental-pool/{vm_id}` | 仅非 leased |
+| GET | `/api/admin/accounts?kind&status&user_id&page` | 全部资源 + `user_email` + `vm_id` + 最近错误 |
+| POST | `/api/admin/accounts/{id}/retry` | 重跑失败步骤 |
+| POST | `/api/admin/accounts/{id}/release` | 强制释放 |
+| GET | `/api/admin/jobs?status=failed|pending|running&page` | `{items:[{id,type,status,attempts,run_after,last_error,payload,created_at,updated_at}]}` |
+| POST | `/api/admin/jobs/{id}/retry` | |
+| GET/PUT | `/api/admin/settings` | `Settings`（PUT 部分更新；密钥字段只写，GET 返回 `"***"` 或空） |
+
+`Settings`:
+```json
+{"site_name":"vm2api 门面","registration_open":true,
+ "base_concurrency":1,"concurrency_per_hosted_seat":0,"concurrency_per_rental_account":0,
+ "hosted_grace_hours":24,"rental_grace_hours":0,"gateway_queue_timeout_ms":0,
+ "hosted_vm_template":{"runtime_type":"docker"},
+ "payment":{"epay":{"enabled":false,"gateway_url":"https://pay.example.com/","pid":"1001","key":"***","types":["alipay","wxpay"]},
+            "manual":{"enabled":true,"instructions":"转账后联系客服…"}}}
+```
