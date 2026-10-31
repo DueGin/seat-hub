@@ -154,8 +154,11 @@ func TestRentalStockSharedPoolAndDeleteReferenced(t *testing.T) {
 	if err != nil || len(public) != 1 || public[0].Stock == nil || *public[0].Stock != 2 {
 		t.Fatalf("public=%+v, err=%v", public, err)
 	}
+	// Without a health probe a VM counts as available: an unconfigured probe
+	// must read as "unknown", never as "sold out" (a fresh install would
+	// otherwise be unable to sell a single rental account).
 	unknown := catalog.New(database, nil)
-	if stock, err := unknown.Stock(ctx, created); err != nil || stock != 0 {
+	if stock, err := unknown.Stock(ctx, created); err != nil || stock != 3 {
 		t.Fatalf("unknown health stock=%d, err=%v", stock, err)
 	}
 	if err := service.Delete(ctx, created.ID); err != nil {

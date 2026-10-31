@@ -214,12 +214,12 @@ utilization 为 0–100；窗口缺失为 `null`。
 | POST | `/api/admin/jobs/{id}/retry` | |
 | GET/PUT | `/api/admin/settings` | `Settings`（PUT 部分更新；密钥字段只写，GET 返回 `"***"` 或空） |
 
-`Settings`:
+`Settings`（全新安装也返回完整的 `payment` 两段文档，前端可直接读 `payment.epay.*` / `payment.manual.*`）:
 ```json
 {"site_name":"vm2api 门面","registration_open":true,
  "base_concurrency":1,"concurrency_per_hosted_seat":0,"concurrency_per_rental_account":0,
  "hosted_grace_hours":24,"rental_grace_hours":0,"gateway_queue_timeout_ms":0,
  "hosted_vm_template":{"runtime_type":"docker"},
- "payment":{"epay":{"enabled":false,"gateway_url":"https://pay.example.com/","pid":"1001","key":"***","types":["alipay","wxpay"]},
-            "manual":{"enabled":true,"instructions":"转账后联系客服…"}}}
+ "payment":{"epay":{"enabled":false,"gateway_url":"","pid":"","key":"***","types":["alipay","wxpay"]},
+            "manual":{"enabled":true,"instructions":"转账后请联系管理员确认收款。"}}}
 ```

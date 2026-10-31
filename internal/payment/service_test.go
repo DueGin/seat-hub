@@ -199,9 +199,6 @@ func TestServiceNotifyRejects(t *testing.T) {
 		{"wrong provider", "provider_unavailable", func(f *serviceFixture) { f.exec(t, `UPDATE orders SET provider = 'manual'`) }, nil, ErrProviderUnavailable, true},
 		{"order missing", "order_not_found", func(f *serviceFixture) { f.exec(t, `DELETE FROM orders`) }, nil, ErrOrderNotFound, true},
 		{"cancelled", "order_not_payable", func(f *serviceFixture) { f.exec(t, `UPDATE orders SET status = 'cancelled'`) }, nil, ErrOrderNotPayable, true},
-		{"expired", "order_not_payable", func(f *serviceFixture) {
-			f.exec(t, `UPDATE orders SET expires_at = ?`, f.now.UTC().Format(time.RFC3339))
-		}, nil, ErrOrderNotPayable, true},
 		{"refunded", "order_not_payable", func(f *serviceFixture) { f.exec(t, `UPDATE orders SET status = 'refunded'`) }, nil, ErrOrderNotPayable, true},
 		{"different trade", "trade_conflict", func(f *serviceFixture) {
 			f.exec(t, `UPDATE orders SET status = 'paid', provider_trade_no = 'other-trade'`)
@@ -226,6 +223,20 @@ func TestServiceNotifyRejects(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A late callback for an order whose payment window closed must still settle:
+// the gateway was already asked for money and the user paid.
+func TestServiceLateCallbackStillSettles(t *testing.T) {
+	f := newServiceFixture(t)
+	f.exec(t, `UPDATE orders SET expires_at = ?`, f.now.UTC().Format(time.RFC3339))
+	if _, err := f.svc.Notify(context.Background(), "epay", signedRequest(testNoticeParams(), http.MethodGet)); err != nil {
+		t.Fatalf("late callback rejected: %v", err)
+	}
+	if f.calls.Load() != 1 {
+		t.Fatalf("marker calls = %d, want 1", f.calls.Load())
+	}
+	f.assertEvent(t, "applied", true)
 }
 
 func TestServiceNotifyVerifiedRejections(t *testing.T) {
@@ -333,14 +344,18 @@ func TestServiceRejectsPublicOfflineNotify(t *testing.T) {
 		if _, err := f.svc.Notify(context.Background(), provider, httptest.NewRequest(http.MethodGet, "/notify?paid=true", nil)); !errors.Is(err, want) {
 			t.Fatalf("%s notify error = %v", provider, err)
 		}
-		result := "rejected:notify_unsupported"
-		if provider == "unknown" {
-			result = "rejected:provider_unavailable"
-		}
-		f.assertEvent(t, result, false)
 	}
 	if f.calls.Load() != 0 {
 		t.Fatal("public offline callback marked paid")
+	}
+	// Anyone can POST here, so a rejected callback must leave no trace in the
+	// event table: only notifications that reference a real order are recorded.
+	var events int
+	if err := f.db.QueryRow(`SELECT COUNT(1) FROM payment_events`).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	if events != 0 {
+		t.Fatalf("unauthenticated callbacks wrote %d payment events", events)
 	}
 }
 
@@ -415,8 +430,10 @@ func TestServiceConfiguration(t *testing.T) {
 func TestServiceEventFailurePreservesCause(t *testing.T) {
 	f := newServiceFixture(t)
 	f.exec(t, `DROP TABLE payment_events`)
-	_, err := f.svc.Notify(context.Background(), "manual", httptest.NewRequest(http.MethodGet, "/notify", nil))
-	if !errors.Is(err, ErrNotifyUnsupported) || !strings.Contains(fmt.Sprint(err), "record payment event") {
-		t.Fatalf("missing original or recording error: %v", err)
+	// A signed notification for a real order is the path that records an event;
+	// when that write fails the provider's own error must survive alongside it.
+	_, err := f.svc.Notify(context.Background(), "epay", signedRequest(testNoticeParams(), http.MethodPost))
+	if err == nil || !strings.Contains(fmt.Sprint(err), "record payment event") {
+		t.Fatalf("missing recording error: %v", err)
 	}
 }

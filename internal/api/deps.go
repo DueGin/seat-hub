@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -22,18 +23,36 @@ type errMapping struct {
 	u        *UserError
 }
 
-var errMappings []errMapping
+var (
+	errMappings []errMapping
+	errMu       sync.RWMutex
+)
 
 // Err registers a sentinel error with its HTTP mapping and returns the
 // sentinel, so packages can write `var ErrFoo = api.Err(errors.New("foo"), 404, "foo", "…")`.
+//
+// Prefer package-level registration. Callers do construct mappings on the
+// request path, so the registry is guarded and deduplicated by sentinel: the
+// same sentinel re-registered with the same code is a no-op instead of an
+// unbounded append.
 func Err(sentinel error, status int, code, message string) error {
+	errMu.Lock()
+	defer errMu.Unlock()
+	for i := range errMappings {
+		if errMappings[i].sentinel == sentinel && errMappings[i].u.Code == code {
+			return sentinel
+		}
+	}
 	errMappings = append(errMappings, errMapping{sentinel: sentinel, u: &UserError{Status: status, Code: code, Message: message}})
 	return sentinel
 }
 
 // AsUserError maps a known sentinel to its UserError; nil when unknown.
 func AsUserError(err error) *UserError {
-	for _, m := range errMappings {
+	errMu.RLock()
+	mappings := errMappings
+	errMu.RUnlock()
+	for _, m := range mappings {
 		if errors.Is(err, m.sentinel) {
 			return m.u
 		}
@@ -320,6 +339,16 @@ type AuthService interface {
 	Allowed(ip, email string) bool
 	HashPassword(password string) (string, error)
 	VerifyPassword(userID int64, password string) bool
+}
+
+// SessionRevoker lets the password-change handler drop every session of a user
+// except the one that performed the change (PORTAL_API.md: 撤销其它会话).
+//
+// It is a separate interface rather than a member of AuthService so a service
+// that cannot revoke sessions still satisfies AuthService; the handler only
+// enables revocation when the implementation supports it.
+type SessionRevoker interface {
+	RevokeOthers(ctx context.Context, userID int64, keepTokenHash string) error
 }
 
 type CatalogService interface {

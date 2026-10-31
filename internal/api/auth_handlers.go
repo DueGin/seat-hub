@@ -4,9 +4,14 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 
+	"github.com/DueGin/vm2api-portal/internal/auth"
 	"github.com/DueGin/vm2api-portal/internal/store"
 )
+
+// firstUserMu serialises the "first user becomes admin" check and create.
+var firstUserMu sync.Mutex
 
 var (
 	ErrEmailTaken         = Err(errors.New("email taken"), http.StatusConflict, "email_taken", "该邮箱已注册")
@@ -42,14 +47,16 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnprocessableEntity, "invalid_password", err.Error())
 		return
 	}
-	// The first registered user becomes the admin when no admin exists yet.
+	// The first registered user becomes the admin when the deployment has no
+	// users yet. Serialised because two concurrent first registrations would
+	// otherwise both observe an empty table and both become admin.
 	role := "user"
-	if admins, err := s.Deps.Users.CountAdmins(r.Context()); err == nil && admins == 0 {
-		if n, _ := s.Deps.Users.Count(r.Context()); n == 0 {
-			role = "admin"
-		}
+	firstUserMu.Lock()
+	if n, err := s.Deps.Users.Count(r.Context()); err == nil && n == 0 {
+		role = "admin"
 	}
 	u, err := s.Deps.Users.Create(r.Context(), email, hash, role)
+	firstUserMu.Unlock()
 	if err != nil {
 		out := ErrEmailTaken
 		if !strings.Contains(err.Error(), "email already registered") {
@@ -84,11 +91,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	token, u, err := s.Deps.Auth.Login(r.Context(), email, body.Password, clientIP(r), r.UserAgent())
 	if err != nil {
+		// auth.ErrUserDisabled is a different sentinel from this package's
+		// ErrUserDisabled; the contract wants 403 user_disabled for a disabled
+		// account, so match the service's error explicitly.
 		mapped := ErrInvalidCredentials
-		if errors.Is(err, store.ErrNotFound) || errors.Is(err, ErrInvalidCredentials) {
-			mapped = ErrInvalidCredentials
-		} else if errors.Is(err, ErrUserDisabled) {
+		switch {
+		case errors.Is(err, auth.ErrUserDisabled), errors.Is(err, ErrUserDisabled):
 			mapped = ErrUserDisabled
+		case errors.Is(err, store.ErrNotFound), errors.Is(err, auth.ErrInvalidCredentials),
+			errors.Is(err, ErrInvalidCredentials):
+			mapped = ErrInvalidCredentials
 		}
 		s.fail(w, r, mapped)
 		return
@@ -141,10 +153,19 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, r, err)
 		return
 	}
-	if h := s.Deps.Auth.TokenHashFrom(r.Context()); h != "" {
-		_ = s.Deps.Auth.Logout(r.Context(), h) // revoke this session too
+	// PORTAL_API.md: changing the password revokes the user's other sessions.
+	// The current one is kept so the caller is not logged out mid-flow (the
+	// cookie stays valid). Rotating a password after a compromise is useless
+	// if the attacker's session outlives it.
+	keep := s.Deps.Auth.TokenHashFrom(r.Context())
+	if revoker, ok := s.Deps.Auth.(SessionRevoker); ok {
+		if err := revoker.RevokeOthers(r.Context(), u.ID, keep); err != nil {
+			s.fail(w, r, err)
+			return
+		}
+	} else {
+		s.Log.Warn("auth service cannot revoke other sessions", "user_id", u.ID)
 	}
-	s.Deps.Auth.ClearCookie(w)
 	s.Deps.Audit.Write(r.Context(), u.ID, "user.password", u.Email, nil)
 	writeOK(w, map[string]any{})
 }

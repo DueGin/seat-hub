@@ -23,6 +23,10 @@ type usersAdapter struct {
 	users  *store.Users
 	db     *sql.DB
 	client vm2api.Client
+	// entitle is injected by the wiring layer (provision.Service.Entitlements).
+	// It is a function rather than a concrete service to keep this package's
+	// dependency graph acyclic.
+	entitle func(ctx context.Context, userID int64) (api.AdminUserDTO, error)
 }
 
 func toUserDTO(u store.User) api.UserDTO {
@@ -128,9 +132,10 @@ func (a *usersAdapter) AdminList(ctx context.Context, q string, page, pageSize i
 	}
 	out := make([]api.AdminUserDTO, 0, len(items))
 	for _, u := range items {
-		out = append(out, api.AdminUserDTO{UserDTO: toUserDTO(u), VM2APIUserID: u.VM2APIUserID})
+		dto := api.AdminUserDTO{UserDTO: toUserDTO(u), VM2APIUserID: u.VM2APIUserID}
+		a.fillEntitlement(ctx, u.ID, &dto)
+		out = append(out, dto)
 	}
-	// Entitlement counters are filled by the entitlement service in app.go.
 	return out, total, nil
 }
 
@@ -142,7 +147,27 @@ func (a *usersAdapter) AdminDetail(ctx context.Context, id int64) (api.AdminUser
 	if err != nil {
 		return api.AdminUserDTO{}, err
 	}
-	return api.AdminUserDTO{UserDTO: toUserDTO(u), VM2APIUserID: u.VM2APIUserID}, nil
+	dto := api.AdminUserDTO{UserDTO: toUserDTO(u), VM2APIUserID: u.VM2APIUserID}
+	a.fillEntitlement(ctx, u.ID, &dto)
+	return dto, nil
+}
+
+// fillEntitlement attaches the concurrency and seat counters the admin console
+// shows. A failure leaves the counters at zero rather than failing the list:
+// the page is still usable without them.
+func (a *usersAdapter) fillEntitlement(ctx context.Context, userID int64, dto *api.AdminUserDTO) {
+	if a.entitle == nil {
+		return
+	}
+	withEnt, err := a.entitle(ctx, userID)
+	if err != nil {
+		return
+	}
+	dto.ConcurrencyTotal = withEnt.ConcurrencyTotal
+	dto.HostedUsed = withEnt.HostedUsed
+	dto.HostedTotal = withEnt.HostedTotal
+	dto.RentalUsed = withEnt.RentalUsed
+	dto.RentalTotal = withEnt.RentalTotal
 }
 
 // settingsAdapter implements api.SettingsStore over settings + secret.Box.

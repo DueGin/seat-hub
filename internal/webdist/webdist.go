@@ -1,6 +1,6 @@
 // Package webdist serves the built SPA. `make web` copies web/dist here before
 // `go build`, so the released binary is self-contained. During development run
-// the Vite dev server and point PORTAL_WEB_DIR at web/dist instead.
+// the Vite dev server (web/ on :5173, proxying /api and /v1) instead.
 package webdist
 
 import (

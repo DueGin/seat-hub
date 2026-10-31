@@ -63,22 +63,50 @@ func VerifyPassword(hash, password string) bool {
 
 // Limiter is a tiny sliding-window attempt limiter keyed by IP + email. It is
 // deliberately in-memory: a single portal instance owns login throttling.
+//
+// The map is attacker-reachable (every unauthenticated login attempt creates a
+// key), so entries are swept lazily and the whole table is bounded: past
+// maxLimiterKeys it is dropped wholesale, which costs one window of throttling
+// but never unbounded memory.
 type Limiter struct {
-	mu      sync.Mutex
-	buckets map[string][]time.Time
-	limit   int
-	window  time.Duration
+	mu        sync.Mutex
+	buckets   map[string][]time.Time
+	limit     int
+	window    time.Duration
+	maxKeys   int
+	lastSweep time.Time
 }
 
+// maxLimiterKeys caps the number of distinct keys kept between sweeps.
+const maxLimiterKeys = 10000
+
+// maxLimiterKeyLen bounds the caller-controlled part of the key. An email is
+// capped at 254 bytes, and the IP prefix adds at most 46, so anything longer
+// cannot be a legitimate key.
+const maxLimiterKeyLen = 320
+
 func NewLimiter(limit int, window time.Duration) *Limiter {
-	return &Limiter{buckets: map[string][]time.Time{}, limit: limit, window: window}
+	return &Limiter{
+		buckets:   map[string][]time.Time{},
+		limit:     limit,
+		window:    window,
+		maxKeys:   maxLimiterKeys,
+		lastSweep: time.Now(),
+	}
 }
 
 // Allow records an attempt and reports whether it is within the limit.
 func (l *Limiter) Allow(key string) bool {
+	if len(key) > maxLimiterKeyLen {
+		key = key[:maxLimiterKeyLen]
+	}
+	now := time.Now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	cutoff := time.Now().Add(-l.window)
+	cutoff := now.Add(-l.window)
+
+	l.sweepLocked(cutoff, now)
+
 	old := l.buckets[key]
 	kept := old[:0]
 	for _, t := range old {
@@ -90,8 +118,40 @@ func (l *Limiter) Allow(key string) bool {
 		l.buckets[key] = kept
 		return false
 	}
-	l.buckets[key] = append(kept, time.Now())
+	l.buckets[key] = append(kept, now)
 	return true
+}
+
+// sweepLocked drops expired buckets once per window and enforces the cap.
+func (l *Limiter) sweepLocked(cutoff, now time.Time) {
+	if now.Sub(l.lastSweep) >= l.window {
+		for k, times := range l.buckets {
+			fresh := 0
+			for _, t := range times {
+				if t.After(cutoff) {
+					fresh++
+					break
+				}
+			}
+			if fresh == 0 {
+				delete(l.buckets, k)
+			}
+		}
+		l.lastSweep = now
+	}
+	if len(l.buckets) >= l.maxKeys {
+		// Still full after sweeping: start over. Existing attempts lose their
+		// history, but only an attacker can drive the table this far.
+		l.buckets = map[string][]time.Time{}
+		l.lastSweep = now
+	}
+}
+
+// Len reports the number of tracked keys; used by tests.
+func (l *Limiter) Len() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.buckets)
 }
 
 // ParseInt is a small helper used by handlers for query parameters.

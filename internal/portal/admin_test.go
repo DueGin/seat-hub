@@ -90,6 +90,15 @@ func adminWantError(t *testing.T, err error, status int, code string) {
 	}
 }
 
+// adminPoolVM makes one rental account available so a rental grant can be
+// allocated. The VM is registered upstream too: allocation assigns the owner.
+func adminPoolVM(t *testing.T, service *Service, client *adminClient, vmID string) int64 {
+	t.Helper()
+	client.AddVM(vm2api.VM{ID: vmID, Label: vmID, Platform: "anthropic", Origin: "platform", CredStatus: "valid"})
+	stamp := store.FmtTime(service.now())
+	return adminExec(t, service, `INSERT INTO rental_pool(vm_id,status,created_at,updated_at) VALUES (?,'available',?,?)`, vmID, stamp, stamp)
+}
+
 func adminProduct(t *testing.T, service *Service, kind string) int64 {
 	t.Helper()
 	stamp := store.FmtTime(service.now())
@@ -397,7 +406,7 @@ func TestAdminPatchSubscriptionExpiryAndValidation(t *testing.T) {
 }
 
 func TestAdminTransactionsRollback(t *testing.T) {
-	service, _ := adminFixture(t)
+	service, client := adminFixture(t)
 	ctx := context.Background()
 	adminExec(t, service, `CREATE TRIGGER admin_fail_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT,'audit unavailable'); END`)
 	if err := service.GrantSubscription(ctx, 1, 2, "concurrency", 1, 30, "回滚"); err == nil {
@@ -409,6 +418,7 @@ func TestAdminTransactionsRollback(t *testing.T) {
 		}
 	}
 	adminExec(t, service, `DROP TRIGGER admin_fail_audit`)
+	adminPoolVM(t, service, client, "grant-rental")
 	if err := service.GrantSubscription(ctx, 1, 2, "rental_account", 1, 30, "原始赠送"); err != nil {
 		t.Fatal(err)
 	}
@@ -457,5 +467,65 @@ func TestAdminPreservesUpstreamAndDatabaseErrors(t *testing.T) {
 	_, _, err = service.Jobs(ctx, "", 1, 20)
 	if err == nil || errors.Unwrap(err) == nil || errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("closed database error was not wrapped: %v", err)
+	}
+}
+
+func TestAdminGrantRentalAllocatesAccount(t *testing.T) {
+	service, client := adminFixture(t)
+	ctx := context.Background()
+	adminWantError(t, service.GrantSubscription(ctx, 1, 2, "rental_account", 1, 30, "无库存"), 409, "out_of_stock")
+	if count := adminCount(t, service, `SELECT COUNT(*) FROM subscriptions`); count != 0 {
+		t.Fatalf("grant without stock created %d subscriptions", count)
+	}
+	adminPoolVM(t, service, client, "grant-vm")
+	if err := service.GrantSubscription(ctx, 1, 2, "rental_account", 1, 30, "赠送一个号"); err != nil {
+		t.Fatal(err)
+	}
+	var subscriptionID, resourceID int64
+	var status string
+	if err := service.db.QueryRow(`SELECT subscription_id, id, status FROM resources WHERE user_id=2 AND kind='rental'`).Scan(&subscriptionID, &resourceID, &status); err != nil {
+		t.Fatalf("grant allocated no account: %v", err)
+	}
+	if status != "active" || subscriptionID == 0 {
+		t.Fatalf("resource=%d status=%s subscription=%d", resourceID, status, subscriptionID)
+	}
+	if count := adminCount(t, service, `SELECT COUNT(*) FROM rental_pool WHERE status='leased' AND leased_resource_id=?`, resourceID); count != 1 {
+		t.Fatal("rental pool row was not leased")
+	}
+	usage, err := client.GetAccountUsage(ctx, "grant-vm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.VM.OwnerUserID == "" || usage.VM.ScheduleState != "on" {
+		t.Fatalf("upstream owner=%q schedule=%s", usage.VM.OwnerUserID, usage.VM.ScheduleState)
+	}
+}
+
+func TestAdminPatchRentalSubscriptionReallocates(t *testing.T) {
+	service, client := adminFixture(t)
+	ctx := context.Background()
+	adminPoolVM(t, service, client, "patch-rental")
+	if err := service.GrantSubscription(ctx, 1, 2, "rental_account", 1, 30, "赠送"); err != nil {
+		t.Fatal(err)
+	}
+	var subscriptionID, resourceID int64
+	if err := service.db.QueryRow(`SELECT id FROM subscriptions`).Scan(&subscriptionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.db.QueryRow(`SELECT id FROM resources WHERE subscription_id=?`, subscriptionID).Scan(&resourceID); err != nil {
+		t.Fatal(err)
+	}
+	// Releasing the account while the subscription stays alive models the "号
+	// 已释放" state; extending the subscription must bring an account back.
+	if err := service.provisioning.ReleaseResource(ctx, resourceID); err != nil {
+		t.Fatal(err)
+	}
+	adminPoolVM(t, service, client, "patch-rental-2")
+	future := store.FmtTime(service.now().AddDate(0, 0, 60))
+	if err := service.PatchSubscription(ctx, subscriptionID, &future, ""); err != nil {
+		t.Fatal(err)
+	}
+	if count := adminCount(t, service, `SELECT COUNT(*) FROM resources WHERE subscription_id=? AND status='active'`, subscriptionID); count != 1 {
+		t.Fatalf("active rental accounts=%d after extension", count)
 	}
 }

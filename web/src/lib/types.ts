@@ -2,7 +2,7 @@ export interface User { id: number; email: string; role: 'user' | 'admin'; statu
 export interface PublicConfig { site_name: string; base_url: string; registration_open: boolean; payment_providers: { id: string; name: string }[]; dev: boolean }
 export type ProductKind = 'concurrency' | 'hosted_seat' | 'rental_account'
 export interface Product { id: number; kind: ProductKind; name: string; description: string; unit_quantity: number; duration_days: number; price_cents: number; currency: string; min_qty: number; max_qty: number; enabled: boolean; sort_order: number; badge: string; stock: number | null }
-export interface Subscription { id: number; kind: ProductKind; quantity: number; status: string; starts_at: string; expires_at: string; source_order_no: string; renewable: boolean; renew_product_ids: number[] }
+export interface Subscription { id: number; kind: ProductKind; quantity: number; status: string; starts_at: string; expires_at: string; source_order_no?: string | null; renewable: boolean; renew_product_ids: number[] }
 export interface Spend { requests: number; tokens: number; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_creation_tokens: number; cost_usd: number }
 export interface DailyUsage { date: string; requests: number; tokens: number; cost_usd: number }
 export interface ModelUsage { model: string; requests: number; tokens: number; cost_usd: number }
@@ -19,9 +19,20 @@ export interface UsageLog { request_id: string; created_at: string; model: strin
 export interface Page<T> { items: T[]; total: number; page: number; page_size: number }
 export interface Order { order_no: string; product_id: number; product_name: string; kind: ProductKind; quantity: number; amount_cents: number; currency: string; provider: string; status: string; renew_subscription_id: number | null; created_at: string; paid_at: string | null; fulfilled_at: string | null; expires_at: string; user_email?: string }
 export interface Payment { type: 'redirect' | 'qrcode' | 'manual' | 'mock'; url?: string; qr?: string; instructions?: string }
-export interface Settings { site_name: string; registration_open: boolean; base_concurrency: number; concurrency_per_hosted_seat: number; concurrency_per_rental_account: number; hosted_grace_hours: number; rental_grace_hours: number; gateway_queue_timeout_ms: number; hosted_vm_template: Record<string, unknown>; payment: { epay: { enabled: boolean; gateway_url: string; pid: string; key: string; types: string[] }; manual: { enabled: boolean; instructions: string } } }
+// Every field is optional-tolerant: a fresh install or an older stored document can omit
+// whole blocks (notably payment), so readers must not assume the shape is complete.
+export interface EpaySettings { enabled?: boolean; gateway_url?: string; pid?: string; key?: string; types?: string[] }
+export interface ManualSettings { enabled?: boolean; instructions?: string }
+export interface PaymentSettings { epay?: EpaySettings; manual?: ManualSettings }
+export interface Settings { site_name?: string; registration_open?: boolean; base_concurrency?: number; concurrency_per_hosted_seat?: number; concurrency_per_rental_account?: number; hosted_grace_hours?: number; rental_grace_hours?: number; gateway_queue_timeout_ms?: number; hosted_vm_template?: Record<string, unknown>; payment?: PaymentSettings }
+// NormalizedSettings is what the settings editor and validateSettings return: the same
+// document with every block filled in, so the form never renders an undefined field.
+export interface NormalizedSettings extends Omit<Settings, 'payment'> {
+  site_name: string; registration_open: boolean; base_concurrency: number; concurrency_per_hosted_seat: number; concurrency_per_rental_account: number; hosted_grace_hours: number; rental_grace_hours: number; gateway_queue_timeout_ms: number; hosted_vm_template: Record<string, unknown>
+  payment: { epay: { enabled: boolean; gateway_url: string; pid: string; key: string; types: string[] }; manual: { enabled: boolean; instructions: string } }
+}
 export interface AdminDashboard { users: number; paying_users: number; revenue_cents_30d: number; orders_pending: number; accounts: { hosted_active: number; rental_active: number; failed: number }; rental_pool: { total: number; available: number; leased: number; maintenance: number }; vm2api: { ok: boolean; version: string; latency_ms: number; error: string | null } }
 export interface AdminUser extends User { concurrency_total: number; hosted_used: number; hosted_total: number; rental_used: number; rental_total: number; vm2api_user_id: string | null }
 export interface PoolCandidate { vm_id: string; label: string; email_masked: string; cred_status: string; schedule_state: string; tier: string | null }
-export interface PoolItem { vm_id: string; tier: string | null; status: 'available' | 'leased' | 'maintenance'; leased_to_user_id: number | null; leased_to_email: string | null; note: string; vm: Omit<PoolCandidate, 'vm_id'> & { five_hour: UsageWindow | null; seven_day: UsageWindow | null } }
+export interface PoolItem { vm_id: string; tier: string | null; status: 'available' | 'leased' | 'maintenance'; leased_to_user_id?: number | null; leased_to_email?: string | null; note: string; vm: Omit<PoolCandidate, 'vm_id'> & { five_hour: UsageWindow | null; seven_day: UsageWindow | null } }
 export interface Job { id: number; type: string; status: string; attempts: number; run_after: string; last_error: string | null; payload: unknown; created_at: string; updated_at: string }

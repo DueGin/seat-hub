@@ -6,6 +6,22 @@ import { dateTime, number } from '@/lib/format'
 import type { Job, Page } from '@/lib/types'
 import { adminPath, ConfirmAction, jobLabels, ListPagination, Select, useAdminFilters, useAdminMutation } from './shared'
 
+const emptyPayloadText = '暂无载荷'
+
+// The backend serializes payload as a JSON *string* (JobDTO.Payload is a Go string), so
+// stringify-ing it again would show the escaped text. Parse a string first, re-format the
+// result, and fall back to the raw text when it is not valid JSON. Objects stay supported
+// in case the contract ever starts returning structured payloads.
+export function payloadText(payload: unknown): string {
+  if (payload === null || payload === undefined) return emptyPayloadText
+  if (typeof payload === 'string') {
+    const trimmed = payload.trim()
+    if (!trimmed) return emptyPayloadText
+    try { return JSON.stringify(JSON.parse(trimmed), null, 2) } catch { return payload }
+  }
+  try { return JSON.stringify(payload, null, 2) ?? String(payload) } catch { return String(payload) }
+}
+
 export function Jobs() {
   const { params, page, update, setPage } = useAdminFilters()
   const status = params.get('status') ?? 'failed'
@@ -20,6 +36,6 @@ export function Jobs() {
       {!query.isError && <ListPagination data={query.data} onChange={setPage} />}
     </Card>
     {retrying && <ConfirmAction title="重试失败任务" description={`确认将任务 #${retrying.id} 重新加入执行队列？请先核对失败原因，避免重复触发同类故障。`} pending={mutation.isPending} error={mutation.error} onClose={() => setRetrying(null)} onConfirm={() => mutation.mutate(retrying)} label="确认重试" />}
-    {detail && <Modal open wide title={`任务详情 #${detail.id}`} onClose={() => setDetail(null)}><div className="stack"><dl className="stack"><div className="row"><dt>任务类型</dt><dd className="mono">{detail.type}</dd></div><div className="row"><dt>状态</dt><dd><Badge status={detail.status} /></dd></div><div className="row"><dt>尝试次数</dt><dd>{detail.attempts}</dd></div><div className="row"><dt>创建时间</dt><dd>{dateTime(detail.created_at)}</dd></div><div className="row"><dt>最早执行时间</dt><dd>{dateTime(detail.run_after)}</dd></div><div className="row"><dt>更新时间</dt><dd>{dateTime(detail.updated_at)}</dd></div></dl><h3>最近错误</h3><p className="mono">{detail.last_error || '暂无错误记录'}</p><h3>任务载荷</h3><div className="table-wrap"><pre className="mono">{JSON.stringify(detail.payload, null, 2) ?? '暂无载荷'}</pre></div></div></Modal>}
+    {detail && <Modal open wide title={`任务详情 #${detail.id}`} onClose={() => setDetail(null)}><div className="stack"><dl className="stack"><div className="row"><dt>任务类型</dt><dd className="mono">{detail.type}</dd></div><div className="row"><dt>状态</dt><dd><Badge status={detail.status} /></dd></div><div className="row"><dt>尝试次数</dt><dd>{detail.attempts}</dd></div><div className="row"><dt>创建时间</dt><dd>{dateTime(detail.created_at)}</dd></div><div className="row"><dt>最早执行时间</dt><dd>{dateTime(detail.run_after)}</dd></div><div className="row"><dt>更新时间</dt><dd>{dateTime(detail.updated_at)}</dd></div></dl><h3>最近错误</h3><p className="mono">{detail.last_error || '暂无错误记录'}</p><h3>任务载荷</h3><div className="table-wrap"><pre className="mono">{payloadText(detail.payload)}</pre></div></div></Modal>}
   </div>
 }

@@ -717,3 +717,213 @@ func TestProvisionRentalCleanupFailureQuarantinesStock(t *testing.T) {
 		t.Fatalf("maintenance=%d", maintenance)
 	}
 }
+
+// refusedOwnerClient fails every ownership assignment, so a hosted VM is built
+// but never handed to the buyer.
+type refusedOwnerClient struct {
+	vm2api.Client
+}
+
+func (client *refusedOwnerClient) SetVMOwner(ctx context.Context, vmID string, owner *string) error {
+	if owner != nil {
+		return errors.New("owner assignment refused")
+	}
+	return client.Client.SetVMOwner(ctx, vmID, owner)
+}
+
+func TestProvisionAuthLinkRequiresOwnerAndProxy(t *testing.T) {
+	service, fake, userID := provisionFixture(t)
+	ctx := context.Background()
+	service.client = &refusedOwnerClient{Client: fake}
+	addSubscription(t, service, userID, "hosted_seat", 1, service.now().Add(time.Hour))
+	account, err := service.CreateHosted(ctx, userID, "无权账号")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ProvisionHosted(ctx, account.ID); err == nil {
+		t.Fatal("provisioning succeeded without an owner")
+	}
+	account, err = service.Account(ctx, userID, account.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if account.Status != "failed" || account.StatusReason == nil || *account.StatusReason != stageOwner {
+		t.Fatalf("failed account=%+v", account)
+	}
+	if _, err := service.GenerateAuthURL(ctx, userID, account.ID); err == nil {
+		t.Fatal("auth link issued for a VM without an owner")
+	}
+	var sessions int
+	if err := service.db.QueryRow(`SELECT COUNT(*) FROM oauth_sessions WHERE resource_id=?`, account.ID).Scan(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	if sessions != 0 {
+		t.Fatalf("oauth sessions=%d", sessions)
+	}
+	if err := service.SubmitAuthCode(ctx, userID, account.ID, "", "code"); err == nil {
+		t.Fatal("authorization code accepted for a VM without an owner")
+	}
+	service.client = fake
+	auth, err := service.GenerateAuthURL(ctx, userID, account.ID)
+	if err != nil {
+		t.Fatalf("auth link after repair: %v", err)
+	}
+	if err := service.SubmitAuthCode(ctx, userID, account.ID, auth.SessionID, "code"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProvisionSyncConcurrencyNeverWritesZero(t *testing.T) {
+	service, fake, userID := provisionFixture(t)
+	ctx := context.Background()
+	var owner string
+	if err := service.db.QueryRow(`SELECT vm2api_user_id FROM users WHERE id=?`, userID).Scan(&owner); err != nil {
+		t.Fatal(err)
+	}
+	key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "zero", UserID: owner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.db.Exec(`INSERT INTO api_keys(user_id,name,key_hash,prefix,vm2api_key_id,vm2api_secret_enc,status,created_at,updated_at) VALUES (?,'zero','hash','prefix',?,'encrypted','active',?,?)`, userID, key.ID, timestamp(service.now()), timestamp(service.now())); err != nil {
+		t.Fatal(err)
+	}
+	// No subscription at all: effective concurrency is 0, which must reach the
+	// upstream key as 1 (0 means unlimited to vm2api).
+	if err := service.SyncConcurrency(ctx, userID); err != nil {
+		t.Fatal(err)
+	}
+	var synced int
+	if err := service.db.QueryRow(`SELECT synced_concurrency FROM api_keys WHERE vm2api_key_id=?`, key.ID).Scan(&synced); err != nil {
+		t.Fatal(err)
+	}
+	if synced != 1 {
+		t.Fatalf("synced concurrency=%d, want 1", synced)
+	}
+	stats, err := fake.KeyStats(ctx, key.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = stats
+}
+
+// failingSyncClient refuses key updates for one user's keys, as a deleted or
+// unreachable upstream key would.
+type failingSyncClient struct {
+	vm2api.Client
+}
+
+func (client *failingSyncClient) UpdateKey(ctx context.Context, keyID string, in vm2api.UpdateKeyInput) error {
+	return errors.New("upstream key unavailable")
+}
+
+func TestProvisionSweepIsolatesUserFailures(t *testing.T) {
+	service, fake, first := provisionFixture(t)
+	ctx := context.Background()
+	now := service.now().Truncate(time.Second)
+	service.Now = func() time.Time { return now }
+	var second int64
+	if err := service.db.QueryRow(`INSERT INTO users(email,password_hash,created_at,updated_at) VALUES ('second@example.com','hash',?,?) RETURNING id`, timestamp(now), timestamp(now)).Scan(&second); err != nil {
+		t.Fatal(err)
+	}
+	settings := `{"base_concurrency":1,"hosted_grace_hours":0}`
+	if _, err := service.db.Exec(`INSERT INTO settings(key,value,updated_at) VALUES ('site',?,?)`, settings, timestamp(now)); err != nil {
+		t.Fatal(err)
+	}
+	for index, userID := range []int64{first, second} {
+		owner, err := fake.CreateUser(ctx, fmt.Sprintf("tenant%d", index), "password")
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "k", UserID: owner.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.db.Exec(`INSERT INTO api_keys(user_id,name,key_hash,prefix,vm2api_key_id,vm2api_secret_enc,status,created_at,updated_at) VALUES (?,'k',?,'prefix',?,'enc','active',?,?)`, userID, fmt.Sprintf("hash%d", userID), key.ID, timestamp(now), timestamp(now)); err != nil {
+			t.Fatal(err)
+		}
+		subscription := addSubscription(t, service, userID, "hosted_seat", 1, now.Add(-time.Minute))
+		addResource(t, service, userID, "hosted", "active", "", &subscription)
+	}
+	service.client = &failingSyncClient{Client: fake}
+	if err := service.SweepExpiry(ctx); err == nil {
+		t.Fatal("sweep hid the per-user failure")
+	}
+	var suspended int
+	if err := service.db.QueryRow(`SELECT COUNT(*) FROM resources WHERE status='suspended'`).Scan(&suspended); err != nil {
+		t.Fatal(err)
+	}
+	if suspended != 2 {
+		t.Fatalf("suspended=%d; a failing user stopped the sweep", suspended)
+	}
+}
+
+func TestProvisionSweepRequeuesStuckReleases(t *testing.T) {
+	service, _, userID := provisionFixture(t)
+	ctx := context.Background()
+	now := service.now().Truncate(time.Second)
+	service.Now = func() time.Time { return now }
+	account := addResource(t, service, userID, "hosted", "releasing", "", nil)
+	if _, err := service.db.Exec(`UPDATE resources SET release_after=? WHERE id=?`, timestamp(now.Add(-time.Hour)), account); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.SweepExpiry(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var jobs int
+	if err := service.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE type='release_resource' AND status='pending'`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 {
+		t.Fatalf("requeued release jobs=%d", jobs)
+	}
+	// A resource that already has a live job is not queued twice.
+	if err := service.SweepExpiry(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE type='release_resource'`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 1 {
+		t.Fatalf("duplicate release jobs=%d", jobs)
+	}
+}
+
+func TestProvisionAllocateRentalTopsUpHeldAccounts(t *testing.T) {
+	service, fake, userID := provisionFixture(t)
+	ctx := context.Background()
+	for _, label := range []string{"one", "two"} {
+		vm, err := fake.CreateHostedVM(ctx, label, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.db.Exec(`INSERT INTO rental_pool(vm_id,status,created_at,updated_at) VALUES (?,'available',?,?)`, vm.ID, timestamp(service.now()), timestamp(service.now())); err != nil {
+			t.Fatal(err)
+		}
+	}
+	subscription := addSubscription(t, service, userID, "rental_account", 2, service.now().Add(time.Hour))
+	if err := service.AllocateRental(ctx, subscription); err != nil {
+		t.Fatal(err)
+	}
+	var held int
+	if err := service.db.QueryRow(`SELECT COUNT(*) FROM resources WHERE subscription_id=? AND status='active'`, subscription).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	if held != 2 {
+		t.Fatalf("allocated=%d", held)
+	}
+	// Idempotent: a second call allocates nothing more.
+	if err := service.AllocateRental(ctx, subscription); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.db.QueryRow(`SELECT COUNT(*) FROM resources WHERE subscription_id=?`, subscription).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	if held != 2 {
+		t.Fatalf("reallocated to %d", held)
+	}
+	// Out of stock is reported, not silently ignored.
+	empty := addSubscription(t, service, userID, "rental_account", 1, service.now().Add(time.Hour))
+	if err := service.AllocateRental(ctx, empty); !errors.Is(err, ErrOutOfStock) {
+		t.Fatalf("empty pool error=%v", err)
+	}
+}

@@ -45,6 +45,14 @@ type Fulfiller interface {
 	ApplyPaidOrder(ctx context.Context, orderID int64) error
 }
 
+// AsyncFulfiller is an optional Fulfiller capability: the payment transition and
+// a durable fulfilment job are written in one transaction, so the order can
+// never be paid without a job that will eventually fulfil it. Fulfillers that
+// do not implement it keep the synchronous behaviour (tests, simple callers).
+type AsyncFulfiller interface {
+	EnqueueFulfilOrderTx(ctx context.Context, tx *sql.Tx, orderID int64) error
+}
+
 type Order struct {
 	ID                  int64   `json:"id"`
 	OrderNo             string  `json:"order_no"`
@@ -91,6 +99,22 @@ func New(db *sql.DB, products Catalog, fulfiller Fulfiller) *Service {
 func (service *Service) SetFulfiller(fulfiller Fulfiller) { service.fulfiller = fulfiller }
 
 const columns = `id, order_no, user_id, product_id, product_snapshot, kind, quantity, units, duration_days, amount_cents, currency, provider, provider_trade_no, status, renew_subscription_id, fulfil_error, created_at, expires_at, paid_at, fulfilled_at, updated_at`
+
+// rentalLiveResourceStatus excludes accounts that no longer occupy stock.
+const rentalLiveResourceStatus = `status NOT IN ('released', 'releasing')`
+
+// rentalReservations is the stock still owed to live rental orders. A fresh
+// purchase owes all its units; renewals are counted once per subscription and
+// only for the gap its live accounts do not cover, so two renewals of the same
+// subscription do not reserve the stock twice.
+const rentalReservations = `COALESCE((SELECT SUM(fresh.units) FROM orders AS fresh
+	WHERE fresh.kind = 'rental_account' AND fresh.status = 'pending' AND fresh.renew_subscription_id IS NULL AND julianday(fresh.expires_at) > julianday(?)), 0)
+	+ COALESCE((SELECT SUM(CASE WHEN owed.held >= owed.units THEN 0 ELSE owed.units - owed.held END) FROM (
+		SELECT MAX(renewed.units) AS units,
+			(SELECT COUNT(*) FROM resources AS held WHERE held.subscription_id = renewed.renew_subscription_id AND held.` + rentalLiveResourceStatus + `) AS held
+		FROM orders AS renewed
+		WHERE renewed.kind = 'rental_account' AND renewed.status = 'pending' AND renewed.renew_subscription_id IS NOT NULL AND julianday(renewed.expires_at) > julianday(?)
+		GROUP BY renewed.renew_subscription_id) AS owed), 0)`
 
 type scanner interface{ Scan(...any) error }
 
@@ -164,13 +188,27 @@ func (service *Service) Create(ctx context.Context, request CreateRequest) (Orde
 	}
 	units := quantity * product.UnitQuantity
 	available := int64(0)
-	reserve := product.Kind == catalog.KindRentalAccount && request.RenewSubscriptionID == nil
+	// Reserve stock for every order that will need a fresh allocation: a new
+	// rental purchase, and a renewal whose old subscription no longer holds
+	// enough live accounts. Renewals used to skip this entirely, so a paid
+	// renewal could fail to fulfil for lack of stock.
+	needed := units
+	if product.Kind == catalog.KindRentalAccount {
+		if request.RenewSubscriptionID != nil {
+			held, err := service.heldUnits(ctx, *request.RenewSubscriptionID)
+			if err != nil {
+				return Order{}, err
+			}
+			needed = max(0, units-held)
+		}
+	}
+	reserve := product.Kind == catalog.KindRentalAccount && needed > 0
 	if reserve {
 		available, err = service.catalog.AvailableVMs(ctx)
 		if err != nil {
 			return Order{}, fmt.Errorf("get rental capacity: %w", err)
 		}
-		if units > available {
+		if needed > available {
 			return Order{}, ErrOutOfStock
 		}
 	}
@@ -186,8 +224,12 @@ func (service *Service) Create(ctx context.Context, request CreateRequest) (Orde
 	query := `INSERT INTO orders (order_no, user_id, product_id, product_snapshot, kind, quantity, units, duration_days, amount_cents, currency, provider, status, renew_subscription_id, created_at, expires_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?`
 	arguments := []any{orderNo, request.UserID, product.ID, string(snapshot), product.Kind, quantity, units, product.DurationDays, product.PriceCents * quantity, product.Currency, request.Provider, request.RenewSubscriptionID, now.Format(time.RFC3339), now.Add(PaymentWindow).Format(time.RFC3339), now.Format(time.RFC3339)}
 	if reserve {
-		query += ` WHERE COALESCE((SELECT SUM(units) FROM orders WHERE kind = 'rental_account' AND status = 'pending' AND renew_subscription_id IS NULL AND julianday(expires_at) > julianday(?)), 0) <= ?`
-		arguments = append(arguments, now.Format(time.RFC3339), available-units)
+		// The stock check and the insert are one statement: concurrent buyers
+		// cannot both pass. Reservations count what a live order still has to
+		// allocate, so a renewal only reserves the gap between its units and the
+		// accounts the subscription already holds.
+		query += ` WHERE ` + rentalReservations + ` <= ?`
+		arguments = append(arguments, now.Format(time.RFC3339), now.Format(time.RFC3339), available-needed)
 	}
 	result, err := service.db.ExecContext(ctx, query, arguments...)
 	if err != nil {
@@ -213,9 +255,37 @@ func generateOrderNo(now time.Time) (string, error) {
 	return "PT" + now.UTC().Format("20060102150405") + hex.EncodeToString(randomBytes[:]), nil
 }
 
+// heldUnits counts the live rental accounts a subscription already holds, so a
+// renewal only has to allocate the shortfall.
+func (service *Service) heldUnits(ctx context.Context, subscriptionID int64) (int64, error) {
+	var held int64
+	if err := service.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM resources WHERE subscription_id = ? AND `+rentalLiveResourceStatus, subscriptionID).Scan(&held); err != nil {
+		return 0, fmt.Errorf("count held rental accounts: %w", err)
+	}
+	return held, nil
+}
+
+// MarkPaid settles an order. It accepts pending orders even when the payment
+// window has already closed: a late callback or a manual transfer must still be
+// bookable, so expiry is a checkout gate, not a settlement gate.
+//
+// With an AsyncFulfiller the status change and a durable fulfil_order job are
+// committed together; fulfilment then runs in the job engine, never on the
+// request context. Otherwise fulfilment stays synchronous for compatibility.
+//
+// The settlement itself runs on a detached context: once the provider has told
+// us the money arrived, a client disconnect must not leave the order pending.
 func (service *Service) MarkPaid(ctx context.Context, orderID int64, providerTradeNo string) error {
+	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
 	now := time.Now().UTC().Format(time.RFC3339)
-	result, err := service.db.ExecContext(ctx, `UPDATE orders SET status = 'paid', provider_trade_no = ?, paid_at = ?, updated_at = ? WHERE id = ? AND status = 'pending' AND julianday(expires_at) > julianday(?)`, nullableString(providerTradeNo), now, now, orderID, now)
+	async, asynchronous := service.fulfiller.(AsyncFulfiller)
+	tx, err := service.db.BeginTx(settleCtx, nil)
+	if err != nil {
+		return fmt.Errorf("begin order settlement: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(settleCtx, `UPDATE orders SET status = 'paid', provider_trade_no = COALESCE(?, provider_trade_no), paid_at = COALESCE(paid_at, ?), updated_at = ? WHERE id = ? AND status IN ('pending', 'expired')`, nullableString(providerTradeNo), now, now, orderID)
 	if err != nil {
 		return fmt.Errorf("mark order paid: %w", err)
 	}
@@ -224,7 +294,7 @@ func (service *Service) MarkPaid(ctx context.Context, orderID int64, providerTra
 		return fmt.Errorf("count paid orders: %w", err)
 	}
 	if count == 0 {
-		purchase, err := service.Get(ctx, orderID)
+		purchase, err := scanOrder(tx.QueryRowContext(settleCtx, `SELECT `+columns+` FROM orders WHERE id = ?`, orderID))
 		if err != nil {
 			return err
 		}
@@ -234,14 +304,33 @@ func (service *Service) MarkPaid(ctx context.Context, orderID int64, providerTra
 		return ErrInvalidState
 	}
 	if service.fulfiller == nil {
+		return tx.Commit()
+	}
+	if asynchronous {
+		if err := async.EnqueueFulfilOrderTx(settleCtx, tx, orderID); err != nil {
+			return fmt.Errorf("enqueue order fulfilment: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit order settlement: %w", err)
+		}
 		return nil
 	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit order settlement: %w", err)
+	}
+	// Fulfilment keeps the caller's context: a cancelled callback should stop
+	// the upstream work early, and the order stays paid with a retry path.
 	return service.fulfill(ctx, orderID)
 }
 
+// fulfill applies a synchronous fulfiller. The failure record is written on a
+// context that survives request cancellation, otherwise a cancelled callback
+// would leave the order paid with no trace and no retry path.
 func (service *Service) fulfill(ctx context.Context, orderID int64) error {
 	if err := service.fulfiller.ApplyPaidOrder(ctx, orderID); err != nil {
-		if recordErr := service.MarkFulfillFailed(ctx, orderID, err.Error()); recordErr != nil {
+		recordCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if recordErr := service.MarkFulfillFailed(recordCtx, orderID, err.Error()); recordErr != nil {
 			return fmt.Errorf("record fulfillment failure: %w", recordErr)
 		}
 		return nil
@@ -249,23 +338,37 @@ func (service *Service) fulfill(ctx context.Context, orderID int64) error {
 	return service.MarkFulfilled(ctx, orderID)
 }
 
+// Refulfill re-drives an order whose fulfilment failed, or one that is stuck in
+// paid (process restarted between settlement and fulfilment).
 func (service *Service) Refulfill(ctx context.Context, orderID int64) error {
 	if service.fulfiller == nil {
 		return ErrInvalidState
 	}
-	result, err := service.db.ExecContext(ctx, `UPDATE orders SET status = 'paid', fulfil_error = NULL, updated_at = ? WHERE id = ? AND status = 'fulfill_failed'`, time.Now().UTC().Format(time.RFC3339), orderID)
+	async, asynchronous := service.fulfiller.(AsyncFulfiller)
+	tx, err := service.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin fulfilment retry: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE orders SET status = 'paid', fulfil_error = NULL, updated_at = ? WHERE id = ? AND status IN ('paid', 'fulfill_failed')`, time.Now().UTC().Format(time.RFC3339), orderID)
 	if err != nil {
 		return fmt.Errorf("retry order fulfillment: %w", err)
 	}
-	if err := service.requireChanged(ctx, result, orderID, StatusFulfilled); err != nil {
-		return err
-	}
-	purchase, err := service.Get(ctx, orderID)
+	changed, err := service.requireChangedTx(ctx, tx, result, orderID)
 	if err != nil {
 		return err
 	}
-	if purchase.Status == StatusFulfilled {
+	if !changed {
 		return nil
+	}
+	if asynchronous {
+		if err := async.EnqueueFulfilOrderTx(ctx, tx, orderID); err != nil {
+			return fmt.Errorf("enqueue order fulfilment: %w", err)
+		}
+		return tx.Commit()
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit fulfilment retry: %w", err)
 	}
 	return service.fulfill(ctx, orderID)
 }
@@ -321,6 +424,27 @@ func (service *Service) requireChanged(ctx context.Context, result sql.Result, o
 		return nil
 	}
 	return ErrInvalidState
+}
+
+// requireChangedTx reports whether the statement changed a row inside a
+// settlement/retry transaction. An order that already reached fulfilled is a
+// successful no-op for a retry.
+func (service *Service) requireChangedTx(ctx context.Context, tx *sql.Tx, result sql.Result, orderID int64) (bool, error) {
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("count changed orders: %w", err)
+	}
+	if count > 0 {
+		return true, nil
+	}
+	purchase, err := scanOrder(tx.QueryRowContext(ctx, `SELECT `+columns+` FROM orders WHERE id = ?`, orderID))
+	if err != nil {
+		return false, err
+	}
+	if purchase.Status == StatusFulfilled {
+		return false, nil
+	}
+	return false, ErrInvalidState
 }
 
 func (service *Service) ExpireStale(ctx context.Context) (int64, error) {

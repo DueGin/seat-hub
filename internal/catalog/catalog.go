@@ -60,6 +60,10 @@ type Service struct {
 
 func New(db *sql.DB, health HealthFunc) *Service { return &Service{db: db, health: health} }
 
+// SetHealth installs the health probe after construction. Without a probe a VM
+// is assumed healthy: "unknown" must not read as "sold out".
+func (service *Service) SetHealth(health HealthFunc) { service.health = health }
+
 const columns = `id, kind, name, description, badge, unit_quantity, duration_days, price_cents, currency, min_qty, max_qty, enabled, sort_order, created_at, updated_at`
 
 type scanner interface{ Scan(...any) error }
@@ -199,11 +203,12 @@ func (service *Service) AvailableVMs(ctx context.Context) (int64, error) {
 		if err := rows.Scan(&vmID); err != nil {
 			return 0, fmt.Errorf("read rental vm: %w", err)
 		}
-		if service.health != nil {
-			healthy, fetched := service.health(vmID)
-			if healthy && fetched {
-				available++
-			}
+		if service.health == nil {
+			available++
+			continue
+		}
+		if healthy, _ := service.health(vmID); healthy {
+			available++
 		}
 	}
 	if err := rows.Err(); err != nil {

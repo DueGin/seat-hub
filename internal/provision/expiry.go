@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/DueGin/vm2api-portal/internal/store"
 	"github.com/DueGin/vm2api-portal/internal/vm2api"
 )
 
@@ -40,56 +41,109 @@ func (service *Service) SweepExpiry(ctx context.Context) error {
 	if readErr != nil {
 		return fmt.Errorf("read expiry users: %w", readErr)
 	}
+	// One failing user must not stop the sweep: a vm2api error for user 5 would
+	// otherwise leave every later user unexpired on every run. Each failure is
+	// recorded and the sweep continues; the user is retried next minute.
+	failures := make([]error, 0)
 	for _, userID := range users {
-		entitlements, err := service.Entitlements(ctx, userID)
-		if err != nil {
-			return err
-		}
-		accounts, err := service.ListAccounts(ctx, userID, false)
-		if err != nil {
-			return err
-		}
-		sort.Slice(accounts, func(first, second int) bool {
-			if accounts[first].CreatedAt == accounts[second].CreatedAt {
-				return accounts[first].ID < accounts[second].ID
-			}
-			return accounts[first].CreatedAt < accounts[second].CreatedAt
-		})
-		hostedIndex := 0
-		for _, account := range accounts {
-			if account.Status == "releasing" {
-				continue
-			}
-			covered := false
-			grace := settings.HostedGraceHours
-			if account.Kind == "hosted" {
-				covered = hostedIndex < entitlements.HostedSeats.Total
-				hostedIndex++
-			} else {
-				grace = settings.RentalGraceHours
-				if account.SubscriptionID != nil {
-					var count int
-					if err := service.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM subscriptions WHERE id=? AND user_id=? AND kind='rental_account' AND status='active' AND julianday(starts_at)<=julianday(?) AND julianday(expires_at)>julianday(?)`, *account.SubscriptionID, userID, timestamp(now), timestamp(now)).Scan(&count); err != nil {
-						return fmt.Errorf("check rental subscription: %w", err)
-					}
-					covered = count > 0
-				}
-			}
-			if covered {
-				if err := service.resumeResource(ctx, account); err != nil {
-					return err
-				}
-				continue
-			}
-			if err := service.suspendResource(ctx, account, time.Duration(max(0, grace))*time.Hour); err != nil {
-				return err
-			}
-		}
-		if err := service.syncConcurrency(ctx, userID); err != nil {
-			return err
+		if err := service.sweepUser(ctx, userID, settings, now); err != nil {
+			failures = append(failures, fmt.Errorf("sweep user %d: %w", userID, err))
 		}
 	}
-	return nil
+	if err := service.requeueStuckReleases(ctx, now); err != nil {
+		failures = append(failures, err)
+	}
+	return errors.Join(failures...)
+}
+
+func (service *Service) sweepUser(ctx context.Context, userID int64, settings store.Site, now time.Time) error {
+	entitlements, err := service.Entitlements(ctx, userID)
+	if err != nil {
+		return err
+	}
+	accounts, err := service.ListAccounts(ctx, userID, false)
+	if err != nil {
+		return err
+	}
+	sort.Slice(accounts, func(first, second int) bool {
+		if accounts[first].CreatedAt == accounts[second].CreatedAt {
+			return accounts[first].ID < accounts[second].ID
+		}
+		return accounts[first].CreatedAt < accounts[second].CreatedAt
+	})
+	var failures []error
+	hostedIndex := 0
+	for _, account := range accounts {
+		if account.Status == "releasing" {
+			continue
+		}
+		covered := false
+		grace := settings.HostedGraceHours
+		if account.Kind == "hosted" {
+			covered = hostedIndex < entitlements.HostedSeats.Total
+			hostedIndex++
+		} else {
+			grace = settings.RentalGraceHours
+			if account.SubscriptionID != nil {
+				var count int
+				if err := service.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM subscriptions WHERE id=? AND user_id=? AND kind='rental_account' AND status='active' AND julianday(starts_at)<=julianday(?) AND julianday(expires_at)>julianday(?)`, *account.SubscriptionID, userID, timestamp(now), timestamp(now)).Scan(&count); err != nil {
+					failures = append(failures, fmt.Errorf("check rental subscription: %w", err))
+					continue
+				}
+				covered = count > 0
+			}
+		}
+		if covered {
+			if err := service.resumeResource(ctx, account); err != nil {
+				failures = append(failures, err)
+			}
+			continue
+		}
+		if err := service.suspendResource(ctx, account, time.Duration(max(0, grace))*time.Hour); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	if err := service.syncConcurrency(ctx, userID); err != nil {
+		failures = append(failures, err)
+	}
+	return errors.Join(failures...)
+}
+
+// requeueStuckReleases re-enqueues release_resource for resources left in
+// releasing past their deadline with no live job (a job that exhausted its
+// retries turns failed and never runs again, so the VM would leak forever).
+// The dedupe key keeps a resource with a pending or running job from being
+// queued twice.
+func (service *Service) requeueStuckReleases(ctx context.Context, now time.Time) error {
+	rows, err := service.db.QueryContext(ctx, `SELECT id FROM resources AS resource
+		WHERE resource.status='releasing'
+		AND (resource.release_after IS NULL OR julianday(resource.release_after)<=julianday(?))
+		AND NOT EXISTS (SELECT 1 FROM jobs WHERE jobs.dedupe_key='release_resource:'||resource.id AND jobs.status IN ('pending','running'))
+		ORDER BY resource.id`, timestamp(now))
+	if err != nil {
+		return fmt.Errorf("list stuck releases: %w", err)
+	}
+	ids := make([]int64, 0)
+	for rows.Next() {
+		var resourceID int64
+		if err := rows.Scan(&resourceID); err != nil {
+			rows.Close()
+			return fmt.Errorf("read stuck release: %w", err)
+		}
+		ids = append(ids, resourceID)
+	}
+	readErr := rows.Err()
+	rows.Close()
+	if readErr != nil {
+		return fmt.Errorf("read stuck releases: %w", readErr)
+	}
+	var failures []error
+	for _, resourceID := range ids {
+		if _, err := service.engine.Enqueue(ctx, "release_resource", jobPayload{ResourceID: resourceID}, fmt.Sprintf("release_resource:%d", resourceID), now, 8); err != nil {
+			failures = append(failures, fmt.Errorf("requeue release for resource %d: %w", resourceID, err))
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func (service *Service) suspendResource(ctx context.Context, account Account, grace time.Duration) error {
@@ -132,7 +186,7 @@ func (service *Service) resumeResource(ctx context.Context, account Account) err
 	}
 	status := strings.TrimPrefix(*account.StatusReason, "subscription_expired:")
 	if status == "active" && account.VMID != "" {
-		if err := service.client.SetSchedulable(ctx, account.VMID, true); err != nil {
+		if err := service.client.SetSchedulable(ctx, account.VMID, true); err != nil && !vm2api.IsStatus(err, 404) {
 			return fmt.Errorf("resume resource scheduling: %w", err)
 		}
 	}
@@ -209,6 +263,30 @@ func (service *Service) releaseJob(ctx context.Context, job Job) error {
 		return err
 	}
 	return service.ReleaseResource(ctx, payload.ResourceID)
+}
+
+// MarkReleasing forces any not-yet-released resource into releasing with an
+// immediate deadline, so the admin "force release" path and DeleteHosted share
+// the same precondition and ReleaseResource is never a silent no-op.
+func (service *Service) MarkReleasing(ctx context.Context, resourceID int64) error {
+	result, err := service.db.ExecContext(ctx, `UPDATE resources SET status='releasing',release_after=?,updated_at=? WHERE id=? AND status<>'released'`, timestamp(service.now()), timestamp(service.now()), resourceID)
+	if err != nil {
+		return fmt.Errorf("mark resource releasing: %w", err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count released resources: %w", err)
+	}
+	if count == 0 {
+		var exists int
+		if err := service.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM resources WHERE id=?`, resourceID).Scan(&exists); err != nil {
+			return fmt.Errorf("check resource: %w", err)
+		}
+		if exists == 0 {
+			return ErrNotFound
+		}
+	}
+	return nil
 }
 
 func (service *Service) ReleaseResource(ctx context.Context, resourceID int64) error {

@@ -29,8 +29,18 @@ func DefaultSite() Site {
 		HostedGraceHours: 24,
 		RentalGraceHours: 0,
 		HostedVMTemplate: json.RawMessage(`{"runtime_type":"docker"}`),
-		Payment:          json.RawMessage(`{}`),
+		Payment:          DefaultPaymentDocument(),
 	}
+}
+
+// DefaultPaymentDocument is the payment config a fresh install starts with.
+// The settings page edits this shape directly, so it must always contain both
+// provider blocks even before anything is configured.
+func DefaultPaymentDocument() json.RawMessage {
+	return json.RawMessage(`{
+  "epay": {"enabled": false, "gateway_url": "", "pid": "", "key": "", "types": ["alipay", "wxpay"]},
+  "manual": {"enabled": true, "instructions": "转账后请联系管理员确认收款。"}
+}`)
 }
 
 // LoadSite merges the stored "site" document over defaults.

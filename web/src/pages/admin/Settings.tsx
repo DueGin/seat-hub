@@ -1,46 +1,51 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { Button, Card, Field, FieldInput, Notice, PageHeader, QueryState } from '@/components/ui'
 import { api } from '@/lib/api'
-import type { Settings as SiteSettings } from '@/lib/types'
+import type { NormalizedSettings, Settings as SiteSettings } from '@/lib/types'
 import { MutationError, Textarea } from './shared'
-import { numericSettings, validateSettings } from './settings-validation'
+import { normalizeSettings, numericSettings, validateSettings } from './settings-validation'
 
 export function Settings() {
   const query = useQuery({ queryKey: ['admin', 'settings'], queryFn: () => api.get<SiteSettings>('/admin/settings'), refetchOnWindowFocus: false })
   return <div className="stack"><PageHeader eyebrow="系统配置" title="站点与支付设置" description="更改基础权益、资源生命周期与支付配置。保存前校验全部字段和 JSON。" /><QueryState query={query}>{query.data && <SettingsEditor initial={query.data} />}</QueryState></div>
 }
 
+// The editor works on the normalized document: initial.payment may be missing entirely
+// (fresh install returning {}, or an older stored row), and nothing below may crash on it.
 function SettingsEditor({ initial }: { initial: SiteSettings }) {
-  const [draft, setDraft] = useState<SiteSettings>(() => structuredClone(initial))
-  const [templateJSON, setTemplateJSON] = useState(() => JSON.stringify(initial.hosted_vm_template, null, 2))
-  const [typesJSON, setTypesJSON] = useState(() => JSON.stringify(initial.payment.epay.types))
+  const normalized = useMemo(() => normalizeSettings(initial), [initial])
+  const [draft, setDraft] = useState<NormalizedSettings>(() => structuredClone(normalized))
+  const [templateJSON, setTemplateJSON] = useState(() => JSON.stringify(normalized.hosted_vm_template, null, 2))
+  const [typesJSON, setTypesJSON] = useState(() => JSON.stringify(normalized.payment.epay.types))
   const [validation, setValidation] = useState('')
   const [dirty, setDirty] = useState(false)
+  const hasExistingKey = Boolean(normalized.payment.epay.key)
   const client = useQueryClient()
   const mutation = useMutation({
     mutationFn: (input: SiteSettings) => api.put<SiteSettings>('/admin/settings', input),
     onSuccess: async (saved) => {
-      const masked: SiteSettings = { ...saved, payment: { ...saved.payment, epay: { ...saved.payment.epay, key: saved.payment.epay.key ? '***' : '' } } }
+      const normalized = normalizeSettings(saved)
+      const masked: NormalizedSettings = { ...normalized, payment: { ...normalized.payment, epay: { ...normalized.payment.epay, key: normalized.payment.epay.key ? '***' : '' } } }
       setDraft(structuredClone(masked)); setTemplateJSON(JSON.stringify(masked.hosted_vm_template, null, 2)); setTypesJSON(JSON.stringify(masked.payment.epay.types)); setDirty(false); setValidation('')
       client.setQueryData(['admin', 'settings'], masked)
       toast.success('系统设置已保存')
       await client.invalidateQueries()
     },
   })
-  function change<K extends keyof SiteSettings>(key: K, value: SiteSettings[K]) { setDirty(true); setDraft((current) => ({ ...current, [key]: value })) }
-  function changeEpay<K extends keyof SiteSettings['payment']['epay']>(key: K, value: SiteSettings['payment']['epay'][K]) { setDirty(true); setDraft((current) => ({ ...current, payment: { ...current.payment, epay: { ...current.payment.epay, [key]: value } } })) }
-  function changeManual<K extends keyof SiteSettings['payment']['manual']>(key: K, value: SiteSettings['payment']['manual'][K]) { setDirty(true); setDraft((current) => ({ ...current, payment: { ...current.payment, manual: { ...current.payment.manual, [key]: value } } })) }
+  function change<K extends keyof NormalizedSettings>(key: K, value: NormalizedSettings[K]) { setDirty(true); setDraft((current) => ({ ...current, [key]: value })) }
+  function changeEpay<K extends keyof NormalizedSettings['payment']['epay']>(key: K, value: NormalizedSettings['payment']['epay'][K]) { setDirty(true); setDraft((current) => ({ ...current, payment: { ...current.payment, epay: { ...current.payment.epay, [key]: value } } })) }
+  function changeManual<K extends keyof NormalizedSettings['payment']['manual']>(key: K, value: NormalizedSettings['payment']['manual'][K]) { setDirty(true); setDraft((current) => ({ ...current, payment: { ...current.payment, manual: { ...current.payment.manual, [key]: value } } })) }
   function formatJSON() {
     try {
-      const validated = validateSettings(draft, templateJSON, typesJSON, Boolean(initial.payment.epay.key))
+      const validated = validateSettings(draft, templateJSON, typesJSON, hasExistingKey)
       setTemplateJSON(JSON.stringify(validated.hosted_vm_template, null, 2)); setTypesJSON(JSON.stringify(validated.payment.epay.types, null, 2)); setValidation(''); toast.success('全部设置与 JSON 校验通过')
     } catch (error) { setValidation(error instanceof Error ? error.message : 'JSON 校验失败') }
   }
   return <form className="stack" onSubmit={(event) => {
     event.preventDefault()
-    try { const input = validateSettings(draft, templateJSON, typesJSON, Boolean(initial.payment.epay.key)); setValidation(''); mutation.mutate(input) } catch (error) { setValidation(error instanceof Error ? error.message : '设置校验失败') }
+    try { const input = validateSettings(draft, templateJSON, typesJSON, hasExistingKey); setValidation(''); mutation.mutate(input) } catch (error) { setValidation(error instanceof Error ? error.message : '设置校验失败') }
   }}>
     <fieldset disabled={mutation.isPending} className="stack">
       <Card><h2>站点信息</h2><div className="form-grid"><Field label="站点名称"><FieldInput required maxLength={200} value={draft.site_name} onChange={(event) => change('site_name', event.target.value)} /></Field><label className="row"><input type="checkbox" checked={draft.registration_open} onChange={(event) => change('registration_open', event.target.checked)} />开放新用户注册</label></div></Card>

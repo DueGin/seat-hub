@@ -83,6 +83,16 @@ func (fixture fixture) subscription(t *testing.T, userID int64, kind string, qua
 	return id
 }
 
+// stock puts VMs in the rental pool so a reservation can be honoured.
+func (fixture fixture) stock(t *testing.T, vmIDs ...string) {
+	t.Helper()
+	for _, vmID := range vmIDs {
+		if _, err := fixture.db.Exec(`INSERT INTO rental_pool(vm_id, status, created_at, updated_at) VALUES (?, 'available', '', '')`, vmID); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestCreateSnapshotAmountAndValidation(t *testing.T) {
 	ctx := context.Background()
 	fixture := setup(t, catalog.KindConcurrency, nil)
@@ -133,6 +143,9 @@ func TestCreateSnapshotAmountAndValidation(t *testing.T) {
 func TestRenewalDerivesQuantityAndChecksOwnership(t *testing.T) {
 	ctx := context.Background()
 	fixture := setup(t, catalog.KindRentalAccount, nil)
+	// Each renewal of six units has to reserve six rental accounts (the old
+	// subscription holds none), so two renewals need twelve.
+	fixture.stock(t, "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l")
 	for _, status := range []string{"active", "expired"} {
 		subscriptionID := fixture.subscription(t, 1, catalog.KindRentalAccount, 6, status)
 		purchase, err := fixture.orders.Create(ctx, order.CreateRequest{UserID: 1, ProductID: fixture.product.ID, Quantity: 999, Provider: "manual", RenewSubscriptionID: &subscriptionID})
@@ -196,15 +209,19 @@ func TestRentalReservationAtomicAndRelease(t *testing.T) {
 	if err := fixture.orders.Cancel(ctx, 1, items[0].OrderNo); err != nil {
 		t.Fatal(err)
 	}
-	fixture.create(t, 1)
 	stale := time.Now().UTC().Add(-time.Second).Format(time.RFC3339)
 	if _, err := fixture.db.Exec(`UPDATE orders SET expires_at = ? WHERE id = ?`, stale, items[1].ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.orders.MarkPaid(ctx, items[1].ID, "late-pending"); !errors.Is(err, order.ErrInvalidState) {
+	// A payment that lands after the window closed must still book: expiry
+	// stops people from paying a stale checkout page, it does not lose money.
+	if err := fixture.orders.MarkPaid(ctx, items[1].ID, "late-pending"); err != nil {
+		t.Fatalf("late payment: %v", err)
+	}
+	expired := fixture.create(t, 1)
+	if _, err := fixture.db.Exec(`UPDATE orders SET expires_at = ? WHERE id = ?`, stale, expired.ID); err != nil {
 		t.Fatal(err)
 	}
-	fixture.create(t, 1)
 	count, err := fixture.orders.ExpireStale(ctx)
 	if err != nil || count != 1 {
 		t.Fatalf("expired=%d, err=%v", count, err)
@@ -212,8 +229,13 @@ func TestRentalReservationAtomicAndRelease(t *testing.T) {
 	if count, err := fixture.orders.ExpireStale(ctx); err != nil || count != 0 {
 		t.Fatalf("expired again=%d, err=%v", count, err)
 	}
-	if err := fixture.orders.MarkPaid(ctx, items[1].ID, "late"); !errors.Is(err, order.ErrInvalidState) {
-		t.Fatal(err)
+	// An order the sweep already expired can still be settled (admin repair).
+	if err := fixture.orders.MarkPaid(ctx, expired.ID, "admin-repair"); err != nil {
+		t.Fatalf("settle expired: %v", err)
+	}
+	settled, err := fixture.orders.Get(ctx, expired.ID)
+	if err != nil || settled.Status != order.StatusPaid || settled.ProviderTradeNo == nil || *settled.ProviderTradeNo != "admin-repair" {
+		t.Fatalf("settled=%+v, err=%v", settled, err)
 	}
 }
 
@@ -386,5 +408,153 @@ func TestPaymentServiceUsesOrderLifecycle(t *testing.T) {
 		if err := fixture.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM payment_events WHERE order_no = ? AND result = ? AND verified = 1`, purchase.OrderNo, result).Scan(&count); err != nil || count != 1 {
 			t.Fatalf("event %s count=%d, err=%v", result, count, err)
 		}
+	}
+}
+
+// asyncFulfiller records the durable jobs a settled order should produce.
+type asyncFulfiller struct {
+	mu       sync.Mutex
+	enqueued []int64
+	failWith error
+	calls    int64
+}
+
+func (apply *asyncFulfiller) ApplyPaidOrder(context.Context, int64) error {
+	atomic.AddInt64(&apply.calls, 1)
+	return errors.New("synchronous fulfilment must not run")
+}
+
+func (apply *asyncFulfiller) EnqueueFulfilOrderTx(ctx context.Context, tx *sql.Tx, orderID int64) error {
+	apply.mu.Lock()
+	defer apply.mu.Unlock()
+	if apply.failWith != nil {
+		return apply.failWith
+	}
+	var pending int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM orders WHERE id = ? AND status = 'paid'`, orderID).Scan(&pending); err != nil {
+		return err
+	}
+	if pending != 1 {
+		return errors.New("job enqueued outside the settlement transaction")
+	}
+	apply.enqueued = append(apply.enqueued, orderID)
+	return nil
+}
+
+func TestMarkPaidEnqueuesDurableFulfilment(t *testing.T) {
+	ctx := context.Background()
+	applicator := &asyncFulfiller{}
+	fixture := setup(t, catalog.KindHostedSeat, applicator)
+	purchase := fixture.create(t, 1)
+	if err := fixture.orders.MarkPaid(ctx, purchase.ID, "trade"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.orders.MarkPaid(ctx, purchase.ID, "trade"); err != nil {
+		t.Fatalf("duplicate settlement: %v", err)
+	}
+	applicator.mu.Lock()
+	enqueued := append([]int64(nil), applicator.enqueued...)
+	applicator.mu.Unlock()
+	if len(enqueued) != 1 || enqueued[0] != purchase.ID || atomic.LoadInt64(&applicator.calls) != 0 {
+		t.Fatalf("enqueued=%v synchronous=%d", enqueued, applicator.calls)
+	}
+	saved, err := fixture.orders.Get(ctx, purchase.ID)
+	if err != nil || saved.Status != order.StatusPaid || saved.PaidAt == nil {
+		t.Fatalf("saved=%+v, err=%v", saved, err)
+	}
+	// Enqueue failure rolls the settlement back so the callback can retry.
+	rejected := &asyncFulfiller{failWith: errors.New("queue unavailable")}
+	fixture.orders.SetFulfiller(rejected)
+	failed := fixture.create(t, 1)
+	if err := fixture.orders.MarkPaid(ctx, failed.ID, "trade-2"); err == nil {
+		t.Fatal("settlement succeeded without a durable job")
+	}
+	still, err := fixture.orders.Get(ctx, failed.ID)
+	if err != nil || still.Status != order.StatusPending {
+		t.Fatalf("rolled back order=%+v, err=%v", still, err)
+	}
+}
+
+func TestRefulfillRedrivesPaidAndFailed(t *testing.T) {
+	ctx := context.Background()
+	var failed atomic.Int64
+	fixture := setup(t, catalog.KindConcurrency, fulfillFunc(func(context.Context, int64) error {
+		if failed.Add(1) == 1 {
+			return errors.New("upstream unavailable")
+		}
+		return nil
+	}))
+	purchase := fixture.create(t, 1)
+	if err := fixture.orders.MarkPaid(ctx, purchase.ID, "trade"); err != nil {
+		t.Fatal(err)
+	}
+	broken, err := fixture.orders.Get(ctx, purchase.ID)
+	if err != nil || broken.Status != order.StatusFulfillFailed {
+		t.Fatalf("broken=%+v, err=%v", broken, err)
+	}
+	if err := fixture.orders.Refulfill(ctx, purchase.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.orders.Refulfill(ctx, purchase.ID); err != nil {
+		t.Fatalf("refulfil fulfilled order: %v", err)
+	}
+
+	// A stuck paid order (process died between settlement and fulfilment) is
+	// re-driven by the same endpoint.
+	stuck := fixture.create(t, 1)
+	if err := fixture.orders.MarkPaid(ctx, stuck.ID, "trade-2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`UPDATE orders SET status='paid', fulfilled_at=NULL WHERE id=?`, stuck.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.orders.Refulfill(ctx, stuck.ID); err != nil {
+		t.Fatalf("refulfil paid order: %v", err)
+	}
+	saved, err := fixture.orders.Get(ctx, stuck.ID)
+	if err != nil || saved.Status != order.StatusFulfilled {
+		t.Fatalf("stuck=%+v, err=%v", saved, err)
+	}
+}
+
+func TestFulfilmentFailureSurvivesCancelledContext(t *testing.T) {
+	ctx := context.Background()
+	fixture := setup(t, catalog.KindConcurrency, fulfillFunc(func(context.Context, int64) error { return errors.New("upstream unavailable") }))
+	purchase := fixture.create(t, 1)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := fixture.orders.MarkPaid(cancelled, purchase.ID, "trade"); err != nil {
+		t.Fatalf("settlement on cancelled request: %v", err)
+	}
+	saved, err := fixture.orders.Get(ctx, purchase.ID)
+	if err != nil || saved.Status != order.StatusFulfillFailed || saved.FulfilError == nil {
+		t.Fatalf("saved=%+v, err=%v", saved, err)
+	}
+}
+
+func TestRenewalReservesWhenOldResourcesWereReleased(t *testing.T) {
+	ctx := context.Background()
+	fixture := setup(t, catalog.KindRentalAccount, nil)
+	fixture.stock(t, "a", "b")
+	subscriptionID := fixture.subscription(t, 1, catalog.KindRentalAccount, 4, "expired")
+	// The old accounts are gone, so the renewal must reserve them again.
+	if _, err := fixture.orders.Create(ctx, order.CreateRequest{UserID: 1, ProductID: fixture.product.ID, Provider: "manual", RenewSubscriptionID: &subscriptionID}); !errors.Is(err, order.ErrOutOfStock) {
+		t.Fatalf("renewal without stock error=%v", err)
+	}
+	fixture.stock(t, "c", "d")
+	purchase, err := fixture.orders.Create(ctx, order.CreateRequest{UserID: 1, ProductID: fixture.product.ID, Provider: "manual", RenewSubscriptionID: &subscriptionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.orders.Cancel(ctx, 1, purchase.OrderNo); err != nil {
+		t.Fatal(err)
+	}
+	// A subscription still holding its accounts only reserves the shortfall:
+	// four units minus one live account leaves three to reserve.
+	if _, err := fixture.db.Exec(`INSERT INTO resources(user_id,kind,subscription_id,vm_id,status,created_at,updated_at) VALUES (1,'rental',?,'a','active','','')`, subscriptionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.orders.Create(ctx, order.CreateRequest{UserID: 1, ProductID: fixture.product.ID, Provider: "manual", RenewSubscriptionID: &subscriptionID}); err != nil {
+		t.Fatalf("renewal with held accounts: %v", err)
 	}
 }

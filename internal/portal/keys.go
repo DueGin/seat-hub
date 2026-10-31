@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/DueGin/vm2api-portal/internal/api"
+	"github.com/DueGin/vm2api-portal/internal/provision"
 	"github.com/DueGin/vm2api-portal/internal/secret"
 	"github.com/DueGin/vm2api-portal/internal/store"
 	"github.com/DueGin/vm2api-portal/internal/vm2api"
@@ -90,7 +91,8 @@ func (service *Service) Create(ctx context.Context, userID int64, name string) (
 		return api.KeyDTO{}, "", fmt.Errorf("generate portal key: %w", err)
 	}
 	plaintext := "sk-pt-" + token
-	upstream, err := service.client.CreateKey(ctx, vm2api.CreateKeyInput{Name: name, UserID: upstreamUser, MaxConcurrency: entitlements.Concurrency.Total})
+	limit := provision.EffectiveConcurrency(entitlements.Concurrency.Total)
+	upstream, err := service.client.CreateKey(ctx, vm2api.CreateKeyInput{Name: name, UserID: upstreamUser, MaxConcurrency: limit})
 	if err != nil {
 		return api.KeyDTO{}, "", fmt.Errorf("create upstream key: %w", err)
 	}
@@ -102,7 +104,7 @@ func (service *Service) Create(ctx context.Context, userID int64, name string) (
 	var id int64
 	err = service.db.QueryRowContext(ctx, `INSERT INTO api_keys(user_id,name,key_hash,prefix,vm2api_key_id,vm2api_secret_enc,synced_concurrency,status,created_at,updated_at)
 		SELECT ?,?,?,?,?,?,?,'active',?,? WHERE (SELECT COUNT(*) FROM api_keys WHERE user_id=? AND status='active')<20 RETURNING id`,
-		userID, name, service.box.MAC(plaintext), plaintext[:10], upstream.ID, encrypted, entitlements.Concurrency.Total, now, now, userID).Scan(&id)
+		userID, name, service.box.MAC(plaintext), plaintext[:10], upstream.ID, encrypted, limit, now, now, userID).Scan(&id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = ErrKeyLimit
@@ -155,7 +157,7 @@ func (service *Service) Update(ctx context.Context, userID, id int64, name, stat
 		if err != nil {
 			return api.KeyDTO{}, fmt.Errorf("load entitlements: %w", err)
 		}
-		concurrency = entitlements.Concurrency.Total
+		concurrency = provision.EffectiveConcurrency(entitlements.Concurrency.Total)
 		input.MaxConcurrency = &concurrency
 	}
 	if status != "" {

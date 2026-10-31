@@ -76,15 +76,22 @@ func (s *Service) Create(ctx context.Context, provider string, req CreateRequest
 func (s *Service) Notify(ctx context.Context, provider string, r *http.Request) (Notice, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Unsupported or unregistered providers are rejected without touching the
+	// event table: anyone can POST here, so an unauthenticated caller must not
+	// be able to append rows.
 	if provider == "manual" || provider == "mock" {
-		return Notice{}, s.record(ctx, provider, Notice{}, false, "rejected:notify_unsupported", ErrNotifyUnsupported)
+		return Notice{}, ErrNotifyUnsupported
 	}
 	p, ok := s.providers[provider]
 	if !ok {
-		return Notice{}, s.record(ctx, provider, Notice{}, false, "rejected:provider_unavailable", ErrProviderUnavailable)
+		return Notice{}, ErrProviderUnavailable
 	}
 	notice, err := p.Notify(r)
 	if err != nil {
+		if notice.OrderNo == "" {
+			// Nothing references a real order; this is noise, not evidence.
+			return notice, err
+		}
 		return notice, s.record(ctx, provider, notice, notice.verified, rejection(err), err)
 	}
 	return notice, s.apply(ctx, provider, notice)
@@ -156,7 +163,7 @@ func (s *Service) apply(ctx context.Context, provider string, notice Notice) err
 	case "paid", "fulfilled", "fulfill_failed":
 		return s.record(ctx, provider, notice, true, "duplicate", nil)
 	}
-	if err := s.payable(order); err != nil {
+	if err := s.settleable(order); err != nil {
 		return reject(err)
 	}
 	// Do not hold a SQL transaction while invoking the marker: it owns its own
@@ -192,6 +199,10 @@ func (s *Service) findOrder(ctx context.Context, orderNo string) (payableOrder, 
 	return order, nil
 }
 
+// payable gates *starting* a payment: the order must still be pending and
+// unexpired. Settlement uses settleable, because a gateway callback or a manual
+// bank transfer routinely lands after the order window closed, and money that
+// arrived must still be recorded.
 func (s *Service) payable(order payableOrder) error {
 	if order.status != "pending" {
 		return ErrOrderNotPayable
@@ -206,14 +217,42 @@ func (s *Service) payable(order payableOrder) error {
 	return nil
 }
 
+// settleable accepts a pending order regardless of its payment window: a
+// gateway callback or a manual transfer can legitimately land late.
+func (s *Service) settleable(order payableOrder) error {
+	if order.status != "pending" {
+		return ErrOrderNotPayable
+	}
+	return nil
+}
+
+// maxEventRaw bounds what a public callback can store. Notifications are
+// attacker-supplied text and the column otherwise accepts the full 64 KiB body.
+const maxEventRaw = 2048
+
 func (s *Service) record(ctx context.Context, provider string, notice Notice, verified bool, result string, cause error) error {
+	raw := notice.Raw
+	if len(raw) > maxEventRaw {
+		raw = raw[:maxEventRaw]
+	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO payment_events
 		(provider, order_no, trade_no, verified, raw, result, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		provider, notice.OrderNo, notice.TradeNo, verified, notice.Raw, result, s.now().UTC().Format(time.RFC3339))
+		provider, notice.OrderNo, notice.TradeNo, verified, raw, result, s.now().UTC().Format(time.RFC3339))
 	if err != nil {
 		return errors.Join(cause, fmt.Errorf("record payment event: %w", err))
 	}
 	return cause
+}
+
+// PruneEvents deletes payment events older than the cutoff. Callers schedule it
+// (hourly is plenty); it returns how many rows were removed.
+func (s *Service) PruneEvents(ctx context.Context, cutoff time.Time) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM payment_events WHERE created_at < ?`,
+		cutoff.UTC().Format(time.RFC3339))
+	if err != nil {
+		return 0, fmt.Errorf("prune payment events: %w", err)
+	}
+	return result.RowsAffected()
 }
 
 func rejection(err error) string {

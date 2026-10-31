@@ -8,6 +8,16 @@ import { ConfirmAction, credentialLabels, MutationError, scheduleLabels, Select,
 
 const poolStatuses: Record<string, string> = { available: '可分配', leased: '已租出', maintenance: '维护中' }
 
+// The backend sends leased_to_email only when the lease can be joined to a user, so an
+// empty email is normal. Fall back to the user id, and only report "暂无租用" when the pool
+// item really has no tenant (or when a leased row is missing both fields).
+function leaseLabel(item: PoolItem): string {
+  const email = item.leased_to_email?.trim()
+  if (email) return email
+  if (item.leased_to_user_id) return `用户 #${item.leased_to_user_id}`
+  return item.status === 'leased' ? '租用人信息缺失' : '暂无租用'
+}
+
 export function RentalPool() {
   const query = useQuery({ queryKey: ['admin', 'rental-pool'], queryFn: () => api.get<{ items: PoolItem[] }>('/admin/rental-pool') })
   const [search, setSearch] = useState('')
@@ -18,12 +28,12 @@ export function RentalPool() {
   const [health, setHealth] = useState<PoolItem | null>(null)
   const [removing, setRemoving] = useState<PoolItem | null>(null)
   const remove = useAdminMutation((item: PoolItem) => api.delete(`/admin/rental-pool/${encodeURIComponent(item.vm_id)}`), 'VM 已移出租赁池', () => setRemoving(null))
-  const items = (query.data?.items ?? []).filter((item) => (!status || status === item.status) && (!search || `${item.vm_id} ${item.vm?.label ?? ''} ${item.vm?.email_masked ?? ''} ${item.leased_to_email ?? ''} ${item.note}`.toLowerCase().includes(search.toLowerCase())))
+  const items = (query.data?.items ?? []).filter((item) => (!status || status === item.status) && (!search || `${item.vm_id} ${item.vm?.label ?? ''} ${item.vm?.email_masked ?? ''} ${item.leased_to_email ?? ''} ${item.leased_to_user_id ?? ''} ${item.note}`.toLowerCase().includes(search.toLowerCase())))
   const currentPage = Math.min(page, Math.max(1, Math.ceil(items.length / 20)))
   return <div className="stack">
     <PageHeader eyebrow="资源供给" title="租赁资源池" description="从未归属的 Claude VM 中选取资源入池，管理维护状态与健康信息。" actions={<><Button variant="secondary" disabled={query.isFetching} onClick={() => { void query.refetch() }}>刷新健康</Button><Button onClick={() => setAdding(true)}>候选 VM 入池</Button></>} />
     <Card><div className="toolbar"><Field label="搜索资源"><FieldInput type="search" value={search} placeholder="VM 编号、备注、邮箱或租用人" onChange={(event) => { setSearch(event.target.value); setPage(1) }} /></Field><Select label="池状态" value={status} onChange={(event) => { setStatus(event.target.value); setPage(1) }}><option value="">全部状态</option>{Object.entries(poolStatuses).map(([value, text]) => <option key={value} value={value}>{text}</option>)}</Select></div>
-      <QueryState query={query}>{items.length ? <><div className="table-wrap"><table className="data-table"><thead><tr><th>VM / 账号</th><th>资源状态</th><th>凭证 / 调度</th><th>租用人</th><th>备注</th><th>操作</th></tr></thead><tbody>{items.slice((currentPage - 1) * 20, currentPage * 20).map((item) => <tr key={item.vm_id}><td><strong>{item.vm?.label || '未命名 VM'}</strong><p className="mono muted">{item.vm_id}</p><p className="muted">{item.vm?.email_masked || '暂无邮箱'} · {item.tier || item.vm?.tier || '未知规格'}</p></td><td><Badge status={item.status} /></td><td><span>{credentialLabels[item.vm?.cred_status] ?? '凭证状态待确认'}</span><p className="muted">{scheduleLabels[item.vm?.schedule_state] ?? '调度状态未知'}</p></td><td>{item.leased_to_email || (item.leased_to_user_id ? `用户 #${item.leased_to_user_id}` : '暂无租用')}</td><td>{item.note || <span className="muted">无备注</span>}</td><td><div className="toolbar"><Button variant="secondary" onClick={() => setHealth(item)}>健康信息</Button><Button variant="secondary" disabled={item.status === 'leased'} onClick={() => setEditing(item)}>维护设置</Button><Button variant="danger" disabled={item.status === 'leased'} onClick={() => { remove.reset(); setRemoving(item) }}>移出</Button></div>{item.status === 'leased' && <p className="muted">租用中不可手动改状态或移出</p>}</td></tr>)}</tbody></table></div><Pagination page={currentPage} total={items.length} onChange={setPage} /></> : <EmptyState title="暂无匹配的池资源" description="调整筛选，或从候选 VM 中选择资源入池。" action={<Button onClick={() => setAdding(true)}>查看候选 VM</Button>} />}</QueryState>
+      <QueryState query={query}>{items.length ? <><div className="table-wrap"><table className="data-table"><thead><tr><th>VM / 账号</th><th>资源状态</th><th>凭证 / 调度</th><th>租用人</th><th>备注</th><th>操作</th></tr></thead><tbody>{items.slice((currentPage - 1) * 20, currentPage * 20).map((item) => <tr key={item.vm_id}><td><strong>{item.vm?.label || '未命名 VM'}</strong><p className="mono muted">{item.vm_id}</p><p className="muted">{item.vm?.email_masked || '暂无邮箱'} · {item.tier || item.vm?.tier || '未知规格'}</p></td><td><Badge status={item.status} /></td><td><span>{credentialLabels[item.vm?.cred_status] ?? '凭证状态待确认'}</span><p className="muted">{scheduleLabels[item.vm?.schedule_state] ?? '调度状态未知'}</p></td><td>{leaseLabel(item)}</td><td>{item.note || <span className="muted">无备注</span>}</td><td><div className="toolbar"><Button variant="secondary" onClick={() => setHealth(item)}>健康信息</Button><Button variant="secondary" disabled={item.status === 'leased'} onClick={() => setEditing(item)}>维护设置</Button><Button variant="danger" disabled={item.status === 'leased'} onClick={() => { remove.reset(); setRemoving(item) }}>移出</Button></div>{item.status === 'leased' && <p className="muted">租用中不可手动改状态或移出</p>}</td></tr>)}</tbody></table></div><Pagination page={currentPage} total={items.length} onChange={setPage} /></> : <EmptyState title="暂无匹配的池资源" description="调整筛选，或从候选 VM 中选择资源入池。" action={<Button onClick={() => setAdding(true)}>查看候选 VM</Button>} />}</QueryState>
     </Card>
     {adding && <PoolCandidates onClose={() => setAdding(false)} />}
     {editing && <PoolEditor item={editing} onClose={() => setEditing(null)} />}

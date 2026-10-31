@@ -4,6 +4,8 @@ Claude 账号托管 / 租赁门面，前面挂着 vm2api。用户购买并发、
 
 - 设计：[docs/DESIGN.md](docs/DESIGN.md)
 - 前后端契约：[docs/PORTAL_API.md](docs/PORTAL_API.md)
+- 部署：[docs/DEPLOY.md](docs/DEPLOY.md)
+- 评审与修复记录：[docs/REVIEW.md](docs/REVIEW.md)
 - 协作约定：[AGENTS.md](AGENTS.md)
 
 ## 快速开始（开发）
@@ -19,4 +21,8 @@ cd web && pnpm install && pnpm dev
 
 ## 状态
 
-骨架与接口契约已落地，业务实现进行中。
+MVP 已可运行：商品 / 订单 / 支付、权益与履约、托管 OAuth 上号、租赁分配与到期回收、
+`/v1` 透传网关（含并发闸与 WebSocket）、用量视图、管理后台、React 前端。
+
+尚未验证：真实 vm2api 上的托管建槽、代理分配、OAuth 换票与初装（目前只在 Fake/mock 上跑过）。
+已知限制见 [docs/REVIEW.md](docs/REVIEW.md)。

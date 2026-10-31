@@ -54,6 +54,7 @@ vm2api 文档与源码在 `/Users/duegin/project/2api/vm2api`（只读参考）�
 - **预付周期订阅**：每笔支付成功的订单生成一条 `subscription`（kind、quantity、starts_at、expires_at）。用户某 kind 的权益 = 所有 `active` 订阅 quantity 之和。
 - **续费**：下单带 `renew_subscription_id` → 支付后把该订阅 `expires_at` 顺延 `duration_days`（若已过期则从现在起算）。续费份数 = `subscription.quantity / product.unit_quantity`，不能整除返回 400。
 - **有效并发** = `settings.base_concurrency` + Σ并发订阅 + `concurrency_per_hosted_seat` × 活跃托管资源数 + `concurrency_per_rental_account` × 活跃租赁资源数。后三项系数后台可配（默认 base=1，其余 0）。
+- **并发 0 = 不允许调用**，不是「无限」。网关对有效并发为 0 的用户直接返回 429 `concurrency_limit_exceeded`；同步到 vm2api key 的 `max_concurrency` 下限为 1（vm2api 用 0 表示不限，门面绝不写 0）。
 - **库存**（仅 `rental_account`）：可租 = 租赁池里 `available` 且 vm2api 侧健康（`schedule_state` 为 `on`/`restricted`、凭证可用）的 VM 数 − 未过期待支付订单的预留数。下单时校验，并在订单未支付期间（30 分钟）按订单 `expires_at` 预留。
 
 ## 4. 资源（账号）状态机
@@ -103,7 +104,10 @@ active ──凭证失效（vm2api 不可调度 oauth_*）──▶ needs_reauth
 
 - 支付提供方插件接口：`Create(order) → {type: redirect|qrcode|manual, url, qr, instructions}`；`Notify(req) → {order_no, trade_no, amount_cents, paid}`，验签 + 金额校验 + 幂等。
 - 内置：`epay`（易支付 v1：`submit.php` 跳转、MD5 签名、异步通知 `notify_url` 回 `success`）、`manual`（展示后台配置的收款说明，管理员在后台「标记已支付」）、`mock`（仅 `PORTAL_DEV=1`，下单即可点「模拟支付」）。
-- 订单状态：`pending → paid → fulfilled`；`pending → cancelled | expired`（30 分钟未支付）；`paid → fulfill_failed`（重试任务 + 后台告警）。
+- 订单状态：`pending → paid → fulfilled`；`pending → cancelled | expired`（30 分钟未支付）；`paid → fulfill_failed`（后台「重新履约」可重试）。
+- 「30 分钟」只是**发起支付**的窗口，不是**入账**的门槛：易支付回调延迟、人工转账晚到，只要订单仍是 `pending`（含已过期 `pending`）都能入账；管理员也可对 `expired` 订单人工确认收款补单。
+- `paid → fulfilled` 由持久任务 `fulfil_order:<订单ID>` 完成（dedupe 保证不重复履约），任务用独立 context 执行：支付回调断开或进程重启不会留下「已付款永不履约」的订单。
+- 履约失败写 `fulfill_failed`，不会回滚支付；后台重试或自动退款的路径都从这里开始。
 
 ## 8. 用量视图（全部来自 vm2api）
 

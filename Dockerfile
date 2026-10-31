@@ -16,7 +16,9 @@ COPY --from=web /src/web/dist ./internal/webdist/dist
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/vm2api-portal ./cmd/portal
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata && adduser -D -u 10001 portal
+RUN apk add --no-cache ca-certificates tzdata \
+ && adduser -D -u 10001 portal \
+ && mkdir -p /data && chown -R portal:portal /data
 USER portal
 WORKDIR /app
 COPY --from=build /out/vm2api-portal /app/vm2api-portal

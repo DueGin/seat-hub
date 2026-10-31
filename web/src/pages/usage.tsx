@@ -18,7 +18,9 @@ export function UsagePage() {
   const [distribution, setDistribution] = useState('model')
   const range = useMemo(() => {
     const until = new Date()
-    const from = new Date(until.getTime() - (days === 'custom' ? 7 : Number(days)) * 86400_000)
+    const from = new Date(until)
+    from.setHours(0, 0, 0, 0)
+    from.setDate(from.getDate() - (days === 'custom' ? 6 : Number(days) - 1))
     if (days === 'custom' && fromDate && untilDate) { const end = new Date(`${untilDate}T23:59:59.999`); return { from: new Date(`${fromDate}T00:00:00`).toISOString(), until: end.toISOString() } }
     return { from: from.toISOString(), until: until.toISOString() }
   }, [days, fromDate, untilDate])

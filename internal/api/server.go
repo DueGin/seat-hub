@@ -142,13 +142,21 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			s.Log.Info("api", "method", r.Method, "path", r.URL.Path, "status", sw.status,
 				"ms", time.Since(start).Milliseconds(), "ip", clientIP(r))
 		}()
-		if needsJSON(r.Method) && !strings.Contains(r.Header.Get("Content-Type"), "json") &&
+		if needsJSON(r.Method) && !isJSONContentType(r.Header.Get("Content-Type")) &&
 			!strings.Contains(r.URL.Path, "/notify") && !strings.Contains(r.URL.Path, "/return") {
 			writeErr(sw, http.StatusUnsupportedMediaType, "unsupported_media_type", "请求需为 application/json")
 			return
 		}
 		next.ServeHTTP(sw, r)
 	})
+}
+
+// isJSONContentType accepts application/json (optionally with parameters).
+// Anything else, including text/json and application/jsonish, is rejected: the
+// check doubles as the CSRF guard, so it must not be spoofable by a browser form.
+func isJSONContentType(value string) bool {
+	mediaType, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(value)), ";")
+	return strings.TrimSpace(mediaType) == "application/json"
 }
 
 func needsJSON(method string) bool {
@@ -271,11 +279,35 @@ func (s *Server) admin(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// clientIP returns the caller's address. Behind nginx the TCP peer is the
+// proxy (usually 127.0.0.1), and trusting it blindly would collapse every
+// caller into one rate-limit bucket. X-Forwarded-For is only honoured when the
+// direct peer is a loopback or private address, and the last hop is used: that
+// is the value our own proxy appended or wrote with $remote_addr, so a client
+// cannot spoof it by sending its own header.
 func clientIP(r *http.Request) string {
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	peer := net.ParseIP(host)
+	if peer == nil || !(peer.IsLoopback() || peer.IsPrivate()) {
 		return host
 	}
-	return r.RemoteAddr
+	hops := r.Header.Values("X-Forwarded-For")
+	if len(hops) == 0 {
+		return host
+	}
+	var last string
+	for _, part := range strings.Split(strings.Join(hops, ","), ",") {
+		if candidate := net.ParseIP(strings.TrimSpace(part)); candidate != nil {
+			last = candidate.String()
+		}
+	}
+	if last == "" {
+		return host
+	}
+	return last
 }
 
 func queryInt(r *http.Request, key string, def int) int {

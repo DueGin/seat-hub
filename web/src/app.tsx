@@ -20,6 +20,7 @@ const KeysPage = lazy(() => import('@/pages/keys').then((module) => ({ default: 
 const OrdersPage = lazy(() => import('@/pages/orders').then((module) => ({ default: module.OrdersPage })))
 const OrderDetailPage = lazy(() => import('@/pages/orders').then((module) => ({ default: module.OrderDetailPage })))
 const AdminPage = lazy(() => import('@/pages/admin').then((module) => ({ default: module.AdminPage })))
+const ProfilePage = lazy(() => import('@/pages/profile').then((module) => ({ default: module.ProfilePage })))
 
 function Protected({ admin = false }: { admin?: boolean }) {
   const session = useSession()
@@ -31,7 +32,7 @@ function Protected({ admin = false }: { admin?: boolean }) {
   return <Outlet />
 }
 const userNav = [
-  { to: '/overview', label: '总览', icon: Gauge }, { to: '/accounts', label: '我的账号', icon: Server }, { to: '/keys', label: 'API 密钥', icon: KeyRound }, { to: '/usage', label: '用量分析', icon: Activity }, { to: '/subscriptions', label: '我的订阅', icon: Boxes }, { to: '/orders', label: '订单记录', icon: CreditCard },
+  { to: '/overview', label: '总览', icon: Gauge }, { to: '/accounts', label: '我的账号', icon: Server }, { to: '/keys', label: 'API 密钥', icon: KeyRound }, { to: '/usage', label: '用量分析', icon: Activity }, { to: '/subscriptions', label: '我的订阅', icon: Boxes }, { to: '/orders', label: '订单记录', icon: CreditCard }, { to: '/profile', label: '账户安全', icon: ShieldCheck },
 ]
 const adminNav = [
   { to: '/admin/dashboard', label: '管理总览', icon: LayoutDashboard }, { to: '/admin/products', label: '商品管理', icon: Package }, { to: '/admin/orders', label: '订单管理', icon: ShoppingBag }, { to: '/admin/users', label: '用户管理', icon: Users }, { to: '/admin/rental-pool', label: '租赁池', icon: Boxes }, { to: '/admin/accounts', label: '资源管理', icon: Server }, { to: '/admin/jobs', label: '任务队列', icon: ListTodo }, { to: '/admin/settings', label: '站点设置', icon: Settings },
@@ -44,7 +45,7 @@ function AppLayout() {
   const location = useLocation()
   const navigate = useNavigate()
   const client = useQueryClient()
-  const admin = location.pathname.startsWith('/admin')
+  const admin = location.pathname.startsWith('/admin') && session.data?.role === 'admin'
   const navigation = admin ? adminNav : userNav
   const current = navigation.find((item) => location.pathname.startsWith(item.to))
   useEffect(() => { setOpen(false); window.scrollTo({ top: 0 }) }, [location.pathname])
@@ -58,5 +59,5 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, { failed: bool
   render() { return this.state.failed ? <div className="fatal-error"><ErrorState error={new Error('页面暂时无法显示，请刷新重试')} retry={() => window.location.reload()} /></div> : this.props.children }
 }
 export default function App() {
-  return <AppErrorBoundary><Suspense fallback={<LoadingState />}><Routes><Route path="/" element={<LandingPage />} /><Route path="/login" element={<AuthPage />} /><Route path="/register" element={<AuthPage register />} /><Route element={<Protected />}><Route element={<AppLayout />}><Route path="/overview" element={<OverviewPage />} /><Route path="/accounts" element={<AccountsPage />} /><Route path="/accounts/new" element={<HostedWizardPage />} /><Route path="/accounts/:id" element={<AccountDetailPage />} /><Route path="/subscriptions" element={<SubscriptionsPage />} /><Route path="/keys" element={<KeysPage />} /><Route path="/usage" element={<UsagePage />} /><Route path="/orders" element={<OrdersPage />} /><Route path="/orders/:orderNo" element={<OrderDetailPage />} /><Route element={<Protected admin />}><Route path="/admin" element={<Navigate to="/admin/dashboard" replace />} /><Route path="/admin/:section" element={<AdminPage />} /></Route></Route></Route><Route path="*" element={<div className="not-found"><Brand /><EmptyState title="这个页面走丢了" description="返回工作台，继续你的工作。" action={<NavLink className="button button-primary" to="/overview">返回工作台</NavLink>} /></div>} /></Routes></Suspense></AppErrorBoundary>
+  return <AppErrorBoundary><Suspense fallback={<LoadingState />}><Routes><Route path="/" element={<LandingPage />} /><Route path="/login" element={<AuthPage />} /><Route path="/register" element={<AuthPage register />} /><Route element={<Protected />}><Route element={<AppLayout />}><Route path="/overview" element={<OverviewPage />} /><Route path="/accounts" element={<AccountsPage />} /><Route path="/accounts/new" element={<HostedWizardPage />} /><Route path="/accounts/:id" element={<AccountDetailPage />} /><Route path="/subscriptions" element={<SubscriptionsPage />} /><Route path="/keys" element={<KeysPage />} /><Route path="/usage" element={<UsagePage />} /><Route path="/profile" element={<ProfilePage />} /><Route path="/orders" element={<OrdersPage />} /><Route path="/orders/:orderNo" element={<OrderDetailPage />} /><Route element={<Protected admin />}><Route path="/admin" element={<Navigate to="/admin/dashboard" replace />} /><Route path="/admin/:section" element={<AdminPage />} /></Route></Route></Route><Route path="*" element={<div className="not-found"><Brand /><EmptyState title="这个页面走丢了" description="返回工作台，继续你的工作。" action={<NavLink className="button button-primary" to="/overview">返回工作台</NavLink>} /></div>} /></Routes></Suspense></AppErrorBoundary>
 }

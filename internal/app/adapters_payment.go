@@ -2,10 +2,14 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/DueGin/vm2api-portal/internal/api"
 	"github.com/DueGin/vm2api-portal/internal/order"
@@ -17,11 +21,56 @@ import (
 // Provider enablement is read from the admin settings document on every call so
 // changing it takes effect without a restart.
 type paymentAdapter struct {
-	svc          *payment.Service
+	db           *sql.DB
+	marker       payment.PaidMarker
 	settings     *settingsAdapter
 	dev          bool
 	callbackBase string // e.g. https://portal.example.com, no trailing slash
+
+	// svc is rebuilt whenever the stored payment document changes, so editing
+	// the merchant credentials in the admin console takes effect without a
+	// restart. The provider list and the charge path must agree on what is
+	// enabled, or an order is created for a provider that cannot charge.
+	mu      sync.Mutex
+	svc     *payment.Service
+	svcHash string
 }
+
+// service returns a payment service matching the current settings.
+func (a *paymentAdapter) service(ctx context.Context) (*payment.Service, error) {
+	raw := deepcopyRaw(a.rawPayment(ctx))
+	sum := sha256.Sum256(raw)
+	hash := hex.EncodeToString(sum[:])
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.svc != nil && a.svcHash == hash {
+		return a.svc, nil
+	}
+	providers, err := buildProvidersFrom(a.db, a.rawPayment(ctx), a.dev)
+	if err != nil {
+		return nil, err
+	}
+	svc, err := payment.NewService(a.db, a.marker, payment.ServiceOptions{Providers: providers, Dev: a.dev})
+	if err != nil {
+		// Keep the previous service rather than breaking charging entirely.
+		if a.svc != nil {
+			return a.svc, nil
+		}
+		return nil, err
+	}
+	a.svc, a.svcHash = svc, hash
+	return svc, nil
+}
+
+func (a *paymentAdapter) rawPayment(ctx context.Context) []byte {
+	site, err := a.settings.Get(ctx)
+	if err != nil {
+		return nil
+	}
+	return site.Payment
+}
+
+func deepcopyRaw(raw []byte) []byte { return append([]byte(nil), raw...) }
 
 func (a *paymentAdapter) Providers(ctx context.Context) []api.PaymentProviderDTO {
 	cfg := a.paymentConfig(ctx)
@@ -71,7 +120,11 @@ func enabled(cfg map[string]any, provider string) bool {
 }
 
 func (a *paymentAdapter) CreatePayment(ctx context.Context, o api.OrderDTO) (api.PaymentDTO, error) {
-	p, err := a.svc.Create(ctx, o.Provider, payment.CreateRequest{
+	svc, err := a.service(ctx)
+	if err != nil {
+		return api.PaymentDTO{}, mapPaymentErr(err)
+	}
+	p, err := svc.Create(ctx, o.Provider, payment.CreateRequest{
 		OrderNo:     o.OrderNo,
 		ProductName: o.ProductName,
 		AmountCents: o.AmountCents,
@@ -85,7 +138,11 @@ func (a *paymentAdapter) CreatePayment(ctx context.Context, o api.OrderDTO) (api
 }
 
 func (a *paymentAdapter) Notify(ctx context.Context, provider string, r *http.Request) (int, string, error) {
-	notice, err := a.svc.Notify(ctx, provider, r)
+	svc, svcErr := a.service(ctx)
+	if svcErr != nil {
+		return http.StatusBadRequest, "fail", svcErr
+	}
+	notice, err := svc.Notify(ctx, provider, r)
 	if err != nil {
 		return http.StatusBadRequest, "fail", err
 	}
@@ -95,7 +152,11 @@ func (a *paymentAdapter) Notify(ctx context.Context, provider string, r *http.Re
 
 // ReturnURL sends the browser back to the order page after a redirect payment.
 func (a *paymentAdapter) MockPay(ctx context.Context, userID int64, orderNo string) error {
-	if err := a.svc.MockPay(ctx, userID, orderNo); err != nil {
+	svc, err := a.service(ctx)
+	if err != nil {
+		return mapPaymentErr(err)
+	}
+	if err := svc.MockPay(ctx, userID, orderNo); err != nil {
 		return mapPaymentErr(err)
 	}
 	return nil

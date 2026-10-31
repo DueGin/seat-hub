@@ -41,7 +41,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o bin
 ## 3. systemd
 
 ```bash
-sudo mkdir -p /opt/vm2api-portal && sudo cp bin/vm2api-portal /opt/vm2api-portal/
+sudo install -D -m 0755 bin/vm2api-portal /opt/vm2api-portal/vm2api-portal
 sudo cp -r deploy .env /opt/vm2api-portal/
 sudo cp /opt/vm2api-portal/deploy/vm2api-portal.service /etc/systemd/system/
 sudo useradd -r -s /usr/sbin/nologin portal || true

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import type { Settings } from '@/lib/types'
-import { validateSettings } from './settings-validation.ts'
+import type { NormalizedSettings } from '@/lib/types'
+import { normalizeSettings, validateSettings } from './settings-validation.ts'
 
-function settings(): Settings {
+function settings(): NormalizedSettings {
   return { site_name: '测试站点', registration_open: true, base_concurrency: 1, concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0, hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0, hosted_vm_template: {}, payment: { epay: { enabled: false, gateway_url: '', pid: '', key: '', types: [] }, manual: { enabled: false, instructions: '' } } }
 }
 
@@ -70,4 +70,18 @@ test('支付网关拒绝非 HTTP 协议和带凭证 URL', () => {
     const draft = settings(); draft.payment.epay.gateway_url = gateway_url
     assert.throws(() => validateSettings(draft, '{}', '[]'), /网关/)
   }
+})
+
+test('payment 缺失、为空对象或只有一个支付方时也能渲染与校验', () => {
+  const fresh = { site_name: '全新部署', registration_open: true } as unknown as Parameters<typeof normalizeSettings>[0]
+  const normalized = normalizeSettings(fresh)
+  assert.deepEqual(normalized.payment.epay, { enabled: false, gateway_url: '', pid: '', key: '', types: ['alipay', 'wxpay'] })
+  assert.deepEqual(normalized.payment.manual, { enabled: false, instructions: '' })
+  assert.equal(normalized.base_concurrency, 1)
+  assert.deepEqual(normalizeSettings({ payment: {} }).payment.epay.types, ['alipay', 'wxpay'])
+  const partial = normalizeSettings({ payment: { epay: { enabled: true } } })
+  assert.equal(partial.payment.epay.enabled, true)
+  assert.equal(partial.payment.manual.enabled, false)
+  const result = validateSettings({ site_name: '全新部署', hosted_vm_template: {}, base_concurrency: 1, concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0, hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0 } as never, '{}', '[]')
+  assert.deepEqual(result.payment.manual, { enabled: false, instructions: '' })
 })

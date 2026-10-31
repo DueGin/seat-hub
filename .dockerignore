@@ -1,0 +1,12 @@
+.git
+.gitignore
+data/
+bin/
+web/node_modules
+web/dist
+internal/webdist/dist
+*.db
+*.db-wal
+*.db-shm
+.env
+.DS_Store

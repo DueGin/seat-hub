@@ -19,6 +19,10 @@ type provisionSpan struct {
 	prov  *provision.Service
 	usage *usage.Service
 	db    *sql.DB
+	// keyStats reads one upstream key's usage from vm2api; nil disables it.
+	keyStats func(ctx context.Context, vm2apiKeyID string) (vm2api.UsageBreakdown, error)
+	// inflight reports the gateway's live request count for a user.
+	inflight func(userID int64) int
 }
 
 func toSeatDTO(c provision.Capacity) api.SeatDTO { return api.SeatDTO{Total: c.Total, Used: c.Used} }
@@ -151,7 +155,9 @@ func (p *provisionSpan) Get(ctx context.Context, userID, id int64) (api.AccountD
 	}
 	dto := toAccountDTO(a, toAccountUsageDTO(u))
 	if u == nil {
-		return dto, nil, nil, nil
+		// vm2api is unreachable or the account has no live VM: the contract
+		// says these are arrays, so hand back empty ones instead of null.
+		return dto, []api.DailyDTO{}, []api.ModelDTO{}, nil
 	}
 	return dto, toDaily(u.Daily), toModels(u.ByModel), nil
 }
@@ -257,6 +263,9 @@ func (p *provisionSpan) Overview(ctx context.Context, userID int64) (api.Overvie
 		RentalAccounts: toSeatDTO(ent.RentalAccounts),
 		AccountsActive: ent.AccountsActive,
 	}
+	if p.inflight != nil {
+		out.Concurrency.InUse = p.inflight(userID)
+	}
 	if ov, err := p.usage.Overview(ctx, userID); err == nil && ov.UsageToday != nil {
 		out.UsageToday = toSpend(ov.UsageToday)
 	}
@@ -288,15 +297,18 @@ func (p *provisionSpan) keys(ctx context.Context, userID int64) (int, error) {
 }
 
 func (p *provisionSpan) Subscriptions(ctx context.Context, userID int64, status string) ([]api.SubscriptionDTO, error) {
-	query := `SELECT id, kind, quantity, status, starts_at, expires_at, COALESCE(source_order_id, 0) FROM subscriptions WHERE user_id = ?`
+	query := `SELECT s.id, s.kind, s.quantity, s.status, s.starts_at, s.expires_at,
+		COALESCE(o.order_no, '')
+		FROM subscriptions s LEFT JOIN orders o ON o.id = s.source_order_id
+		WHERE s.user_id = ?`
 	args := []any{userID}
 	switch status {
 	case "active":
-		query += ` AND status = 'active'`
+		query += ` AND s.status = 'active'`
 	case "expired":
-		query += ` AND status <> 'active'`
+		query += ` AND s.status <> 'active'`
 	}
-	rows, err := p.db.QueryContext(ctx, query+` ORDER BY expires_at ASC`, args...)
+	rows, err := p.db.QueryContext(ctx, query+` ORDER BY s.expires_at ASC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list subscriptions: %w", err)
 	}
@@ -304,13 +316,17 @@ func (p *provisionSpan) Subscriptions(ctx context.Context, userID int64, status 
 	products, _ := p.renewableProducts(ctx)
 	out := make([]api.SubscriptionDTO, 0)
 	for rows.Next() {
-		var s api.SubscriptionDTO
-		var orderID int64
-		if err := rows.Scan(&s.ID, &s.Kind, &s.Quantity, &s.Status, &s.StartsAt, &s.ExpiresAt, &orderID); err != nil {
+		var sub api.SubscriptionDTO
+		var orderNo string
+		if err := rows.Scan(&sub.ID, &sub.Kind, &sub.Quantity, &sub.Status, &sub.StartsAt, &sub.ExpiresAt, &orderNo); err != nil {
 			return nil, fmt.Errorf("scan subscription: %w", err)
 		}
-		s.Renewable, s.RenewProductIDs = true, matchRenewables(products, s.Kind, s.Quantity)
-		out = append(out, s)
+		sub.SourceOrderNo = orderNo
+		sub.RenewProductIDs = matchRenewables(products, sub.Kind, sub.Quantity)
+		// Only offer renewal when a matching product exists; an empty list would
+		// render a button that cannot do anything.
+		sub.Renewable = len(sub.RenewProductIDs) > 0
+		out = append(out, sub)
 	}
 	return out, rows.Err()
 }
@@ -417,16 +433,30 @@ func (p *provisionSpan) Logs(ctx context.Context, userID int64, q api.UsageLogQu
 	return out, nil
 }
 
+// KeyStats is the per-key usage panel. It must check ownership: without it any
+// user could read another user's aggregate by guessing a key id.
 func (p *provisionSpan) KeyStats(ctx context.Context, userID, keyID int64) ([]api.DailyDTO, []api.ModelDTO, error) {
-	// Key stats come from vm2api per upstream key; the usage package exposes
-	// them through the summary split, so a single-key window is reused here.
-	now := time.Now().UTC()
-	summary, err := p.usage.Summary(ctx, userID, now.AddDate(0, 0, -30), now)
+	var upstreamKeyID string
+	err := p.db.QueryRowContext(ctx,
+		`SELECT vm2api_key_id FROM api_keys WHERE id = ? AND user_id = ? AND status <> 'deleted'`,
+		keyID, userID).Scan(&upstreamKeyID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil, api.Err(errKeyNotFound, 404, "key_not_found", "API Key 不存在")
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("look up key: %w", err)
+	}
+	if p.keyStats == nil || upstreamKeyID == "" {
+		return []api.DailyDTO{}, []api.ModelDTO{}, nil
+	}
+	breakdown, err := p.keyStats(ctx, upstreamKeyID)
 	if err != nil {
 		return nil, nil, err
 	}
-	return toDaily(summary.Daily), toModels(summary.ByModel), nil
+	return toDaily(breakdown.Daily), toModels(breakdown.ByModel), nil
 }
+
+var errKeyNotFound = errors.New("key not found")
 
 // Entitlement answers the gateway resolver: effective concurrency and how many
 // accounts are usable right now.

@@ -55,12 +55,29 @@ func (service *Service) SyncConcurrency(ctx context.Context, userID int64) error
 	return service.syncConcurrency(ctx, userID)
 }
 
+// minConcurrency is the smallest limit written upstream. vm2api treats
+// max_concurrency <= 0 as "unlimited", so a user with zero purchased concurrency
+// must be synced as 1 rather than 0: 0 here means "no requests allowed", and the
+// upstream key must never be handed an unlimited budget by accident.
+const minConcurrency = 1
+
+// EffectiveConcurrency maps an entitlement total onto the value written to
+// vm2api: zero purchased concurrency stays a hard zero for the gateway, but the
+// upstream key limit must never be 0 because vm2api reads 0 as unlimited.
+func EffectiveConcurrency(total int) int {
+	if total < minConcurrency {
+		return minConcurrency
+	}
+	return total
+}
+
 func (service *Service) syncConcurrency(ctx context.Context, userID int64) error {
 	entitlements, err := service.Entitlements(ctx, userID)
 	if err != nil {
 		return err
 	}
-	rows, err := service.db.QueryContext(ctx, `SELECT id,vm2api_key_id FROM api_keys WHERE user_id=? AND status='active' AND synced_concurrency<>?`, userID, entitlements.Concurrency.Total)
+	limit := EffectiveConcurrency(entitlements.Concurrency.Total)
+	rows, err := service.db.QueryContext(ctx, `SELECT id,vm2api_key_id FROM api_keys WHERE user_id=? AND status='active' AND synced_concurrency<>?`, userID, limit)
 	if err != nil {
 		return fmt.Errorf("list keys for sync: %w", err)
 	}
@@ -83,11 +100,15 @@ func (service *Service) syncConcurrency(ctx context.Context, userID int64) error
 		return fmt.Errorf("read sync keys: %w", readErr)
 	}
 	for _, item := range keys {
-		limit := entitlements.Concurrency.Total
-		if err := service.client.UpdateKey(ctx, item.upstream, vm2api.UpdateKeyInput{MaxConcurrency: &limit}); err != nil {
-			return fmt.Errorf("sync key concurrency: %w", err)
+		upstream := limit
+		if err := service.client.UpdateKey(ctx, item.upstream, vm2api.UpdateKeyInput{MaxConcurrency: &upstream}); err != nil {
+			// A key deleted upstream is already gone: there is no concurrency
+			// left to clamp, and failing here would abort the caller's sweep.
+			if !vm2api.IsStatus(err, 404) {
+				return fmt.Errorf("sync key concurrency: %w", err)
+			}
 		}
-		if _, err := service.db.ExecContext(ctx, `UPDATE api_keys SET synced_concurrency=?,updated_at=? WHERE id=? AND status='active'`, entitlements.Concurrency.Total, timestamp(service.now()), item.id); err != nil {
+		if _, err := service.db.ExecContext(ctx, `UPDATE api_keys SET synced_concurrency=?,updated_at=? WHERE id=? AND status='active'`, limit, timestamp(service.now()), item.id); err != nil {
 			return fmt.Errorf("save synced concurrency: %w", err)
 		}
 	}

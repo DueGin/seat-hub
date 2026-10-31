@@ -4,13 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	authed "github.com/DueGin/vm2api-portal/internal/auth"
 )
 
 // --- fakes ---
@@ -18,9 +22,18 @@ import (
 type fakeAuth struct {
 	user  *UserDTO
 	token string
+
+	loginErr error
+
+	mu       sync.Mutex
+	revoked  []string // "userID|keepHash" pairs passed to RevokeOthers
+	tokenHsh string
 }
 
 func (f *fakeAuth) Login(ctx context.Context, email, password, ip, ua string) (string, UserDTO, error) {
+	if f.loginErr != nil {
+		return "", UserDTO{}, f.loginErr
+	}
 	if f.user == nil {
 		return "", UserDTO{}, ErrInvalidCredentials
 	}
@@ -43,10 +56,18 @@ func (f *fakeAuth) UserFrom(ctx context.Context) (UserDTO, bool) {
 	u, ok := ctx.Value(fakeUserKey).(UserDTO)
 	return u, ok
 }
-func (f *fakeAuth) TokenHashFrom(ctx context.Context) string   { return "" }
+func (f *fakeAuth) TokenHashFrom(ctx context.Context) string   { return f.tokenHsh }
 func (f *fakeAuth) Allowed(ip, email string) bool              { return true }
 func (f *fakeAuth) HashPassword(p string) (string, error)      { return "h", nil }
 func (f *fakeAuth) VerifyPassword(userID int64, p string) bool { return p == "right" }
+
+// RevokeOthers records the call instead of touching sessions.
+func (f *fakeAuth) RevokeOthers(ctx context.Context, userID int64, keepTokenHash string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revoked = append(f.revoked, fmt.Sprintf("%d|%s", userID, keepTokenHash))
+	return nil
+}
 
 type fakeUserKeyType struct{}
 
@@ -234,14 +255,21 @@ func apiErr(sentinel error, status int, code, msg string) error {
 
 func newTestServer(t *testing.T, role string) *httptest.Server {
 	t.Helper()
+	srv, _ := newTestServerWithAuth(t, role)
+	return srv
+}
+
+func newTestServerWithAuth(t *testing.T, role string) (*httptest.Server, *fakeAuth) {
+	t.Helper()
 	var user *UserDTO
 	if role != "" {
 		user = &UserDTO{ID: 1, Email: "u@example.com", Role: role, Status: "active"}
 	}
+	auth := &fakeAuth{user: user}
 	s := &Server{
 		Deps: Deps{
 			Users: fakeUsers{}, Settings: fakeSettings{}, Audit: fakeAudit{},
-			Auth:    &fakeAuth{user: user},
+			Auth:    auth,
 			Catalog: fakeCatalog{}, Orders: fakeOrders{}, Payments: fakePayments{},
 			Accounts: fakeAccounts{}, Usage: fakeUsage{}, Keys: fakeKeys{}, Admin: fakeAdmin{},
 			Site: func(r *http.Request) SiteConfig { return SiteConfig{SiteName: "测试站", BaseURL: "http://x"} },
@@ -251,7 +279,7 @@ func newTestServer(t *testing.T, role string) *httptest.Server {
 	}
 	srv := httptest.NewServer(s.Deps.Auth.Middleware(s.Handler()))
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, auth
 }
 
 func doJSON(t *testing.T, method, url, body string) (*http.Response, map[string]any) {
@@ -354,5 +382,108 @@ func TestUnknownFieldsRejected(t *testing.T) {
 	resp, _ := doJSON(t, http.MethodPost, srv.URL+"/api/orders", `{"product_id":1,"quantity":1,"provider":"manual","bogus":1}`)
 	if resp.StatusCode != 422 {
 		t.Fatalf("status=%d", resp.StatusCode)
+	}
+}
+
+func TestDisabledLoginReturns403(t *testing.T) {
+	srv, auth := newTestServerWithAuth(t, "user")
+	auth.loginErr = authed.ErrUserDisabled
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/api/auth/login", `{"email":"u@example.com","password":"right"}`)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+	errObj, _ := body["error"].(map[string]any)
+	if errObj["code"] != "user_disabled" {
+		t.Fatalf("code = %v, want user_disabled", errObj["code"])
+	}
+}
+
+func TestWrongPasswordStays401(t *testing.T) {
+	srv, auth := newTestServerWithAuth(t, "user")
+	auth.loginErr = authed.ErrInvalidCredentials
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/api/auth/login", `{"email":"u@example.com","password":"nope"}`)
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", resp.StatusCode)
+	}
+	errObj, _ := body["error"].(map[string]any)
+	if errObj["code"] != "invalid_credentials" {
+		t.Fatalf("code = %v", errObj["code"])
+	}
+}
+
+func TestChangePasswordRevokesOtherSessions(t *testing.T) {
+	srv, auth := newTestServerWithAuth(t, "user")
+	auth.tokenHsh = "hash-of-current-token"
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/api/auth/password",
+		`{"old_password":"right","new_password":"new-password"}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d body = %v", resp.StatusCode, body)
+	}
+	auth.mu.Lock()
+	defer auth.mu.Unlock()
+	if len(auth.revoked) != 1 {
+		t.Fatalf("RevokeOthers calls = %v, want exactly one", auth.revoked)
+	}
+	if want := "1|hash-of-current-token"; auth.revoked[0] != want {
+		t.Fatalf("RevokeOthers = %q, want %q (current session kept)", auth.revoked[0], want)
+	}
+}
+
+func TestChangePasswordRejectsWrongOldPassword(t *testing.T) {
+	srv, auth := newTestServerWithAuth(t, "user")
+	resp, _ := doJSON(t, http.MethodPost, srv.URL+"/api/auth/password",
+		`{"old_password":"wrong","new_password":"new-password"}`)
+	if resp.StatusCode != 422 {
+		t.Fatalf("status = %d, want 422", resp.StatusCode)
+	}
+	auth.mu.Lock()
+	defer auth.mu.Unlock()
+	if len(auth.revoked) != 0 {
+		t.Fatalf("sessions revoked on a failed change: %v", auth.revoked)
+	}
+}
+
+func TestJSONContentTypeIsStrict(t *testing.T) {
+	cases := map[string]bool{
+		"application/json":                  true,
+		"application/json; charset=utf-8":   true,
+		"APPLICATION/JSON":                  true,
+		" application/json ":                true,
+		"text/json":                         false,
+		"application/jsonish":               false,
+		"application/x-www-form-urlencoded": false,
+		"multipart/form-data; boundary=x":   false,
+		"":                                  false,
+	}
+	for contentType, want := range cases {
+		if got := isJSONContentType(contentType); got != want {
+			t.Fatalf("isJSONContentType(%q) = %v, want %v", contentType, got, want)
+		}
+	}
+}
+
+func TestClientIPHonoursForwardedForOnlyFromProxy(t *testing.T) {
+	cases := []struct {
+		name       string
+		remoteAddr string
+		xff        []string
+		want       string
+	}{
+		{"direct client ignores spoofed xff", "203.0.113.9:5555", []string{"1.2.3.4"}, "203.0.113.9"},
+		{"loopback proxy uses last hop", "127.0.0.1:5555", []string{"1.2.3.4"}, "1.2.3.4"},
+		{"private proxy uses last hop", "10.0.0.5:5555", []string{"1.2.3.4"}, "1.2.3.4"},
+		{"proxy keeps rightmost valid hop", "127.0.0.1:5555", []string{"9.9.9.9, 5.6.7.8"}, "5.6.7.8"},
+		{"proxy with junk hop falls back", "127.0.0.1:5555", []string{"not-an-ip"}, "127.0.0.1"},
+		{"proxy without xff", "127.0.0.1:5555", nil, "127.0.0.1"},
+	}
+	for _, tc := range cases {
+		r := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+		r.RemoteAddr = tc.remoteAddr
+		for _, v := range tc.xff {
+			r.Header.Add("X-Forwarded-For", v)
+		}
+		if got := clientIP(r); got != tc.want {
+			t.Fatalf("%s: clientIP = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }

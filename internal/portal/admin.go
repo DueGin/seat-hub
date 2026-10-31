@@ -374,6 +374,10 @@ func (service *Service) GrantSubscription(ctx context.Context, adminID, userID i
 		return fmt.Errorf("开始赠送事务失败: %w", err)
 	}
 	defer tx.Rollback()
+	stock, err := service.rentalStock(ctx, kind, quantity)
+	if err != nil {
+		return err
+	}
 	stamp := store.FmtTime(now)
 	_, err = tx.ExecContext(ctx, `INSERT INTO products(kind,name,unit_quantity,duration_days,price_cents,
 		currency,min_qty,max_qty,enabled,created_at,updated_at)
@@ -424,7 +428,31 @@ func (service *Service) GrantSubscription(ctx context.Context, adminID, userID i
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交赠送事务失败: %w", err)
 	}
+	// A granted rental subscription entitles the user to real accounts: assign
+	// them now, after the entitlement rows are committed. Failing here leaves a
+	// subscription without stock, so the error is returned rather than swallowed.
+	if kind == "rental_account" && stock {
+		if err := service.provisioning.AllocateRental(ctx, subscriptionID); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// rentalStock verifies a rental grant can be honoured before anything is
+// written. It returns whether an allocation is needed at all.
+func (service *Service) rentalStock(ctx context.Context, kind string, quantity int) (bool, error) {
+	if kind != "rental_account" {
+		return false, nil
+	}
+	var available int
+	if err := service.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rental_pool WHERE status='available'`).Scan(&available); err != nil {
+		return false, fmt.Errorf("查询租赁库存失败: %w", err)
+	}
+	if available < quantity {
+		return false, adminError(http.StatusConflict, "out_of_stock", "租赁池可用账号不足，无法赠送")
+	}
+	return true, nil
 }
 
 func (service *Service) PatchSubscription(ctx context.Context, id int64, expiresAt *string, status string) error {
@@ -470,6 +498,18 @@ func (service *Service) PatchSubscription(ctx context.Context, id int64, expires
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("提交修改订阅事务失败: %w", err)
+	}
+	// Extending a rental subscription revives its entitlement. If its accounts
+	// were already released, the user would stay entitled to N accounts while
+	// holding none, so top the subscription back up.
+	var kind, current string
+	if err := service.db.QueryRowContext(ctx, `SELECT kind,status FROM subscriptions WHERE id=?`, id).Scan(&kind, &current); err != nil {
+		return fmt.Errorf("读取订阅类型失败: %w", err)
+	}
+	if kind == "rental_account" && current == "active" {
+		if err := service.provisioning.AllocateRental(ctx, id); err != nil {
+			return err
+		}
 	}
 	return nil
 }

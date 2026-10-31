@@ -31,12 +31,29 @@ type LoginResult struct {
 	Token string // raw cookie value
 }
 
+// dummyPasswordHash is verified whenever an email is unknown so the login
+// path costs the same argon2 work whether or not the account exists. Without
+// it the response time reveals which emails are registered.
+var dummyPasswordHash string
+
+func init() {
+	h, err := HashPassword("vm2api-portal-nonexistent-account")
+	if err == nil {
+		dummyPasswordHash = h
+	}
+}
+
 // Login verifies credentials and issues a session. It returns the user even on
 // failure so callers can distinguish disabled accounts.
 func (s *Service) Login(ctx context.Context, email, password, ip, ua string) (LoginResult, error) {
 	u, err := s.Users.GetByEmail(ctx, email)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			// Burn one argon2 verification so timing does not distinguish an
+			// unknown email from a wrong password.
+			if dummyPasswordHash != "" {
+				VerifyPassword(dummyPasswordHash, password)
+			}
 			return LoginResult{}, ErrInvalidCredentials
 		}
 		return LoginResult{}, err
@@ -164,4 +181,22 @@ func (s *Service) VerifyPassword(userID int64, password string) bool {
 		return false
 	}
 	return VerifyPassword(u.PasswordHash, password)
+}
+
+// ChangePassword replaces the user's password and revokes every session except
+// keepTokenHash (pass "" to revoke all). Rotating a password after a
+// compromise is pointless if the attacker's cookie survives it.
+func (s *Service) ChangePassword(ctx context.Context, userID int64, newHash, keepTokenHash string) error {
+	if err := s.Users.SetPassword(ctx, userID, newHash); err != nil {
+		return err
+	}
+	return s.RevokeOthers(ctx, userID, keepTokenHash)
+}
+
+// RevokeOthers deletes all sessions of the user but keepTokenHash.
+func (s *Service) RevokeOthers(ctx context.Context, userID int64, keepTokenHash string) error {
+	if keepTokenHash == "" {
+		return s.Sessions.DeleteAll(ctx, userID)
+	}
+	return s.Sessions.DeleteOthers(ctx, userID, keepTokenHash)
 }

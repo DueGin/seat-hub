@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -60,6 +61,21 @@ func New(cfg Config) *Gateway {
 func (g *Gateway) Inflight(userID int64) int { return g.limiter.inflight(userID) }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Normalize before routing: net/http hands us the raw path, so
+	// "/v1/../api/panel/login" would otherwise pass isProxiedPath and vm2api
+	// would clean it into its own admin surface on the other side.
+	cleanPath, ok := canonicalPath(r.URL.Path, r.URL.RawPath)
+	if !ok {
+		writeErr(w, r, http.StatusBadRequest, "invalid_path", "请求路径不合法")
+		return
+	}
+	if cleanPath != r.URL.Path {
+		u := *r.URL
+		u.Path = cleanPath
+		u.RawPath = "" // force EscapedPath to re-derive from Path
+		r = r.Clone(r.Context())
+		r.URL = &u
+	}
 	if !isProxiedPath(r.URL.Path) {
 		http.NotFound(w, r)
 		return
@@ -95,6 +111,12 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(r.Context().Err(), context.Canceled) {
 			return
 		}
+		if p.Concurrency <= 0 {
+			// Zero slots is a hard wall, not "unlimited": wait for a purchase.
+			writeErr(w, r, http.StatusTooManyRequests, "concurrency_limit_exceeded",
+				"当前没有可用的并发额度（0 路）：请先购买并发套餐后再调用")
+			return
+		}
 		w.Header().Set("Retry-After", "1")
 		writeErr(w, r, http.StatusTooManyRequests, "concurrency_limit_exceeded",
 			"并发已用满，请提高并发额度或稍后重试")
@@ -126,6 +148,7 @@ func principalFrom(ctx context.Context) *Principal {
 func (g *Gateway) rewrite(pr *httputil.ProxyRequest) {
 	pr.SetURL(g.cfg.Upstream)
 	pr.Out.URL.Path = pr.In.URL.Path
+	pr.Out.URL.RawPath = "" // ServeHTTP already canonicalized Path
 	pr.Out.URL.RawQuery = pr.In.URL.RawQuery
 	pr.Out.Host = g.cfg.Upstream.Host
 
@@ -152,12 +175,14 @@ func (g *Gateway) rewrite(pr *httputil.ProxyRequest) {
 }
 
 func stripHopByHopResponse(resp *http.Response) error {
+	// A 101 must reach handleUpgradeResponse intact: it re-reads the Upgrade
+	// type from the Connection header, so stripping Connection turns every
+	// WebSocket upgrade into "backend tried to switch protocol \"\"".
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		return nil
+	}
 	for _, h := range []string{"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
 		"Te", "Trailer", "Transfer-Encoding", "Upgrade"} {
-		// Keep Upgrade for 101 responses so the hijack path still works.
-		if resp.StatusCode == http.StatusSwitchingProtocols && h == "Upgrade" {
-			continue
-		}
 		resp.Header.Del(h)
 	}
 	return nil
@@ -178,6 +203,52 @@ func (g *Gateway) onProxyError(w http.ResponseWriter, r *http.Request, err error
 // isProxiedPath limits the gateway to the vm2api protocol surface.
 func isProxiedPath(p string) bool {
 	return p == "/v1" || strings.HasPrefix(p, "/v1/")
+}
+
+// canonicalPath cleans a request path and rejects dot segments outright.
+//
+// Cleaning alone is not enough: path.Clean("/v1/../api/panel/login") is
+// "/api/panel/login", which is outside the gateway surface, but a path such as
+// "/v1/./messages" would silently normalize into an allowed route. Rejecting
+// any "." or ".." segment keeps one meaning for both Path and RawPath and
+// makes an encoded attempt (%2e%2e) fail the same way as the plain form.
+func canonicalPath(p, rawPath string) (string, bool) {
+	if hasDotSegment(p) || hasDotSegment(rawPath) {
+		return "", false
+	}
+	if p == "" {
+		return "/", true
+	}
+	trailingSlash := strings.HasSuffix(p, "/") && p != "/"
+	clean := path.Clean(p)
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	if clean == "/" {
+		return clean, true
+	}
+	if trailingSlash {
+		clean += "/"
+	}
+	return clean, true
+}
+
+// hasDotSegment reports whether any "/"-separated segment is "." or "..".
+// It also inspects percent-decoded segments so "/v1/%2e%2e/x" is caught even
+// when the caller only guards RawPath.
+func hasDotSegment(p string) bool {
+	if p == "" {
+		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return true
+		}
+		if unescaped, err := url.PathUnescape(seg); err == nil && (unescaped == "." || unescaped == "..") {
+			return true
+		}
+	}
+	return false
 }
 
 func presentedKey(r *http.Request) string {
@@ -279,13 +350,17 @@ func (l *limiter) inflight(userID int64) int {
 	return l.active[userID]
 }
 
-// acquire reserves one slot for the user. limit <= 0 is treated as unlimited.
+// acquire reserves one slot for the user. limit <= 0 means the user has no
+// concurrency at all (not "unlimited"), which the caller turns into a 429.
+//
+// Every successful acquire returns a release func, and every path that can
+// race with a hand-over still returns one: release() transfers the slot to the
+// waiter by closing its channel *and* incrementing active, so a waiter that
+// loses the select race to ctx.Done must hand the slot back instead of
+// dropping it.
 func (l *limiter) acquire(ctx context.Context, userID int64, limit int, queueTimeout time.Duration) (func(), bool) {
 	if limit <= 0 {
-		l.mu.Lock()
-		l.active[userID]++
-		l.mu.Unlock()
-		return func() { l.release(userID) }, true
+		return nil, false
 	}
 	l.mu.Lock()
 	if l.active[userID] < limit {
@@ -307,46 +382,60 @@ func (l *limiter) acquire(ctx context.Context, userID int64, limit int, queueTim
 	case <-ch:
 		return func() { l.release(userID) }, true
 	case <-timer.C:
-		l.mu.Lock()
-		removed := false
-		ws := l.waiters[userID]
-		for i, w := range ws {
-			if w == ch {
-				l.waiters[userID] = append(ws[:i], ws[i+1:]...)
-				removed = true
-				break
-			}
+		if l.dequeue(userID, ch) {
+			return nil, false
 		}
-		l.mu.Unlock()
-		// The slot may have been handed over between the select and now.
-		if !removed {
-			return func() { l.release(userID) }, true
-		}
-		return nil, false
+		// release() already took us out of the queue and handed the slot
+		// over; take ownership of it.
+		return func() { l.release(userID) }, true
 	case <-ctx.Done():
-		l.mu.Lock()
-		ws := l.waiters[userID]
-		for i, w := range ws {
-			if w == ch {
-				l.waiters[userID] = append(ws[:i], ws[i+1:]...)
-				break
-			}
+		if l.dequeue(userID, ch) {
+			return nil, false
 		}
-		l.mu.Unlock()
-		return nil, false
+		// Same race as above: the slot was already transferred to us.
+		return func() { l.release(userID) }, true
 	}
+}
+
+// dequeue removes ch from the waiter queue and reports whether it was still
+// queued. false means release() already claimed it.
+func (l *limiter) dequeue(userID int64, ch chan struct{}) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	ws := l.waiters[userID]
+	for i, w := range ws {
+		if w == ch {
+			l.waiters[userID] = append(ws[:i], ws[i+1:]...)
+			if len(l.waiters[userID]) == 0 {
+				delete(l.waiters, userID)
+			}
+			return true
+		}
+	}
+	if len(ws) == 0 {
+		delete(l.waiters, userID)
+	}
+	return false
 }
 
 func (l *limiter) release(userID int64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.active[userID] > 0 {
-		l.active[userID]--
-	}
 	if ws := l.waiters[userID]; len(ws) > 0 {
 		w := ws[0]
-		l.waiters[userID] = ws[1:]
-		l.active[userID]++ // hand the slot straight to the waiter
+		if len(ws) == 1 {
+			delete(l.waiters, userID)
+		} else {
+			l.waiters[userID] = ws[1:]
+		}
+		// Hand the slot straight to the waiter: active is neither decremented
+		// here nor incremented there, the count simply transfers.
 		close(w)
+		return
+	}
+	if l.active[userID] > 1 {
+		l.active[userID]--
+	} else {
+		delete(l.active, userID)
 	}
 }

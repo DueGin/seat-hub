@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DueGin/vm2api-portal/internal/api"
@@ -55,7 +56,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	vmClient := vm2api.NewHTTPClient(cfg.VM2APIBaseURL, cfg.VM2APIMasterKey, nil)
 
 	settingsAdv := &settingsAdapter{settings: settings, audit: audit}
-	catalogSvc := catalog.New(db.DB, nil) // health hook installed below once provisioning exists
+	catalogSvc := catalog.New(db.DB, cachedVMHealth(vmClient))
 	orderSvc := order.New(db.DB, catalogSvc, nil)
 	paymentSvc, err := payment.NewService(db.DB, orderSvc, payment.ServiceOptions{
 		Providers: buildProviders(cfg, settingsAdv),
@@ -64,15 +65,31 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	paymentAdv := &paymentAdapter{svc: paymentSvc, settings: settingsAdv, dev: cfg.Dev, callbackBase: callbackBase(cfg)}
+	paymentAdv := &paymentAdapter{db: db.DB, marker: orderSvc, settings: settingsAdv, dev: cfg.Dev, callbackBase: callbackBase(cfg)}
+	paymentAdv.svc = paymentSvc
 
 	// Usage/provisioning services are wired by wiring.go; they are the only
 	// parts that need the job engine.
 	prov := newProvisioner(db, vmClient, box, orderSvc, settings, logger)
 	orderSvc.SetFulfiller(prov)
 
+	usersAdv := &usersAdapter{users: users, db: db.DB, client: vmClient}
+	usersAdv.entitle = func(ctx context.Context, userID int64) (api.AdminUserDTO, error) {
+		ent, err := prov.prov.Entitlements(ctx, userID)
+		if err != nil {
+			return api.AdminUserDTO{}, err
+		}
+		return api.AdminUserDTO{
+			ConcurrencyTotal: ent.Concurrency.Total,
+			HostedUsed:       ent.HostedSeats.Used,
+			HostedTotal:      ent.HostedSeats.Total,
+			RentalUsed:       ent.RentalAccounts.Used,
+			RentalTotal:      ent.RentalAccounts.Total,
+		}, nil
+	}
+
 	deps := api.Deps{
-		Users:    &usersAdapter{users: users, db: db.DB, client: vmClient},
+		Users:    usersAdv,
 		Settings: settingsAdv,
 		Audit:    audit,
 		Auth:     authAdv,
@@ -83,7 +100,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		Usage:    prov,
 		Keys:     &keyAdapter{inner: prov.keys},
 		Admin:    prov,
-		Site:     siteFunc(settings),
+		Site:     siteFunc(settings, cfg.PublicBaseURL),
 		Dev:      cfg.Dev,
 	}
 	apiServer := &api.Server{Deps: deps, Log: logger, Secure: cfg.SecureCookies()}
@@ -94,11 +111,24 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	mux.Handle("/api/", authSvc.Middleware(apiServer.Handler()))
 	mux.Handle("/", authSvc.Middleware(webdist.Handler("")))
 
+	// QueueTimeout is admin-editable (settings.gateway_queue_timeout_ms).
+	// Read once at wiring time: the value is captured for the process lifetime,
+	// so a settings change applies on restart.
+	queueTimeout := time.Duration(0)
+	if site, err := store.LoadSite(context.Background(), settings); err != nil {
+		logger.Warn("gateway queue timeout unavailable, failing fast", "err", err)
+	} else if site.GatewayQueueTimeoutMS > 0 {
+		queueTimeout = time.Duration(site.GatewayQueueTimeoutMS) * time.Millisecond
+	}
+
 	gw := gateway.New(gateway.Config{
 		Upstream:     mustURL(cfg.VM2APIBaseURL),
 		Resolver:     res,
 		MaxBodyBytes: int64(cfg.MaxBodyMB) << 20,
+		QueueTimeout: queueTimeout,
 	})
+
+	prov.SetInflightSource(gw.Inflight)
 
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/v1") {
@@ -150,13 +180,51 @@ func (a *App) Close(ctx context.Context) error {
 	return a.DB.Close()
 }
 
-func siteFunc(settings *store.Settings) func(r *http.Request) api.SiteConfig {
+// cachedVMHealth adapts vm2api's per-VM view into catalog's health probe and
+// caches it: the public product list asks about every pooled VM on each
+// request, and a stale-but-recent answer is better than a blocking fan-out.
+func cachedVMHealth(client vm2api.Client) catalog.HealthFunc {
+	probe := vmHealthFunc(client.GetAccountUsage)
+	type entry struct {
+		healthy bool
+		expires time.Time
+	}
+	var (
+		mu    sync.Mutex
+		cache = map[string]entry{}
+	)
+	return func(vmID string) (bool, bool) {
+		now := time.Now()
+		mu.Lock()
+		if e, ok := cache[vmID]; ok && e.expires.After(now) {
+			mu.Unlock()
+			return e.healthy, true
+		}
+		mu.Unlock()
+		healthy, fetched := probe(vmID)
+		mu.Lock()
+		if len(cache) > 5000 {
+			cache = map[string]entry{}
+		}
+		cache[vmID] = entry{healthy: healthy, expires: now.Add(30 * time.Second)}
+		mu.Unlock()
+		return healthy, fetched
+	}
+}
+
+// siteFunc exposes the storefront config. The public base URL always comes from
+// configuration when set: deriving it from the request Host would let a caller
+// poison what every user is told to point their client at.
+func siteFunc(settings *store.Settings, publicBaseURL string) func(r *http.Request) api.SiteConfig {
 	return func(r *http.Request) api.SiteConfig {
 		site, err := store.LoadSite(r.Context(), settings)
 		if err != nil {
 			site = store.DefaultSite()
 		}
-		base := baseURLFor(r)
+		base := strings.TrimRight(publicBaseURL, "/")
+		if base == "" {
+			base = baseURLFor(r)
+		}
 		return api.SiteConfig{
 			SiteName:         site.SiteName,
 			BaseURL:          base,

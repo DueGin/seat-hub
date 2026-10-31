@@ -19,6 +19,15 @@ func (service *Service) provisionJob(ctx context.Context, job Job) error {
 	return service.ProvisionHosted(ctx, payload.ResourceID)
 }
 
+// Hosted provisioning stages recorded in resources.status_reason when a step
+// fails. They keep "the VM is not ready" distinguishable from "the credential
+// exchange failed": only the latter may continue to the OAuth flow.
+const (
+	stageSlot  = "provisioning_failed:slot"
+	stageOwner = "provisioning_failed:owner"
+	stageProxy = "provisioning_failed:proxy"
+)
+
 func (service *Service) ProvisionHosted(ctx context.Context, resourceID int64) error {
 	service.mu.Lock()
 	defer service.mu.Unlock()
@@ -53,19 +62,89 @@ func (service *Service) ProvisionHosted(ctx context.Context, resourceID int64) e
 			return errors.Join(fmt.Errorf("save hosted vm: %w", err), cleanupErr)
 		}
 	}
+	if err := service.prepareHosted(ctx, account, owner); err != nil {
+		return err
+	}
+	return service.markAwaitingAuth(ctx, resourceID)
+}
+
+// prepareHosted runs the steps that make a hosted VM usable for onboarding:
+// scheduling off, ownership assigned to the buyer, and an egress proxy in
+// place. It is idempotent so a retry (or a link regeneration on a half-built
+// resource) repairs whatever failed before, and it refuses to continue when a
+// step is still broken.
+func (service *Service) prepareHosted(ctx context.Context, account Account, owner string) error {
+	fail := func(stage string, err error) error {
+		return service.failStage(ctx, account.ID, stage, err)
+	}
 	if err := service.client.SetSchedulable(ctx, account.VMID, false); err != nil {
-		return service.failResource(ctx, resourceID, fmt.Errorf("disable hosted scheduling: %w", err))
+		return fail(stageSlot, fmt.Errorf("disable hosted scheduling: %w", err))
 	}
 	if err := service.client.SetVMOwner(ctx, account.VMID, &owner); err != nil {
-		return service.failResource(ctx, resourceID, fmt.Errorf("assign hosted owner: %w", err))
+		return fail(stageOwner, fmt.Errorf("assign hosted owner: %w", err))
 	}
 	if err := service.client.AllocateProxy(ctx, account.VMID); err != nil {
-		return service.failResource(ctx, resourceID, fmt.Errorf("allocate hosted proxy: %w", err))
+		return fail(stageProxy, fmt.Errorf("allocate hosted proxy: %w", err))
 	}
-	if _, err := service.db.ExecContext(ctx, `UPDATE resources SET status='awaiting_auth',last_error=NULL,updated_at=? WHERE id=? AND status IN ('provisioning','failed')`, timestamp(service.now()), resourceID); err != nil {
+	return nil
+}
+
+func (service *Service) markAwaitingAuth(ctx context.Context, resourceID int64) error {
+	if _, err := service.db.ExecContext(ctx, `UPDATE resources SET status='awaiting_auth',status_reason=NULL,last_error=NULL,updated_at=? WHERE id=? AND status IN ('provisioning','failed','awaiting_auth','needs_reauth')`, timestamp(service.now()), resourceID); err != nil {
 		return fmt.Errorf("mark hosted awaiting auth: %w", err)
 	}
 	return nil
+}
+
+// ensureOnboardable verifies, right before an OAuth link is issued or a code is
+// exchanged, that the VM belongs to the buyer and has an egress proxy. A
+// resource whose owner assignment never succeeded must not be onboarded: the VM
+// would stay shared and the user's credential would sit on someone else's slot.
+func (service *Service) ensureOnboardable(ctx context.Context, account Account) error {
+	owner, err := service.upstreamUser(ctx, account.UserID)
+	if err != nil {
+		return err
+	}
+	if provisioningIncomplete(account) {
+		if err := service.prepareHosted(ctx, account, owner); err != nil {
+			return err
+		}
+		return service.markAwaitingAuth(ctx, account.ID)
+	}
+	usage, err := service.client.GetAccountUsage(ctx, account.VMID)
+	if err != nil {
+		if vm2api.IsStatus(err, 404) {
+			return service.failResource(ctx, account.ID, fmt.Errorf("hosted vm %s is missing upstream", account.VMID))
+		}
+		return fmt.Errorf("verify hosted resource: %w", err)
+	}
+	if usage.VM.OwnerUserID == owner && usage.VM.ProxyConfigured {
+		return nil
+	}
+	if err := service.prepareHosted(ctx, account, owner); err != nil {
+		return err
+	}
+	return service.markAwaitingAuth(ctx, account.ID)
+}
+
+// failStage records which provisioning step failed, so a failed resource whose
+// owner or proxy was never assigned can be told apart from one whose
+// authorization code exchange failed.
+func (service *Service) failStage(ctx context.Context, resourceID int64, stage string, failure error) error {
+	if errors.Is(failure, context.Canceled) || errors.Is(failure, context.DeadlineExceeded) {
+		return failure
+	}
+	_, err := service.db.ExecContext(ctx, `UPDATE resources SET status='failed',status_reason=?,last_error=?,updated_at=? WHERE id=? AND status NOT IN ('released','releasing','suspended')`, stage, failure.Error(), timestamp(service.now()), resourceID)
+	if err != nil {
+		return errors.Join(failure, fmt.Errorf("save resource failure: %w", err))
+	}
+	return failure
+}
+
+// provisioningIncomplete reports whether the resource never finished the steps
+// that precede onboarding (create slot, assign owner, allocate proxy).
+func provisioningIncomplete(account Account) bool {
+	return account.StatusReason != nil && strings.HasPrefix(*account.StatusReason, "provisioning_failed:")
 }
 
 type OnboardingError struct {
@@ -123,6 +202,9 @@ func (service *Service) GenerateAuthURL(ctx context.Context, userID, resourceID 
 	if account.Kind != "hosted" || account.VMID == "" || (account.Status != "awaiting_auth" && account.Status != "needs_reauth" && account.Status != "failed") {
 		return vm2api.AuthURL{}, ErrInvalidState
 	}
+	if err := service.ensureOnboardable(ctx, account); err != nil {
+		return vm2api.AuthURL{}, err
+	}
 	auth, err := service.client.GenerateAuthURL(ctx, account.VMID)
 	if err != nil {
 		return vm2api.AuthURL{}, service.failResource(ctx, resourceID, fmt.Errorf("generate auth url: %w", err))
@@ -161,6 +243,9 @@ func (service *Service) SubmitAuthCode(ctx context.Context, userID, resourceID i
 	}
 	if account.Kind != "hosted" || account.VMID == "" || (account.Status != "awaiting_auth" && account.Status != "needs_reauth" && account.Status != "failed") {
 		return ErrInvalidState
+	}
+	if err := service.ensureOnboardable(ctx, account); err != nil {
+		return err
 	}
 	var id int64
 	var storedSession, expires string

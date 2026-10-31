@@ -12,8 +12,12 @@ build: web
 dev:
 	PORTAL_DEV=1 go run ./cmd/portal
 
+# Loads .env so the mock and the portal agree on the master key
+# (PORTAL_MOCK_VM2API_MASTER_KEY defaults to mock-master-key).
 mock:
-	go run ./cmd/mock-vm2api
+	@set -a; [ -f .env ] && . ./.env; set +a; \
+		PORTAL_MOCK_VM2API_MASTER_KEY="$${VM2API_MASTER_KEY:-mock-master-key}" \
+		go run ./cmd/mock-vm2api
 
 test:
 	go test ./...

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"net/url"
 	"strings"
 
@@ -14,33 +15,36 @@ import (
 // missing the provider is simply absent, which makes the storefront offer
 // manual payment only.
 func buildProviders(cfg config.Config, settings *settingsAdapter) map[string]payment.Provider {
-	out := map[string]payment.Provider{}
 	site, err := settings.Get(context.Background())
-	if err == nil {
-		if epay := epayFromSettings(site.Payment); epay != nil {
-			if p, err := payment.NewEPay(*epay); err == nil {
-				out["epay"] = p
-			}
+	if err != nil {
+		site.Payment = nil
+	}
+	providers, _ := buildProvidersFrom(nil, site.Payment, cfg.Dev)
+	return providers
+}
+
+// buildProvidersFrom builds the provider map from a payment document. It is
+// shared by the boot path and the hot-reload path so the two never drift.
+func buildProvidersFrom(_ *sql.DB, raw []byte, dev bool) (map[string]payment.Provider, error) {
+	out := map[string]payment.Provider{}
+	if epay := epayFromSettings(raw); epay != nil {
+		if p, err := payment.NewEPay(*epay); err == nil {
+			out["epay"] = p
 		}
-		if manual, ok := manualFromSettings(site.Payment); ok {
-			out["manual"] = payment.NewManual(manual)
-		} else {
-			out["manual"] = payment.NewManual("")
-		}
+	}
+	if manual, ok := manualFromSettings(raw); ok {
+		out["manual"] = payment.NewManual(manual)
 	} else {
+		// Manual transfer is the always-available fallback: a deployment with no
+		// gateway configured still has a way to take money.
 		out["manual"] = payment.NewManual("")
 	}
-	// Manual transfer is the always-available fallback: a deployment with no
-	// payment gateway configured still has a way to take money.
-	if _, ok := out["manual"]; !ok {
-		out["manual"] = payment.NewManual("")
-	}
-	if cfg.Dev {
+	if dev {
 		if mock, err := payment.NewMock(true); err == nil {
 			out["mock"] = mock
 		}
 	}
-	return out
+	return out, nil
 }
 
 func epayFromSettings(raw []byte) *payment.EPayConfig {

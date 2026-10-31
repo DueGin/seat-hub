@@ -2,7 +2,7 @@ import type {
   Account, AccountUsage, AdminDashboard, AdminUser, ApiKey, DailyUsage, Job,
   ModelUsage, Onboarding, Order, Overview, Page, Payment, PoolCandidate,
   PoolItem, Product, ProductKind, PublicConfig, Settings, Spend, Subscription,
-  UsageLog, UsageSummary, User,
+  UsageLog, UsageSummary, User, NormalizedSettings,
 } from './types'
 
 type Owned<T> = { userId: number; value: T }
@@ -37,7 +37,7 @@ function setSession(id: number | null) {
   try { sessionStorage.setItem(sessionKey, JSON.stringify(id)) } catch {}
 }
 
-let settings: Settings = {
+let settings: NormalizedSettings = {
   site_name: 'vm2api 演示环境', registration_open: true, base_concurrency: 1,
   concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0,
   hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0,
@@ -102,16 +102,17 @@ const orders: Owned<Order>[] = []
 const orderTerms = new Map<string, { unitQuantity: number; durationDays: number }>()
 for (const entry of subscriptions) {
   const product = products.find(item => item.kind === entry.value.kind)
-  if (!product) continue
+  const orderNo = entry.value.source_order_no
+  if (!product || !orderNo) continue
   orders.push({ userId: entry.userId, value: {
-    order_no: entry.value.source_order_no, product_id: product.id, product_name: product.name,
+    order_no: orderNo, product_id: product.id, product_name: product.name,
     kind: product.kind, quantity: entry.value.quantity / product.unit_quantity,
     amount_cents: product.price_cents * entry.value.quantity / product.unit_quantity,
     currency: 'CNY', provider: 'mock', status: 'fulfilled', renew_subscription_id: null,
     created_at: entry.value.starts_at, paid_at: entry.value.starts_at, fulfilled_at: entry.value.starts_at,
     expires_at: new Date(Date.parse(entry.value.starts_at) + 30 * 60_000).toISOString(),
   } })
-  orderTerms.set(entry.value.source_order_no, { unitQuantity: product.unit_quantity, durationDays: product.duration_days })
+  orderTerms.set(orderNo, { unitQuantity: product.unit_quantity, durationDays: product.duration_days })
 }
 orders.push({ userId: 1, value: { order_no: 'PT202610310001', product_id: 1, product_name: products[0].name, kind: 'concurrency', quantity: 1, amount_cents: 9900, currency: 'CNY', provider: 'mock', status: 'pending', renew_subscription_id: null, created_at: iso(-5 * 60_000), paid_at: null, fulfilled_at: null, expires_at: iso(25 * 60_000) } })
 orderTerms.set('PT202610310001', { unitQuantity: 5, durationDays: 30 })
@@ -568,7 +569,7 @@ function dashboard(): AdminDashboard {
 }
 function settingsView(): Settings { return { ...settings, payment: { ...settings.payment, epay: { ...settings.payment.epay, key: epayKeyConfigured ? '***' : '' } } } }
 function patchSettings(input: Input) {
-  const updated: Settings = structuredClone(settings)
+  const updated: NormalizedSettings = structuredClone(settings)
   if (input.site_name !== undefined) updated.site_name = limitedText(input, 'site_name', '', 120)
   if (!updated.site_name) fail(422, 'invalid_site_name', '站点名称不能为空。')
   if (input.registration_open !== undefined) updated.registration_open = boolean(input, 'registration_open', true)
@@ -578,27 +579,29 @@ function patchSettings(input: Input) {
   let configured = epayKeyConfigured
   if (input.payment !== undefined) {
     const payment = record(input.payment)
+    const epay = updated.payment.epay
+    const manual = updated.payment.manual
     if (payment.manual !== undefined) {
-      const manual = record(payment.manual)
-      if (manual.enabled !== undefined) updated.payment.manual.enabled = boolean(manual, 'enabled', true)
-      if (manual.instructions !== undefined) updated.payment.manual.instructions = limitedText(manual, 'instructions', '', 4_000)
+      const manualInput = record(payment.manual)
+      if (manualInput.enabled !== undefined) manual.enabled = boolean(manualInput, 'enabled', true)
+      if (manualInput.instructions !== undefined) manual.instructions = limitedText(manualInput, 'instructions', '', 4_000)
     }
     if (payment.epay !== undefined) {
-      const epay = record(payment.epay)
-      if (epay.enabled !== undefined) updated.payment.epay.enabled = boolean(epay, 'enabled', false)
-      if (epay.gateway_url !== undefined) {
-        const gateway = text(epay, 'gateway_url')
+      const epayInput = record(payment.epay)
+      if (epayInput.enabled !== undefined) epay.enabled = boolean(epayInput, 'enabled', false)
+      if (epayInput.gateway_url !== undefined) {
+        const gateway = text(epayInput, 'gateway_url')
         let url: URL
         try { url = new URL(gateway) } catch { return fail(422, 'invalid_gateway_url', '请输入有效的 HTTPS 支付地址。') }
         if (url.protocol !== 'https:') fail(422, 'invalid_gateway_url', '支付地址必须使用 HTTPS。')
-        updated.payment.epay.gateway_url = gateway
+        epay.gateway_url = gateway
       }
-      if (epay.pid !== undefined) updated.payment.epay.pid = text(epay, 'pid')
-      if (epay.key !== undefined) { const key = text(epay, 'key'); if (key !== '***') configured = key.length > 0 }
-      if (epay.types !== undefined) {
-        const types = epay.types
+      if (epayInput.pid !== undefined) epay.pid = text(epayInput, 'pid')
+      if (epayInput.key !== undefined) { const key = text(epayInput, 'key'); if (key !== '***') configured = key.length > 0 }
+      if (epayInput.types !== undefined) {
+        const types = epayInput.types
         if (!Array.isArray(types) || !types.every((value: unknown): value is string => typeof value === 'string')) fail(422, 'invalid_types', '支付类型必须是文本数组。')
-        updated.payment.epay.types = [...types]
+        epay.types = [...types]
       }
     }
   }

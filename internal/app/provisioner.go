@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -43,12 +45,17 @@ func newProvisioner(
 		_ = portalAdmin
 	}
 	p := &provisioner{
-		provisionSpan: &provisionSpan{prov: prov, usage: use, db: db.DB},
-		svc:           prov,
-		keys:          keysAndAdmin,
-		admin:         keysAndAdmin,
-		usage:         use,
-		log:           logger,
+		provisionSpan: &provisionSpan{
+			prov:     prov,
+			usage:    use,
+			db:       db.DB,
+			keyStats: client.KeyStats,
+		},
+		svc:   prov,
+		keys:  keysAndAdmin,
+		admin: keysAndAdmin,
+		usage: use,
+		log:   logger,
 	}
 	return p
 }
@@ -122,16 +129,53 @@ func (p *provisioner) AdminList(ctx context.Context, kind, status string, userID
 	return p.adminAccounts(ctx, kind, status, userID, page, pageSize)
 }
 
+// AdminRetry re-runs the failed provisioning step for a hosted account. The
+// admin endpoint has no owning user in its path, so the owner is read from the
+// resource row: passing userID 0 to RetryHosted would filter on user_id = 0 and
+// never match.
 func (p *provisioner) AdminRetry(ctx context.Context, id int64) error {
-	return p.svc.RetryHosted(ctx, 0, id)
+	owner, kind, err := p.resourceOwner(ctx, id)
+	if err != nil {
+		return err
+	}
+	if kind != "hosted" {
+		return api.Err(provision.ErrInvalidState, 409, "invalid_state", "仅托管账号支持重跑失败步骤")
+	}
+	return p.svc.RetryHosted(ctx, owner, id)
 }
+
+// AdminRelease force-releases an account. Any state except released is pushed
+// to releasing first (released stays an idempotent success), so the admin action
+// can no longer return 200 while the slot and its VM stay in place.
 func (p *provisioner) AdminRelease(ctx context.Context, id int64) error {
+	if err := p.svc.MarkReleasing(ctx, id); err != nil {
+		return err
+	}
 	return p.svc.ReleaseResource(ctx, id)
+}
+
+func (p *provisioner) resourceOwner(ctx context.Context, id int64) (int64, string, error) {
+	var owner int64
+	var kind string
+	err := p.db.QueryRowContext(ctx, `SELECT user_id, kind FROM resources WHERE id = ?`, id).Scan(&owner, &kind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", api.Err(provision.ErrNotFound, 404, "not_found", "账号不存在")
+	}
+	if err != nil {
+		return 0, "", fmt.Errorf("read resource owner: %w", err)
+	}
+	return owner, kind, nil
 }
 
 // ApplyPaidOrder makes the provisioner the order fulfiller.
 func (p *provisioner) ApplyPaidOrder(ctx context.Context, orderID int64) error {
 	return p.svc.ApplyPaidOrder(ctx, orderID)
+}
+
+// SetInflightSource lets the wiring layer supply the gateway's live per-user
+// request counter (the overview shows it as "in use").
+func (p *provisioner) SetInflightSource(fn func(userID int64) int) {
+	p.provisionSpan.inflight = fn
 }
 
 // Attach starts the expiry sweep/job loop once the process is about to serve.
