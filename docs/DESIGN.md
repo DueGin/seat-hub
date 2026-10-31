@@ -54,7 +54,7 @@ vm2api 文档与源码在 `/Users/duegin/project/2api/vm2api`（只读参考）�
 - **预付周期订阅**：每笔支付成功的订单生成一条 `subscription`（kind、quantity、starts_at、expires_at）。用户某 kind 的权益 = 所有 `active` 订阅 quantity 之和。
 - **续费**：下单带 `renew_subscription_id` → 支付后把该订阅 `expires_at` 顺延 `duration_days`（若已过期则从现在起算）。续费份数 = `subscription.quantity / product.unit_quantity`，不能整除返回 400。
 - **有效并发** = `settings.base_concurrency` + Σ并发订阅 + `concurrency_per_hosted_seat` × 活跃托管资源数 + `concurrency_per_rental_account` × 活跃租赁资源数。后三项系数后台可配（默认 base=1，其余 0）。
-- **库存**（仅 `rental_account`）：可租 = 租赁池里 `available` 且 vm2api 侧健康（`schedule_state` 为 `on`/`restricted`、凭证可用）的 VM 数 − 未过期待支付订单的预留数。下单时校验并预留 15 分钟。
+- **库存**（仅 `rental_account`）：可租 = 租赁池里 `available` 且 vm2api 侧健康（`schedule_state` 为 `on`/`restricted`、凭证可用）的 VM 数 − 未过期待支付订单的预留数。下单时校验，并在订单未支付期间（30 分钟）按订单 `expires_at` 预留。
 
 ## 4. 资源（账号）状态机
 
