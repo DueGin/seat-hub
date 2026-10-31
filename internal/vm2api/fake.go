@@ -38,6 +38,13 @@ type Fake struct {
 	bootstrap map[string]int
 	logs      []fakeLog
 	now       func() time.Time
+
+	// Self-check state (fake_selfcheck.go).
+	disabledProxies map[string]bool
+	exitOverride    map[string]ExitProbe
+	exitErr         map[string]error
+	proxyQueue      []ProxyView
+	resetCalls      map[string]int
 }
 
 type fakeKey struct {
@@ -118,6 +125,10 @@ func fakeCloneWindow(window *Window) *Window {
 
 func fakeCloneVM(vm VM) VM {
 	vm.CredentialRejected = credentialRejected(vm.UnschedulableCode)
+	if vm.Proxy != nil {
+		proxy := *vm.Proxy
+		vm.Proxy = &proxy
+	}
 	vm.FiveHour = fakeCloneWindow(vm.FiveHour)
 	vm.SevenDay = fakeCloneWindow(vm.SevenDay)
 	vm.SevenDayFable = fakeCloneWindow(vm.SevenDayFable)
@@ -151,6 +162,9 @@ func (fake *Fake) AddVM(vm VM) {
 	}
 	if vm.ScheduleState == "" {
 		vm.ScheduleState = "on"
+	}
+	if vm.Fingerprint == (Fingerprint{}) {
+		vm.Fingerprint = fake.newFingerprintLocked()
 	}
 	fake.vms[vm.ID] = fakeCloneVM(vm)
 }
@@ -359,6 +373,7 @@ func (fake *Fake) CreateHostedVM(ctx context.Context, label string, template jso
 		ID: fake.newVMIDLocked(), Label: label, Platform: "anthropic", Origin: "platform",
 		CredStatus: "missing", ScheduleState: "unschedulable", UnschedulableCode: "no_credential", SeatsMax: 2,
 	}
+	vm.Fingerprint = fake.newFingerprintLocked()
 	fake.vms[vm.ID] = vm
 	return vm, nil
 }
@@ -401,6 +416,14 @@ func (fake *Fake) AllocateProxy(ctx context.Context, vmID string) error {
 	vm, exists := fake.vms[vmID]
 	if !exists {
 		return fakeMissing("vm")
+	}
+	if vm.Proxy == nil {
+		proxy := fake.nextProxyLocked()
+		vm.Proxy = &proxy
+		// vm2api follows the proxy's timezone unless the slot pins one.
+		if vm.Timezone == "" {
+			vm.Timezone = proxy.GeoTimezone
+		}
 	}
 	vm.ProxyConfigured = true
 	fake.vms[vmID] = vm

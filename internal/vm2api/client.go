@@ -40,6 +40,18 @@ type Client interface {
 	SetSchedulable(ctx context.Context, vmID string, schedulable bool) error
 	DeleteVM(ctx context.Context, vmID string) error
 
+	// Slot self-check (docs/SELFCHECK.md). All of these go through vm2api, so
+	// the outbound traffic uses the slot's own proxy, never the portal's.
+	CollectIdentity(ctx context.Context, vmID string) (Fingerprint, error)
+	ProbeExit(ctx context.Context, vmID string) (ExitProbe, error)
+	// ResetVM destroys the slot's home directory and regenerates its
+	// fingerprint (mode=traits), keeping the VM id and its proxy binding.
+	ResetVM(ctx context.Context, vmID string) error
+	// UnbindProxy detaches one VM from a pool proxy; DisableProxy keeps a bad
+	// proxy from being handed out again. AllocateProxy then binds a new one.
+	UnbindProxy(ctx context.Context, proxyID, vmID string) error
+	DisableProxy(ctx context.Context, proxyID string) error
+
 	// Hosted onboarding: OAuth authorization link (flavor claude_code) only.
 	GenerateAuthURL(ctx context.Context, vmID string) (AuthURL, error)
 	ExchangeCode(ctx context.Context, vmID, sessionID, code string) error
@@ -110,6 +122,47 @@ type VM struct {
 	SeatsMax           int     `json:"seats_max"`
 	Inflight           int     `json:"inflight"`
 	CredentialRejected bool    `json:"credential_rejected"` // unschedulable for oauth_* / credential_* reasons
+
+	// Fingerprint is the slot's device identity as vm2api tracks it. The
+	// self-check compares these keys across slots.
+	Fingerprint Fingerprint `json:"fingerprint"`
+	Timezone    string      `json:"timezone"`
+	Locale      string      `json:"locale"`
+	// Proxy is the bound exit; nil when nothing is bound.
+	Proxy *ProxyView `json:"proxy"`
+	// Account identifies the Claude account on the slot (empty until signed in).
+	AccountUUID string `json:"account_uuid"`
+	Email       string `json:"email"`
+}
+
+// Fingerprint is the subset of vm2api's fingerprint the self-check needs.
+// Keys the portal never inspects are deliberately absent.
+type Fingerprint struct {
+	DeviceID       string `json:"device_id"`
+	GuestMachineID string `json:"guest_machine_id"`
+	Hostname       string `json:"hostname"`
+	Timezone       string `json:"timezone"`
+	Locale         string `json:"locale"`
+	CollectedAt    string `json:"collected_at"`
+}
+
+// ProxyView is the bound exit as vm2api reports it.
+type ProxyView struct {
+	ID            string `json:"id"`
+	Scheme        string `json:"scheme"` // socks5 | local
+	Status        string `json:"status"` // ok | unknown | dead | fail
+	Enabled       bool   `json:"enabled"`
+	BlockedReason string `json:"blocked_reason"`
+	GeoIP         string `json:"geo_ip"`
+	GeoTimezone   string `json:"geo_timezone"`
+}
+
+// ExitProbe is the slot's real egress as observed by vm2api's exit probe.
+type ExitProbe struct {
+	Via         string `json:"via"` // socks5 | node | local | deploy_proxy
+	IP          string `json:"ip"`
+	CountryCode string `json:"country_code"`
+	Timezone    string `json:"timezone"`
 }
 
 type Window struct {

@@ -487,3 +487,15 @@ func TestClientIPHonoursForwardedForOnlyFromProxy(t *testing.T) {
 		}
 	}
 }
+
+func (fakeAdmin) RunSelfcheck(ctx context.Context, resourceID int64, rebuild bool) (SelfcheckDTO, error) {
+	return SelfcheckDTO{State: "pass", MaxAttempts: 3}, nil
+}
+
+func (fakeAdmin) SelfcheckHistory(ctx context.Context, resourceID int64, limit int) ([]SelfcheckReportDTO, error) {
+	return nil, nil
+}
+
+func (fakeAdmin) RunPoolSelfcheck(ctx context.Context, vmID string) (SelfcheckDTO, error) {
+	return SelfcheckDTO{State: "pass", MaxAttempts: 3}, nil
+}

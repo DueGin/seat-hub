@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/DueGin/vm2api-portal/internal/selfcheck"
 	"github.com/DueGin/vm2api-portal/internal/store"
 	"github.com/DueGin/vm2api-portal/internal/vm2api"
 )
@@ -31,6 +32,7 @@ type Service struct {
 	mu         sync.Mutex
 	Now        func() time.Time
 	EnsureUser func(context.Context, int64) (string, error)
+	checker    selfcheck.Checker
 }
 
 func New(db *sql.DB, client vm2api.Client) *Service {

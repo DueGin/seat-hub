@@ -19,6 +19,12 @@ type Site struct {
 	GatewayQueueTimeoutMS    int             `json:"gateway_queue_timeout_ms"`
 	HostedVMTemplate         json.RawMessage `json:"hosted_vm_template"`
 	Payment                  json.RawMessage `json:"payment"`
+
+	// Slot self-check (see docs/SELFCHECK.md).
+	SelfcheckRequireDedicatedProxy bool `json:"selfcheck_require_dedicated_proxy"`
+	SelfcheckRequireTimezoneMatch  bool `json:"selfcheck_require_timezone_match"`
+	SelfcheckMaxRebuilds           int  `json:"selfcheck_max_rebuilds"`
+	SelfcheckRecheckMinutes        int  `json:"selfcheck_recheck_minutes"`
 }
 
 func DefaultSite() Site {
@@ -30,6 +36,11 @@ func DefaultSite() Site {
 		RentalGraceHours: 0,
 		HostedVMTemplate: json.RawMessage(`{"runtime_type":"docker"}`),
 		Payment:          DefaultPaymentDocument(),
+
+		SelfcheckRequireDedicatedProxy: true,
+		SelfcheckRequireTimezoneMatch:  true,
+		SelfcheckMaxRebuilds:           3,
+		SelfcheckRecheckMinutes:        30,
 	}
 }
 

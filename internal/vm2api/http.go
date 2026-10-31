@@ -259,6 +259,37 @@ type panelVM struct {
 	StatusOI         string                `json:"status_7d_oi"`
 	Estimate5h       *Estimate             `json:"estimate_5h"`
 	Estimate7d       *Estimate             `json:"estimate_7d"`
+	// Proxy shadows VM.Proxy: vm2api nests geo under proxy.geo.
+	Proxy *panelProxy `json:"proxy"`
+}
+
+type panelProxy struct {
+	ID            string `json:"id"`
+	Scheme        string `json:"scheme"`
+	Status        string `json:"status"`
+	Enabled       *bool  `json:"enabled"`
+	BlockedReason string `json:"blocked_reason"`
+	Geo           *struct {
+		IP       string `json:"ip"`
+		Timezone string `json:"timezone"`
+	} `json:"geo"`
+}
+
+func (raw *panelProxy) mapped() *ProxyView {
+	if raw == nil {
+		return nil
+	}
+	view := &ProxyView{
+		ID:            raw.ID,
+		Scheme:        raw.Scheme,
+		Status:        raw.Status,
+		Enabled:       raw.Enabled == nil || *raw.Enabled,
+		BlockedReason: raw.BlockedReason,
+	}
+	if raw.Geo != nil {
+		view.GeoIP, view.GeoTimezone = raw.Geo.IP, raw.Geo.Timezone
+	}
+	return view
 }
 
 type panelCredentialStatus string
@@ -364,6 +395,8 @@ func (raw panelVM) mapped() VM {
 		result.SevenDayFable.Status = raw.StatusOI
 	}
 	result.CredentialRejected = credentialRejected(result.UnschedulableCode)
+	result.Email = raw.Email
+	result.Proxy = raw.Proxy.mapped()
 	return result
 }
 
@@ -452,6 +485,44 @@ func (client *HTTPClient) SetSchedulable(ctx context.Context, vmID string, sched
 
 func (client *HTTPClient) DeleteVM(ctx context.Context, vmID string) error {
 	return client.call(ctx, http.MethodDelete, vmPath(vmID), nil, nil, nil)
+}
+
+// CollectIdentity asks the slot to re-report its fingerprint
+// (POST /vms/:id/collect-identity) and returns the merged result.
+func (client *HTTPClient) CollectIdentity(ctx context.Context, vmID string) (Fingerprint, error) {
+	var data struct {
+		Fingerprint Fingerprint `json:"fingerprint"`
+	}
+	err := client.call(ctx, http.MethodPost, vmPath(vmID)+"/collect-identity", nil, map[string]any{}, &data)
+	return data.Fingerprint, err
+}
+
+// ProbeExit geo-probes the slot's real egress (POST /vms/:id/exit-probe).
+func (client *HTTPClient) ProbeExit(ctx context.Context, vmID string) (ExitProbe, error) {
+	var data struct {
+		Via string `json:"via"`
+		Geo struct {
+			IP          string `json:"ip"`
+			CountryCode string `json:"country_code"`
+			Timezone    string `json:"timezone"`
+		} `json:"geo"`
+	}
+	err := client.call(ctx, http.MethodPost, vmPath(vmID)+"/exit-probe", nil, map[string]any{}, &data)
+	return ExitProbe{Via: data.Via, IP: data.Geo.IP, CountryCode: data.Geo.CountryCode, Timezone: data.Geo.Timezone}, err
+}
+
+// ResetVM rebuilds the slot with fresh traits (POST /vms/:id/reset
+// {mode:"traits"}): new fingerprint, wiped home, same id and proxy.
+func (client *HTTPClient) ResetVM(ctx context.Context, vmID string) error {
+	return client.call(ctx, http.MethodPost, vmPath(vmID)+"/reset", nil, map[string]string{"mode": "traits"}, nil)
+}
+
+func (client *HTTPClient) UnbindProxy(ctx context.Context, proxyID, vmID string) error {
+	return client.call(ctx, http.MethodPost, "/proxies/"+url.PathEscape(proxyID)+"/unbind", nil, map[string]string{"vm_id": vmID}, nil)
+}
+
+func (client *HTTPClient) DisableProxy(ctx context.Context, proxyID string) error {
+	return client.call(ctx, http.MethodPost, "/proxies/"+url.PathEscape(proxyID)+"/disable", nil, map[string]any{}, nil)
 }
 
 func (client *HTTPClient) GenerateAuthURL(ctx context.Context, vmID string) (AuthURL, error) {

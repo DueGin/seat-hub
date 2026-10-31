@@ -215,6 +215,38 @@ type AccountDTO struct {
 	CreatedAt    string           `json:"created_at"`
 	ExpiresAt    *string          `json:"expires_at"`
 	Usage        *AccountUsageDTO `json:"usage"`
+	Selfcheck    *SelfcheckDTO    `json:"selfcheck"`
+}
+
+// SelfcheckDTO is a slot's latest self-check (docs/SELFCHECK.md).
+// State: pending | pass | fail | exhausted. Attempts counts rebuilds so far;
+// MaxAttempts is the configured budget (default 3). Checks carry user-safe
+// messages only; admin endpoints add Detail.
+type SelfcheckDTO struct {
+	State       string              `json:"state"`
+	Attempts    int                 `json:"attempts"`
+	MaxAttempts int                 `json:"max_attempts"`
+	CheckedAt   *string             `json:"checked_at"`
+	Checks      []SelfcheckCheckDTO `json:"checks"`
+}
+
+type SelfcheckCheckDTO struct {
+	Code    string `json:"code"`
+	OK      bool   `json:"ok"`
+	Skipped bool   `json:"skipped,omitempty"`
+	Remedy  string `json:"remedy,omitempty"`
+	Message string `json:"message"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+// SelfcheckReportDTO is one recorded run, for the admin history view.
+type SelfcheckReportDTO struct {
+	ID        int64               `json:"id"`
+	VMID      string              `json:"vm_id"`
+	Attempt   int                 `json:"attempt"`
+	Passed    bool                `json:"passed"`
+	Checks    []SelfcheckCheckDTO `json:"checks"`
+	CreatedAt string              `json:"created_at"`
 }
 
 type OnboardingDTO struct {
@@ -225,6 +257,7 @@ type OnboardingDTO struct {
 	Bootstrap        *BootstrapDTO `json:"bootstrap"`
 	Error            *ErrorDTO     `json:"error,omitempty"`
 	CanRegenerate    bool          `json:"can_regenerate"`
+	Selfcheck        *SelfcheckDTO `json:"selfcheck"`
 }
 
 type BootstrapDTO struct {
@@ -289,6 +322,11 @@ type SettingsPayload struct {
 	GatewayQueueTimeoutMS    int             `json:"gateway_queue_timeout_ms"`
 	HostedVMTemplate         json.RawMessage `json:"hosted_vm_template"`
 	Payment                  json.RawMessage `json:"payment"`
+
+	SelfcheckRequireDedicatedProxy bool `json:"selfcheck_require_dedicated_proxy"`
+	SelfcheckRequireTimezoneMatch  bool `json:"selfcheck_require_timezone_match"`
+	SelfcheckMaxRebuilds           int  `json:"selfcheck_max_rebuilds"`
+	SelfcheckRecheckMinutes        int  `json:"selfcheck_recheck_minutes"`
 }
 
 // --- service interfaces (implemented in internal/app) ---
@@ -491,7 +529,20 @@ type KeyService interface {
 	Delete(ctx context.Context, userID, id int64) error
 }
 
+// AdminService is everything the admin console calls. AdminCoreService is the
+// part internal/portal implements; the self-check methods are implemented in
+// internal/app, which owns the provision + selfcheck wiring.
 type AdminService interface {
+	AdminCoreService
+
+	// Self-check (docs/SELFCHECK.md). RunSelfcheck re-checks a resource's slot
+	// now; rebuild=true resets the retry budget and rebuilds first.
+	RunSelfcheck(ctx context.Context, resourceID int64, rebuild bool) (SelfcheckDTO, error)
+	SelfcheckHistory(ctx context.Context, resourceID int64, limit int) ([]SelfcheckReportDTO, error)
+	RunPoolSelfcheck(ctx context.Context, vmID string) (SelfcheckDTO, error)
+}
+
+type AdminCoreService interface {
 	Dashboard(ctx context.Context) (AdminDashboardDTO, error)
 	RentalPool(ctx context.Context) ([]RentalPoolRowDTO, error)
 	RentalCandidates(ctx context.Context) ([]RentalCandidateDTO, error)
@@ -535,13 +586,14 @@ type VM2APIHealth struct {
 }
 
 type RentalPoolRowDTO struct {
-	VMID           string       `json:"vm_id"`
-	Tier           string       `json:"tier"`
-	Status         string       `json:"status"`
-	LeasedToUserID *int64       `json:"leased_to_user_id"`
-	LeasedToEmail  string       `json:"leased_to_email,omitempty"`
-	Note           string       `json:"note"`
-	VM             *RentalVMDTO `json:"vm"`
+	VMID           string        `json:"vm_id"`
+	Tier           string        `json:"tier"`
+	Status         string        `json:"status"`
+	LeasedToUserID *int64        `json:"leased_to_user_id"`
+	LeasedToEmail  string        `json:"leased_to_email,omitempty"`
+	Note           string        `json:"note"`
+	VM             *RentalVMDTO  `json:"vm"`
+	Selfcheck      *SelfcheckDTO `json:"selfcheck"`
 }
 
 type RentalVMDTO struct {

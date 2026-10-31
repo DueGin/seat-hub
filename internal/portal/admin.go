@@ -17,7 +17,7 @@ import (
 	"github.com/DueGin/vm2api-portal/internal/vm2api"
 )
 
-var _ api.AdminService = (*Service)(nil)
+var _ api.AdminCoreService = (*Service)(nil)
 
 func adminError(status int, code, message string) error {
 	return &api.UserError{Status: status, Code: code, Message: message}

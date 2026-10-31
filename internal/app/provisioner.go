@@ -25,7 +25,7 @@ type provisioner struct {
 	*provisionSpan
 	svc   *provision.Service
 	keys  api.KeyService
-	admin api.AdminService
+	admin api.AdminCoreService
 	usage *usage.Service
 	log   *slog.Logger
 }
@@ -58,6 +58,22 @@ func newProvisioner(
 		log:   logger,
 	}
 	return p
+}
+
+// --- self-check admin surface (implemented by the self-check integration) ---
+
+var errSelfcheckNotWired = api.Err(errors.New("selfcheck not wired"), 503, "selfcheck_unavailable", "自检尚未启用")
+
+func (p *provisioner) RunSelfcheck(ctx context.Context, resourceID int64, rebuild bool) (api.SelfcheckDTO, error) {
+	return api.SelfcheckDTO{}, errSelfcheckNotWired
+}
+
+func (p *provisioner) SelfcheckHistory(ctx context.Context, resourceID int64, limit int) ([]api.SelfcheckReportDTO, error) {
+	return nil, errSelfcheckNotWired
+}
+
+func (p *provisioner) RunPoolSelfcheck(ctx context.Context, vmID string) (api.SelfcheckDTO, error) {
+	return api.SelfcheckDTO{}, errSelfcheckNotWired
 }
 
 // keyAdapter adapts the key service. It is a separate type because
