@@ -321,7 +321,7 @@ func TestProvisionRentalExpiryAndStockFailure(t *testing.T) {
 	}
 	now := service.now().Truncate(time.Second)
 	service.Now = func() time.Time { return now }
-	if _, err := service.db.Exec(`INSERT INTO rental_pool(vm_id,status,created_at,updated_at) VALUES (?,'available',?,?)`, vm.ID, timestamp(now), timestamp(now)); err != nil {
+	if _, err := service.db.Exec(`INSERT INTO rental_pool(vm_id,status,selfcheck_state,created_at,updated_at) VALUES (?,'available','pass',?,?)`, vm.ID, timestamp(now), timestamp(now)); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.FulfilOrder(ctx, orderID); !errors.Is(err, ErrOutOfStock) {
@@ -338,7 +338,7 @@ func TestProvisionRentalExpiryAndStockFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.db.Exec(`INSERT INTO rental_pool(vm_id,status,created_at,updated_at) VALUES (?,'available',?,?)`, second.ID, timestamp(now), timestamp(now)); err != nil {
+	if _, err := service.db.Exec(`INSERT INTO rental_pool(vm_id,status,selfcheck_state,created_at,updated_at) VALUES (?,'available','pass',?,?)`, second.ID, timestamp(now), timestamp(now)); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.FulfilOrder(ctx, orderID); err != nil {
@@ -601,7 +601,7 @@ func TestProvisionRentalAssignmentCompensation(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := service.db.Exec(`INSERT INTO rental_pool(vm_id,status,created_at,updated_at) VALUES (?,'available',?,?)`, vm.ID, timestamp(service.now()), timestamp(service.now())); err != nil {
+		if _, err := service.db.Exec(`INSERT INTO rental_pool(vm_id,status,selfcheck_state,created_at,updated_at) VALUES (?,'available','pass',?,?)`, vm.ID, timestamp(service.now()), timestamp(service.now())); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -701,7 +701,7 @@ func TestProvisionRentalCleanupFailureQuarantinesStock(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := service.db.Exec(`INSERT INTO rental_pool(vm_id,status,created_at,updated_at) VALUES (?,'available',?,?)`, vm.ID, timestamp(service.now()), timestamp(service.now())); err != nil {
+		if _, err := service.db.Exec(`INSERT INTO rental_pool(vm_id,status,selfcheck_state,created_at,updated_at) VALUES (?,'available','pass',?,?)`, vm.ID, timestamp(service.now()), timestamp(service.now())); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -896,7 +896,7 @@ func TestProvisionAllocateRentalTopsUpHeldAccounts(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := service.db.Exec(`INSERT INTO rental_pool(vm_id,status,created_at,updated_at) VALUES (?,'available',?,?)`, vm.ID, timestamp(service.now()), timestamp(service.now())); err != nil {
+		if _, err := service.db.Exec(`INSERT INTO rental_pool(vm_id,status,selfcheck_state,created_at,updated_at) VALUES (?,'available','pass',?,?)`, vm.ID, timestamp(service.now()), timestamp(service.now())); err != nil {
 			t.Fatal(err)
 		}
 	}

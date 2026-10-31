@@ -26,7 +26,12 @@ func (fake *Fake) initSelfcheckLocked() {
 }
 
 func (fake *Fake) newFingerprintLocked() Fingerprint {
-	n := fake.nextID("fp")
+	n := "fp"
+	if !fake.hostileSelfcheck {
+		n = fake.nextID("fp")
+	} else {
+		n = "shared"
+	}
 	return Fingerprint{
 		DeviceID:       "dev-" + n,
 		GuestMachineID: "mid-" + n,
@@ -41,6 +46,9 @@ func (fake *Fake) newFingerprintLocked() Fingerprint {
 // Disabled proxies are never handed out, matching vm2api's allocator.
 func (fake *Fake) nextProxyLocked() ProxyView {
 	fake.initSelfcheckLocked()
+	if fake.hostileSelfcheck {
+		return ProxyView{ID: "px-shared", Scheme: "socks5", Status: "ok", Enabled: true, GeoIP: "203.0.113.99", GeoTimezone: fakeDefaultTimezone}
+	}
 	for len(fake.proxyQueue) > 0 {
 		next := fake.proxyQueue[0]
 		fake.proxyQueue = fake.proxyQueue[1:]
@@ -53,6 +61,15 @@ func (fake *Fake) nextProxyLocked() ProxyView {
 		ID: n, Scheme: "socks5", Status: "ok", Enabled: true,
 		GeoIP: fmt.Sprintf("203.0.113.%d", fake.sequence%250+1), GeoTimezone: fakeDefaultTimezone,
 	}
+}
+
+// SetHostileSelfcheck makes every slot share one fingerprint and one exit, so
+// self-check always fails. cmd/mock-vm2api uses it to demonstrate the rebuild
+// budget; a rebuild cannot fix a shared fingerprint in this mode.
+func (fake *Fake) SetHostileSelfcheck(hostile bool) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	fake.hostileSelfcheck = hostile
 }
 
 // --- test hooks ---

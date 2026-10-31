@@ -82,8 +82,9 @@ active ──凭证失效（vm2api 不可调度 oauth_*）──▶ needs_reauth
 ## 5. 托管上号（唯一方式：OAuth 授权链接）
 
 - 只允许 `flavor: "claude_code"` 的授权链接上号。门面 API 与 vm2api client **都不暴露** sessionKey、Setup Token、凭证导入等任何其它入口；flavor 在 client 内写死。
-- 用户视角三步：
-  1. 点「添加托管账号」→ 后台异步建槽、分配代理，几十秒后出现「打开授权链接」按钮。
+- 用户视角三步（第 0 步由系统完成，见 [SELFCHECK.md](SELFCHECK.md)）：
+  0. 建槽、分配代理后先跑**槽位自检**（一代理 IP 一号一槽、指纹不重复）。不通过则自动重建，最多 3 次；仍不过则转人工，用户看到「多次自检未通过」。
+  1. 点「添加托管账号」→ 后台异步建槽、分配代理、自检，几十秒后出现「打开授权链接」按钮。
   2. 新窗口打开链接，登录要托管的 Claude 账号并授权，复制页面给出的授权码（形如 `code#state`）。
   3. 粘贴授权码提交 → 显示初装进度 → 完成即可用。链接 30 分钟过期，可一键重新生成。
 - 后端：`generate-auth-url {flavor:"claude_code"}` → 存 `oauth_session`（auth_url、session_id、expires_at）；提交码 → `exchange-code`（同步）→ `bootstrapping`，后台任务轮询 `GET /vms/:id/official-cc-bootstrap` 直到成功/失败；成功后若槽仍调度关则 `POST /vms/:id/schedulable {schedulable:true}`。

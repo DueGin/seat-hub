@@ -4,7 +4,7 @@ import type { NormalizedSettings } from '@/lib/types'
 import { normalizeSettings, validateSettings } from './settings-validation.ts'
 
 function settings(): NormalizedSettings {
-  return { site_name: '测试站点', registration_open: true, base_concurrency: 1, concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0, hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0, hosted_vm_template: {}, payment: { epay: { enabled: false, gateway_url: '', pid: '', key: '', types: [] }, manual: { enabled: false, instructions: '' } } }
+  return { site_name: '测试站点', registration_open: true, base_concurrency: 1, concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0, hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0, selfcheck_require_dedicated_proxy: true, selfcheck_require_timezone_match: true, selfcheck_max_rebuilds: 3, selfcheck_recheck_minutes: 30, hosted_vm_template: {}, payment: { epay: { enabled: false, gateway_url: '', pid: '', key: '', types: [] }, manual: { enabled: false, instructions: '' } } }
 }
 
 test('保留所有设置字段并解析模板及支付方式', () => {
@@ -84,4 +84,21 @@ test('payment 缺失、为空对象或只有一个支付方时也能渲染与校
   assert.equal(partial.payment.manual.enabled, false)
   const result = validateSettings({ site_name: '全新部署', hosted_vm_template: {}, base_concurrency: 1, concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0, hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0 } as never, '{}', '[]')
   assert.deepEqual(result.payment.manual, { enabled: false, instructions: '' })
+  assert.equal(result.selfcheck_require_dedicated_proxy, true)
+  assert.equal(result.selfcheck_require_timezone_match, true)
+  assert.equal(result.selfcheck_max_rebuilds, 3)
+  assert.equal(result.selfcheck_recheck_minutes, 30)
+})
+
+test('自检设置校验重建次数与复检间隔边界', () => {
+  for (const value of [-1, 11, 0.5, Number.NaN]) {
+    const draft = settings(); draft.selfcheck_max_rebuilds = value
+    assert.throws(() => validateSettings(draft, '{}', '[]'), /最多重建次数/)
+  }
+  for (const value of [4, 1441, 5.5, Number.NaN]) {
+    const draft = settings(); draft.selfcheck_recheck_minutes = value
+    assert.throws(() => validateSettings(draft, '{}', '[]'), /复检间隔分钟/)
+  }
+  const boundary = settings(); boundary.selfcheck_max_rebuilds = 0; boundary.selfcheck_recheck_minutes = 1440
+  assert.equal(validateSettings(boundary, '{}', '[]').selfcheck_max_rebuilds, 0)
 })

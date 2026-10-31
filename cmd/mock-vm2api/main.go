@@ -20,6 +20,13 @@ func main() {
 		masterKey = "mock-master-key"
 	}
 	fake := vm2api.NewFake()
+	// PORTAL_MOCK_SELFCHECK=hostile makes every slot share one fingerprint and
+	// exit, so self-check can never pass: useful to watch a slot exhaust its
+	// rebuild budget in a smoke test.
+	if os.Getenv("PORTAL_MOCK_SELFCHECK") == "hostile" {
+		fake.SetHostileSelfcheck(true)
+		log.Printf("模拟 vm2api 进入敌意自检模式：所有槽位共用指纹与出口")
+	}
 	fake.AddVM(vm2api.VM{
 		ID: "mock-claude-001", Label: "模拟 Claude 账号", Platform: "anthropic",
 		Origin: "platform", Tier: "pro", CredStatus: "valid", HasCredential: true,

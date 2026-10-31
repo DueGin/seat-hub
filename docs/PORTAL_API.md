@@ -105,8 +105,16 @@
 {"id":7,"kind":"hosted|rental","label":"主号","email_masked":"ab***@gmail.com",
  "status":"provisioning|awaiting_auth|bootstrapping|active|needs_reauth|suspended|failed|releasing|released|allocating",
  "status_reason":null,"tier":"pro|max|null","created_at":"…","expires_at":"…|null",
- "usage":AccountUsage|null}
+ "usage":AccountUsage|null,"selfcheck":Selfcheck|null}
 ```
+`Selfcheck`（账号、托管上号进度和租赁池行共用）:
+```json
+{"state":"pending|pass|fail|exhausted","attempts":0,"max_attempts":3,
+ "checked_at":"2026-10-31T00:00:00Z",
+ "checks":[{"code":"proxy_exclusive","ok":true,"message":"代理独占检查通过"}]}
+```
+`attempts` 为已重建次数，`max_attempts` 为当前重建上限；尚未检查时 `checked_at=null`。每个检查项还可返回 `skipped:true`（该规则已跳过）、`remedy:"reset|reproxy|manual"`（失败处理方式）；管理员接口可额外返回 `detail`，用户接口仅返回可公开的提示。尚未检查的账号返回 `state:"pending"`、`checks:[]`。检查规则见 `docs/SELFCHECK.md`。
+
 `AccountUsage`（来自 vm2api，取不到为 `null`）:
 ```json
 {"available":true,"schedule_state":"on|off|unschedulable|restricted","restriction_text":null,
@@ -138,7 +146,7 @@ utilization 为 0–100；窗口缺失为 `null`。
  "auth_url":"https://claude.ai/oauth/authorize?…","auth_url_expires_at":"…",
  "bootstrap":{"state":"pending|running|succeeded|failed","message":"…"}|null,
  "error":{"code":"…","message":"…"}|null,
- "can_regenerate":true}
+ "can_regenerate":true,"selfcheck":Selfcheck|null}
 ```
 
 | 方法 | 路径 | 说明 |
@@ -151,6 +159,8 @@ utilization 为 0–100；窗口缺失为 `null`。
 | DELETE | `/api/hosted/{id}` | 移除托管账号（销毁凭证、释放席位）。响应 `{}` |
 
 不存在任何其它上号接口（sessionKey / setup-token / 凭证导入）。
+
+生成授权链接和提交授权码前必须通过自检。未通过时返回 409 `selfcheck_failed`；重建次数耗尽返回 409 `selfcheck_exhausted`；账号已在其它槽位托管返回 409 `account_duplicate`，需人工处理。前端在自检 `pending` / `fail` 时展示检查和重建进度，仅在 `pass` 后展示授权链接。
 
 ## API Key
 
@@ -202,17 +212,30 @@ utilization 为 0–100；窗口缺失为 `null`。
 | PATCH | `/api/admin/users/{id}` | `{status?, role?}`；停用同步停用 vm2api 用户与密钥 |
 | POST | `/api/admin/users/{id}/grant` | `{kind, quantity, duration_days, note}` 赠送订阅（生成 provider=`grant` 的已履约订单） |
 | PATCH | `/api/admin/subscriptions/{id}` | `{expires_at?, status?:"cancelled"}` |
-| GET | `/api/admin/rental-pool` | `{items:[{vm_id, tier, status:"available|leased|maintenance", leased_to_user_id, leased_to_email, note, vm:{label, email_masked, cred_status, schedule_state, tier, five_hour, seven_day}}]}` |
+| GET | `/api/admin/rental-pool` | `{items:[{vm_id, tier, status:"available|leased|maintenance", leased_to_user_id, leased_to_email, note, selfcheck:Selfcheck|null, vm:{label, email_masked, cred_status, schedule_state, tier, five_hour, seven_day}}]}` |
 | GET | `/api/admin/rental-pool/candidates` | vm2api 中未归属、Claude、未入池的 VM：`{items:[{vm_id,label,email_masked,cred_status,schedule_state,tier}]}` |
-| POST | `/api/admin/rental-pool` | `{vm_ids:[…], note?}` 入池 |
+| POST | `/api/admin/rental-pool` | `{vm_ids:[…], note?}` 入池前自检，未通过返回 409 `selfcheck_failed` |
 | PATCH | `/api/admin/rental-pool/{vm_id}` | `{status:"available|maintenance", note?}`（`leased` 不可手改） |
 | DELETE | `/api/admin/rental-pool/{vm_id}` | 仅非 leased |
+| POST | `/api/admin/rental-pool/{vm_id}/selfcheck` | `{}` 重跑入池自检 → `Selfcheck`；`vm_id` 不能为空或全空白 |
 | GET | `/api/admin/accounts?kind&status&user_id&page` | 全部资源 + `user_email` + `vm_id` + 最近错误 |
+| POST | `/api/admin/accounts/{id}/selfcheck` | `{rebuild?:bool}` → `Selfcheck`。默认 `false` 立即重跑；`true` 重置重建计数并先重建再检查 |
+| GET | `/api/admin/accounts/{id}/selfchecks?limit=20` | `{items:[SelfcheckReport]}`。`limit` 省略默认 20，须为 1–100 的整数；无历史时 `items:[]` |
 | POST | `/api/admin/accounts/{id}/retry` | 重跑失败步骤 |
 | POST | `/api/admin/accounts/{id}/release` | 强制释放 |
 | GET | `/api/admin/jobs?status=failed|pending|running&page` | `{items:[{id,type,status,attempts,run_after,last_error,payload,created_at,updated_at}]}` |
 | POST | `/api/admin/jobs/{id}/retry` | |
 | GET/PUT | `/api/admin/settings` | `Settings`（PUT 部分更新；密钥字段只写，GET 返回 `"***"` 或空） |
+
+以上三个自检接口仅管理员可调用，均使用标准成功/失败信封。账号 `id` 必须为正整数；非法 ID、`rebuild` 类型、空白 VM ID，以及空值、非整数、重复或超出 1–100 的 `limit` 返回 422 `invalid_request`。自检执行成功时返回 HTTP 200 和实际检查状态，`state=fail|exhausted` 也会返回检查明细；执行错误沿用错误信封。
+
+`SelfcheckReport`（自检历史中的一次检查）:
+```json
+{"id":12,"vm_id":"vm-7","attempt":1,"passed":false,
+ "checks":[{"code":"proxy_exclusive","ok":false,"remedy":"rebuild",
+            "message":"代理已被其它槽位使用","detail":"管理员诊断信息"}],
+ "created_at":"2026-10-31T00:00:00Z"}
+```
 
 `Settings`（全新安装也返回完整的 `payment` 两段文档，前端可直接读 `payment.epay.*` / `payment.manual.*`）:
 ```json
@@ -220,6 +243,10 @@ utilization 为 0–100；窗口缺失为 `null`。
  "base_concurrency":1,"concurrency_per_hosted_seat":0,"concurrency_per_rental_account":0,
  "hosted_grace_hours":24,"rental_grace_hours":0,"gateway_queue_timeout_ms":0,
  "hosted_vm_template":{"runtime_type":"docker"},
+ "selfcheck_require_dedicated_proxy":true,"selfcheck_require_timezone_match":true,
+ "selfcheck_max_rebuilds":3,"selfcheck_recheck_minutes":30,
  "payment":{"epay":{"enabled":false,"gateway_url":"","pid":"","key":"***","types":["alipay","wxpay"]},
             "manual":{"enabled":true,"instructions":"转账后请联系管理员确认收款。"}}}
 ```
+
+自检设置：`selfcheck_require_dedicated_proxy` 默认 `true`，要求独占 SOCKS5 代理；`selfcheck_require_timezone_match` 默认 `true`，要求出口地理时区与槽位时区一致；`selfcheck_max_rebuilds` 默认 `3`，控制自动重建上限；`selfcheck_recheck_minutes` 默认 `30`，控制授权前复查间隔和后台巡检周期。`GET /api/admin/settings` 返回这四个字段，`PUT` 可部分更新。

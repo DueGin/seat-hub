@@ -1,8 +1,9 @@
 import { toast } from 'sonner'
+import type { SelfcheckCheck } from './types'
 
-type Envelope<T> = { ok: true; data: T } | { ok: false; error: { code: string; message: string } }
+type Envelope<T> = { ok: true; data: T } | { ok: false; error: { code: string; message: string; checks?: SelfcheckCheck[] } }
 export class ApiError extends Error {
-  constructor(public code: string, message: string, public status: number) { super(message); this.name = 'ApiError' }
+  constructor(public code: string, message: string, public status: number, public checks: SelfcheckCheck[] = []) { super(message); this.name = 'ApiError' }
 }
 export const isMock = import.meta.env.DEV && import.meta.env.VITE_MOCK !== 'false'
 async function request<T>(path: string, method = 'GET', body?: unknown): Promise<T> {
@@ -13,11 +14,11 @@ async function request<T>(path: string, method = 'GET', body?: unknown): Promise
     let envelope: Envelope<T>
     try { envelope = await response.json() as Envelope<T> } catch { throw new ApiError('invalid_response', '服务暂时不可用，请稍后重试', response.status) }
     if (!response.ok || !envelope.ok) {
-      const error = !envelope.ok ? envelope.error : { code: 'request_failed', message: '请求未能完成' }
+      const error: { code: string; message: string; checks?: SelfcheckCheck[] } = !envelope.ok ? envelope.error : { code: 'request_failed', message: '请求未能完成' }
       if (response.status === 401 && !['/auth/me', '/auth/login', '/auth/register'].includes(path)) {
         window.location.assign(`/login?returnTo=${encodeURIComponent(window.location.pathname + window.location.search)}`)
       }
-      throw new ApiError(error.code, error.message, response.status)
+      throw new ApiError(error.code, error.message, response.status, error.checks ?? [])
     }
     return envelope.data
   } catch (error) {

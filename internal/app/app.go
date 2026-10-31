@@ -18,6 +18,7 @@ import (
 	"github.com/DueGin/vm2api-portal/internal/order"
 	"github.com/DueGin/vm2api-portal/internal/payment"
 	"github.com/DueGin/vm2api-portal/internal/secret"
+	"github.com/DueGin/vm2api-portal/internal/selfcheck"
 	"github.com/DueGin/vm2api-portal/internal/store"
 	"github.com/DueGin/vm2api-portal/internal/vm2api"
 	"github.com/DueGin/vm2api-portal/internal/webdist"
@@ -71,6 +72,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	// Usage/provisioning services are wired by wiring.go; they are the only
 	// parts that need the job engine.
 	prov := newProvisioner(db, vmClient, box, orderSvc, settings, logger)
+	prov.svc.SetChecker(selfcheck.NewEngine(vmClient, db.DB))
 	orderSvc.SetFulfiller(prov)
 
 	usersAdv := &usersAdapter{users: users, db: db.DB, client: vmClient}

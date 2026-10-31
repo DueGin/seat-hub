@@ -3,12 +3,15 @@ package app
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/DueGin/vm2api-portal/internal/api"
 	"github.com/DueGin/vm2api-portal/internal/provision"
+	"github.com/DueGin/vm2api-portal/internal/selfcheck"
+	"github.com/DueGin/vm2api-portal/internal/store"
 	"github.com/DueGin/vm2api-portal/internal/usage"
 	"github.com/DueGin/vm2api-portal/internal/vm2api"
 )
@@ -16,9 +19,10 @@ import (
 // provisionSpan serves api.AccountService and api.UsageService on top of the
 // provisioning and usage packages.
 type provisionSpan struct {
-	prov  *provision.Service
-	usage *usage.Service
-	db    *sql.DB
+	prov     *provision.Service
+	usage    *usage.Service
+	db       *sql.DB
+	settings *store.Settings
 	// keyStats reads one upstream key's usage from vm2api; nil disables it.
 	keyStats func(ctx context.Context, vm2apiKeyID string) (vm2api.UsageBreakdown, error)
 	// inflight reports the gateway's live request count for a user.
@@ -113,7 +117,48 @@ func derefString(s *string) string {
 	return *s
 }
 
-func toAccountDTO(a provision.Account, usageDTO *api.AccountUsageDTO) api.AccountDTO {
+func toSelfcheckChecks(checks []selfcheck.Check, admin bool) []api.SelfcheckCheckDTO {
+	items := make([]api.SelfcheckCheckDTO, 0, len(checks))
+	for _, check := range checks {
+		item := api.SelfcheckCheckDTO{
+			Code: string(check.Code), OK: check.OK, Skipped: check.Skipped,
+			Remedy: string(check.Remedy), Message: check.Message,
+		}
+		if admin {
+			item.Detail = check.Detail
+		}
+		items = append(items, item)
+	}
+	return items
+}
+
+func toSelfcheckDTO(state provision.SelfcheckState, admin bool) api.SelfcheckDTO {
+	if state.State == "" {
+		state.State = "pending"
+	}
+	return api.SelfcheckDTO{
+		State: state.State, Attempts: state.Attempts, MaxAttempts: state.MaxAttempts,
+		CheckedAt: state.CheckedAt, Checks: toSelfcheckChecks(state.Checks, admin),
+	}
+}
+
+func accountSelfcheck(a provision.Account, maxAttempts int, admin bool) *api.SelfcheckDTO {
+	var summary struct {
+		Checks []selfcheck.Check `json:"checks"`
+	}
+	if a.SelfcheckSummary != nil {
+		if err := json.Unmarshal([]byte(*a.SelfcheckSummary), &summary); err != nil {
+			_ = json.Unmarshal([]byte(*a.SelfcheckSummary), &summary.Checks)
+		}
+	}
+	dto := toSelfcheckDTO(provision.SelfcheckState{
+		State: a.SelfcheckState, Attempts: a.SelfcheckAttempts, MaxAttempts: maxAttempts,
+		CheckedAt: a.SelfcheckCheckedAt, Checks: summary.Checks,
+	}, admin)
+	return &dto
+}
+
+func toAccountDTO(a provision.Account, usageDTO *api.AccountUsageDTO, maxAttempts int) api.AccountDTO {
 	return api.AccountDTO{
 		ID:           a.ID,
 		Kind:         a.Kind,
@@ -125,6 +170,7 @@ func toAccountDTO(a provision.Account, usageDTO *api.AccountUsageDTO) api.Accoun
 		CreatedAt:    a.CreatedAt,
 		ExpiresAt:    a.ExpiresAt,
 		Usage:        usageDTO,
+		Selfcheck:    accountSelfcheck(a, maxAttempts, false),
 	}
 }
 
@@ -133,13 +179,17 @@ func (p *provisionSpan) List(ctx context.Context, userID int64, includeReleased 
 	if err != nil {
 		return nil, mapProvisionErr(err)
 	}
+	site, err := store.LoadSite(ctx, p.settings)
+	if err != nil {
+		return nil, fmt.Errorf("load selfcheck settings: %w", err)
+	}
 	out := make([]api.AccountDTO, 0, len(accounts))
 	for _, a := range accounts {
 		var u *usage.AccountUsage
 		if a.Status == "active" || a.Status == "needs_reauth" || a.Status == "suspended" {
 			u, _ = p.usage.AccountUsage(ctx, userID, a.ID)
 		}
-		out = append(out, toAccountDTO(a, toAccountUsageDTO(u)))
+		out = append(out, toAccountDTO(a, toAccountUsageDTO(u), site.SelfcheckMaxRebuilds))
 	}
 	return out, nil
 }
@@ -153,7 +203,13 @@ func (p *provisionSpan) Get(ctx context.Context, userID, id int64) (api.AccountD
 	if err != nil && !errors.Is(err, usage.ErrNotFound) {
 		return api.AccountDTO{}, nil, nil, err
 	}
-	dto := toAccountDTO(a, toAccountUsageDTO(u))
+	state, err := p.prov.Selfcheck(ctx, id)
+	if err != nil {
+		return api.AccountDTO{}, nil, nil, mapProvisionErr(err)
+	}
+	dto := toAccountDTO(a, toAccountUsageDTO(u), state.MaxAttempts)
+	check := toSelfcheckDTO(state, false)
+	dto.Selfcheck = &check
 	if u == nil {
 		// vm2api is unreachable or the account has no live VM: the contract
 		// says these are arrays, so hand back empty ones instead of null.
@@ -171,11 +227,20 @@ func (p *provisionSpan) CreateHosted(ctx context.Context, userID int64, label st
 	if err != nil {
 		return api.AccountDTO{}, api.OnboardingDTO{}, mapProvisionErr(err)
 	}
+	state, err := p.prov.Selfcheck(ctx, a.ID)
+	if err != nil {
+		return api.AccountDTO{}, api.OnboardingDTO{}, mapProvisionErr(err)
+	}
+	check := toSelfcheckDTO(state, false)
+	account := toAccountDTO(a, nil, state.MaxAttempts)
+	account.Selfcheck = &check
 	ob, err := p.prov.Onboarding(ctx, userID, a.ID)
 	if err != nil {
-		return toAccountDTO(a, nil), api.OnboardingDTO{AccountID: a.ID, Status: a.Status}, nil
+		return account, api.OnboardingDTO{AccountID: a.ID, Status: a.Status, Selfcheck: &check}, nil
 	}
-	return toAccountDTO(a, nil), toOnboardingDTO(ob), nil
+	onboarding := toOnboardingDTO(ob)
+	onboarding.Selfcheck = &check
+	return account, onboarding, nil
 }
 
 func toOnboardingDTO(ob provision.Onboarding) api.OnboardingDTO {
@@ -202,7 +267,14 @@ func (p *provisionSpan) Onboarding(ctx context.Context, userID, id int64) (api.O
 	if err != nil {
 		return api.OnboardingDTO{}, mapProvisionErr(err)
 	}
-	return toOnboardingDTO(ob), nil
+	state, err := p.prov.Selfcheck(ctx, id)
+	if err != nil {
+		return api.OnboardingDTO{}, mapProvisionErr(err)
+	}
+	dto := toOnboardingDTO(ob)
+	check := toSelfcheckDTO(state, false)
+	dto.Selfcheck = &check
+	return dto, nil
 }
 
 func (p *provisionSpan) RegenerateAuthURL(ctx context.Context, userID, id int64) (api.OnboardingDTO, error) {
@@ -234,6 +306,16 @@ func mapProvisionErr(err error) error {
 	switch {
 	case err == nil:
 		return nil
+	case errors.Is(err, provision.ErrAccountDuplicate):
+		return &api.UserError{Status: 409, Code: "account_duplicate", Message: "该 Claude 账号已在其它槽位托管，不能重复上号"}
+	case errors.Is(err, provision.ErrSelfcheckExhausted):
+		return &api.UserError{Status: 409, Code: "selfcheck_exhausted", Message: "槽位多次自检未通过，已转人工处理"}
+	case errors.Is(err, provision.ErrSelfcheckFailed):
+		message := "槽位自检未通过，系统正在重建运行环境，请稍后再试"
+		if err != provision.ErrSelfcheckFailed {
+			message += "（" + err.Error() + "）"
+		}
+		return &api.UserError{Status: 409, Code: "selfcheck_failed", Message: message}
 	case errors.Is(err, provision.ErrNotFound), errors.Is(err, usage.ErrNotFound):
 		return api.Err(provision.ErrNotFound, 404, "not_found", "账号不存在")
 	case errors.Is(err, provision.ErrNoFreeSeat):

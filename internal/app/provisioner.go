@@ -41,14 +41,12 @@ func newProvisioner(
 	prov := provision.New(db.DB, client)
 	use := usage.New(db.DB, client)
 	keysAndAdmin := portal.New(db, client, box, prov)
-	if portalAdmin, ok := any(keysAndAdmin).(api.AdminService); ok {
-		_ = portalAdmin
-	}
 	p := &provisioner{
 		provisionSpan: &provisionSpan{
 			prov:     prov,
 			usage:    use,
 			db:       db.DB,
+			settings: settings,
 			keyStats: client.KeyStats,
 		},
 		svc:   prov,
@@ -62,18 +60,29 @@ func newProvisioner(
 
 // --- self-check admin surface (implemented by the self-check integration) ---
 
-var errSelfcheckNotWired = api.Err(errors.New("selfcheck not wired"), 503, "selfcheck_unavailable", "自检尚未启用")
-
 func (p *provisioner) RunSelfcheck(ctx context.Context, resourceID int64, rebuild bool) (api.SelfcheckDTO, error) {
-	return api.SelfcheckDTO{}, errSelfcheckNotWired
+	state, err := p.svc.RecheckResource(ctx, resourceID, rebuild)
+	return toSelfcheckDTO(state, true), mapProvisionErr(err)
 }
 
 func (p *provisioner) SelfcheckHistory(ctx context.Context, resourceID int64, limit int) ([]api.SelfcheckReportDTO, error) {
-	return nil, errSelfcheckNotWired
+	records, err := p.svc.SelfcheckHistory(ctx, resourceID, limit)
+	if err != nil {
+		return nil, mapProvisionErr(err)
+	}
+	items := make([]api.SelfcheckReportDTO, 0, len(records))
+	for _, record := range records {
+		items = append(items, api.SelfcheckReportDTO{
+			ID: record.ID, VMID: record.VMID, Attempt: record.Attempt,
+			Passed: record.Passed, Checks: toSelfcheckChecks(record.Checks, true), CreatedAt: record.CreatedAt,
+		})
+	}
+	return items, nil
 }
 
 func (p *provisioner) RunPoolSelfcheck(ctx context.Context, vmID string) (api.SelfcheckDTO, error) {
-	return api.SelfcheckDTO{}, errSelfcheckNotWired
+	state, err := p.svc.AdmitPoolVM(ctx, vmID)
+	return toSelfcheckDTO(state, true), mapProvisionErr(err)
 }
 
 // keyAdapter adapts the key service. It is a separate type because
@@ -106,7 +115,24 @@ func (p *provisioner) Dashboard(ctx context.Context) (api.AdminDashboardDTO, err
 }
 
 func (p *provisioner) RentalPool(ctx context.Context) ([]api.RentalPoolRowDTO, error) {
-	return p.admin.RentalPool(ctx)
+	items, err := p.admin.RentalPool(ctx)
+	if err != nil {
+		return nil, mapProvisionErr(err)
+	}
+	site, err := store.LoadSite(ctx, p.settings)
+	if err != nil {
+		return nil, fmt.Errorf("load selfcheck settings: %w", err)
+	}
+	for index := range items {
+		if items[index].Selfcheck == nil {
+			items[index].Selfcheck = &api.SelfcheckDTO{State: "pending"}
+		}
+		items[index].Selfcheck.MaxAttempts = site.SelfcheckMaxRebuilds
+		if items[index].Selfcheck.Checks == nil {
+			items[index].Selfcheck.Checks = []api.SelfcheckCheckDTO{}
+		}
+	}
+	return items, nil
 }
 
 func (p *provisioner) RentalCandidates(ctx context.Context) ([]api.RentalCandidateDTO, error) {
@@ -114,7 +140,7 @@ func (p *provisioner) RentalCandidates(ctx context.Context) ([]api.RentalCandida
 }
 
 func (p *provisioner) RentalAdd(ctx context.Context, vmIDs []string, note string) error {
-	return p.admin.RentalAdd(ctx, vmIDs, note)
+	return mapProvisionErr(p.admin.RentalAdd(ctx, vmIDs, note))
 }
 
 func (p *provisioner) RentalPatch(ctx context.Context, vmID, status, note string) error {
@@ -215,7 +241,7 @@ var (
 func (p *provisioner) adminAccounts(ctx context.Context, kind, status string, userID int64, page, pageSize int) ([]api.AdminAccountDTO, int64, error) {
 	query := `SELECT r.id, r.user_id, u.email, r.kind, COALESCE(r.vm_id,''), r.label, r.email_masked,
 		r.tier, r.status, COALESCE(r.status_reason,''), COALESCE(r.last_error,''), r.created_at,
-		COALESCE(s.expires_at,'')
+		COALESCE(s.expires_at,''), r.selfcheck_state, r.selfcheck_attempts, r.selfcheck_checked_at, r.selfcheck_summary
 		FROM resources r JOIN users u ON u.id = r.user_id
 		LEFT JOIN subscriptions s ON s.id = r.subscription_id WHERE 1=1`
 	args := []any{}
@@ -236,6 +262,10 @@ func (p *provisioner) adminAccounts(ctx context.Context, kind, status string, us
 	if err := p.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
+	site, err := store.LoadSite(ctx, p.settings)
+	if err != nil {
+		return nil, 0, fmt.Errorf("load selfcheck settings: %w", err)
+	}
 	args = append(args, pageSize, (page-1)*pageSize)
 	rows, err := p.db.QueryContext(ctx, query+` ORDER BY r.id DESC LIMIT ? OFFSET ?`, args...)
 	if err != nil {
@@ -246,10 +276,13 @@ func (p *provisioner) adminAccounts(ctx context.Context, kind, status string, us
 	for rows.Next() {
 		var row api.AdminAccountDTO
 		var expires string
+		var account provision.Account
 		if err := rows.Scan(&row.ID, &row.UserID, &row.UserEmail, &row.Kind, &row.VMID, &row.Label,
-			&row.EmailMasked, &row.Tier, &row.Status, &row.StatusReason, &row.LastError, &row.CreatedAt, &expires); err != nil {
+			&row.EmailMasked, &row.Tier, &row.Status, &row.StatusReason, &row.LastError, &row.CreatedAt, &expires,
+			&account.SelfcheckState, &account.SelfcheckAttempts, &account.SelfcheckCheckedAt, &account.SelfcheckSummary); err != nil {
 			return nil, 0, err
 		}
+		row.Selfcheck = accountSelfcheck(account, site.SelfcheckMaxRebuilds, true)
 		if expires != "" {
 			row.ExpiresAt = &expires
 		}

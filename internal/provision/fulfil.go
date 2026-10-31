@@ -126,7 +126,7 @@ func claimRentalTx(ctx context.Context, tx *sql.Tx, userID, subscriptionID int64
 				skip = append(skip, item)
 			}
 		}
-		err := tx.QueryRowContext(ctx, `SELECT vm_id,tier FROM rental_pool WHERE status='available'`+exclude+` ORDER BY vm_id LIMIT 1`, skip...).Scan(&vmID, &tier)
+		err := tx.QueryRowContext(ctx, `SELECT vm_id,tier FROM rental_pool WHERE status='available' AND selfcheck_state='pass'`+exclude+` ORDER BY vm_id LIMIT 1`, skip...).Scan(&vmID, &tier)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrOutOfStock
 		}
@@ -141,7 +141,7 @@ func claimRentalTx(ctx context.Context, tx *sql.Tx, userID, subscriptionID int64
 		if err != nil {
 			return nil, fmt.Errorf("read rental resource id: %w", err)
 		}
-		claimed, err := tx.ExecContext(ctx, `UPDATE rental_pool SET status='leased',leased_resource_id=?,updated_at=? WHERE vm_id=? AND status='available'`, resourceID, timestamp(now), vmID)
+		claimed, err := tx.ExecContext(ctx, `UPDATE rental_pool SET status='leased',leased_resource_id=?,updated_at=? WHERE vm_id=? AND status='available' AND selfcheck_state='pass'`, resourceID, timestamp(now), vmID)
 		if err != nil {
 			return nil, fmt.Errorf("lease rental vm: %w", err)
 		}

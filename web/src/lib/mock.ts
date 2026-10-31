@@ -2,7 +2,8 @@ import type {
   Account, AccountUsage, AdminDashboard, AdminUser, ApiKey, DailyUsage, Job,
   ModelUsage, Onboarding, Order, Overview, Page, Payment, PoolCandidate,
   PoolItem, Product, ProductKind, PublicConfig, Settings, Spend, Subscription,
-  UsageLog, UsageSummary, User, NormalizedSettings,
+  UsageLog, UsageSummary, User, NormalizedSettings, Selfcheck, SelfcheckCheck,
+  SelfcheckReport,
 } from './types'
 
 type Owned<T> = { userId: number; value: T }
@@ -42,6 +43,8 @@ let settings: NormalizedSettings = {
   concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0,
   hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0,
   hosted_vm_template: { runtime_type: 'docker' },
+  selfcheck_require_dedicated_proxy: true, selfcheck_require_timezone_match: true,
+  selfcheck_max_rebuilds: 3, selfcheck_recheck_minutes: 30,
   payment: {
     epay: { enabled: false, gateway_url: 'https://payment.invalid.example/', pid: '', key: '', types: ['alipay', 'wxpay'] },
     manual: { enabled: true, instructions: '演示环境，无需真实转账；管理员可在订单中模拟确认收款。' },
@@ -85,12 +88,30 @@ function accountUsage(seed: number): AccountUsage {
     seats_used: 1, seats_max: 4, inflight: seed % 2, fetched_at: iso(),
   }
 }
+function passingChecks(): SelfcheckCheck[] {
+  return [
+    { code: 'proxy_bound', ok: true, message: '已绑定独享 SOCKS5 出口' },
+    { code: 'proxy_healthy', ok: true, message: '出口代理运行正常' },
+    { code: 'exit_ip_unique', ok: true, message: '出口 IP 未与其他槽位重复' },
+    { code: 'fingerprint_unique', ok: true, message: '设备指纹未与其他槽位重复' },
+  ]
+}
+function selfcheck(state: Selfcheck['state'], attempts = 0): Selfcheck {
+  const checks = passingChecks()
+  if (state === 'fail') checks[2] = { code: 'exit_ip_unique', ok: false, message: '出口 IP 与其他槽位重复', detail: '203.0.113.24 同时分配给 demo-hosted-1', remedy: '重建运行环境并重新分配出口。' }
+  if (state === 'exhausted') checks[1] = { code: 'proxy_healthy', ok: false, message: '出口代理健康检查失败', detail: 'proxy status=dead', remedy: '请管理员更换可用代理后重新自检。' }
+  if (state === 'pending') return { state, attempts, max_attempts: settings.selfcheck_max_rebuilds, checked_at: null, checks: [] }
+  return { state, attempts, max_attempts: settings.selfcheck_max_rebuilds, checked_at: iso(-60_000), checks }
+}
+function duplicateSelfcheck(): Selfcheck {
+  return { ...selfcheck('fail'), checks: [...passingChecks(), { code: 'account_unique', ok: false, message: '该账号已在其它槽位托管', detail: 'account_uuid 与资源 #1 重复', remedy: '请移除此账号，或使用尚未托管的账号。' }] }
+}
 const accounts: Owned<Account>[] = [
-  { userId: 1, value: { id: 1, kind: 'hosted', label: '日常开发主号', email_masked: 'de***@gmail.com', status: 'active', status_reason: null, tier: 'max', created_at: iso(-12 * DAY), expires_at: null, usage: accountUsage(1) } },
-  { userId: 1, value: { id: 2, kind: 'hosted', label: '设计工作室', email_masked: 'st***@outlook.com', status: 'needs_reauth', status_reason: '授权已过期，请重新完成 OAuth 授权。', tier: 'pro', created_at: iso(-10 * DAY), expires_at: null, usage: { ...accountUsage(2), available: false, schedule_state: 'unschedulable', restriction_text: '需要重新授权', five_hour: null, seven_day: null, estimate_5h: null, estimate_7d: null, inflight: 0 } } },
-  { userId: 1, value: { id: 3, kind: 'hosted', label: '暂停中的备用号', email_masked: 'ba***@gmail.com', status: 'suspended', status_reason: '账号已暂停，当前无法获取用量。', tier: 'pro', created_at: iso(-8 * DAY), expires_at: null, usage: null } },
-  { userId: 1, value: { id: 4, kind: 'rental', label: 'Max 独享租赁', email_masked: 're***@gmail.com', status: 'active', status_reason: null, tier: 'max', created_at: iso(-24 * DAY), expires_at: iso(6 * DAY), usage: accountUsage(2) } },
-  { userId: 2, value: { id: 5, kind: 'hosted', label: '个人工作账号', email_masked: 'us***@gmail.com', status: 'active', status_reason: null, tier: 'pro', created_at: iso(-5 * DAY), expires_at: null, usage: accountUsage(0) } },
+  { userId: 1, value: { id: 1, kind: 'hosted', label: '日常开发主号', email_masked: 'de***@gmail.com', status: 'active', status_reason: null, tier: 'max', created_at: iso(-12 * DAY), expires_at: null, usage: accountUsage(1), selfcheck: selfcheck('pass') } },
+  { userId: 1, value: { id: 2, kind: 'hosted', label: '设计工作室（重建中）', email_masked: 'st***@outlook.com', status: 'needs_reauth', status_reason: '环境自检未通过，正在第 2 次重建。', tier: 'pro', created_at: iso(-10 * DAY), expires_at: null, usage: { ...accountUsage(2), available: false, schedule_state: 'unschedulable', restriction_text: '需要重新授权', five_hour: null, seven_day: null, estimate_5h: null, estimate_7d: null, inflight: 0 }, selfcheck: selfcheck('fail', 2) } },
+  { userId: 1, value: { id: 3, kind: 'hosted', label: '备用号（转人工）', email_masked: 'ba***@gmail.com', status: 'failed', status_reason: '多次自检未通过，已转人工处理。', tier: 'pro', created_at: iso(-8 * DAY), expires_at: null, usage: null, selfcheck: selfcheck('exhausted', 3) } },
+  { userId: 1, value: { id: 4, kind: 'rental', label: 'Max 独享租赁', email_masked: 're***@gmail.com', status: 'active', status_reason: null, tier: 'max', created_at: iso(-24 * DAY), expires_at: iso(6 * DAY), usage: accountUsage(2), selfcheck: selfcheck('pass') } },
+  { userId: 2, value: { id: 5, kind: 'hosted', label: '个人工作账号', email_masked: 'us***@gmail.com', status: 'active', status_reason: null, tier: 'pro', created_at: iso(-5 * DAY), expires_at: null, usage: accountUsage(0), selfcheck: selfcheck('pass') } },
 ]
 const keys: Owned<ApiKey>[] = [
   { userId: 1, value: { id: 1, name: '开发环境', prefix: 'sk-pt-Demo', status: 'active', created_at: iso(-25 * DAY), last_used_at: iso(-120_000) } },
@@ -124,11 +145,13 @@ const pool: PoolItem[] = rentalCandidates.slice(0, 5).map((candidate, index) => 
   leased_to_user_id: index === 0 ? 1 : null, leased_to_email: index === 0 ? users[0].email : null,
   note: index === 4 ? '演示：维护中的账号' : '演示资源，请勿用于真实请求',
   vm: { label: candidate.label, email_masked: candidate.email_masked, cred_status: candidate.cred_status, schedule_state: index === 4 ? 'off' : candidate.schedule_state, tier: candidate.tier, five_hour: { utilization: index * 7, resets_at: iso(3_600_000), status: 'ok' }, seven_day: { utilization: index * 11, resets_at: iso(2 * DAY), status: 'ok' } },
+  selfcheck: index === 4 ? selfcheck('fail') : selfcheck('pass'),
 }))
 const accountVMs = new Map<number, string>([[1, 'demo-hosted-1'], [2, 'demo-hosted-2'], [3, 'demo-hosted-3'], [4, 'demo-vm-1'], [5, 'demo-hosted-5']])
 const rentalSubscriptions = new Map<number, number>([[4, 3]])
 const onboardings = new Map<number, Onboarding>()
 const bootstrapFailures = new Set<number>()
+const selfcheckReports = new Map<number, SelfcheckReport[]>()
 const jobs: Job[] = [
   { id: 1, type: 'hosted.reauthorize', status: 'failed', attempts: 3, run_after: iso(-3_600_000), last_error: '演示：OAuth 授权已失效，请重新授权。', payload: { account_id: 2 }, created_at: iso(-2 * DAY), updated_at: iso(-3_600_000) },
   { id: 2, type: 'usage.refresh', status: 'pending', attempts: 0, run_after: iso(60_000), last_error: null, payload: { account_id: 1 }, created_at: iso(-60_000), updated_at: iso(-60_000) },
@@ -158,9 +181,10 @@ for (let day = 29; day >= 0; day--) {
 class MockError extends Error {
   readonly status: number
   readonly code: string
-  constructor(status: number, code: string, message: string) { super(message); this.status = status; this.code = code }
+  readonly checks: SelfcheckCheck[]
+  constructor(status: number, code: string, message: string, checks: SelfcheckCheck[] = []) { super(message); this.status = status; this.code = code; this.checks = checks }
 }
-function fail(status: number, code: string, message: string): never { throw new MockError(status, code, message) }
+function fail(status: number, code: string, message: string, checks: SelfcheckCheck[] = []): never { throw new MockError(status, code, message, checks) }
 function ok(data: unknown = {}, status = 200): Response {
   return new Response(JSON.stringify({ ok: true, data }), { status, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } })
 }
@@ -359,12 +383,19 @@ function onboardingFor(account: Account): Onboarding {
   if (account.status === 'suspended') fail(409, 'account_suspended', '账号已暂停，请恢复托管席位并联系管理员重试。')
   let onboarding = onboardings.get(account.id)
   if (!onboarding) {
-    onboarding = { account_id: account.id, status: account.status, auth_url: null, auth_url_expires_at: null, bootstrap: account.status === 'active' ? { state: 'succeeded', message: '演示账号已就绪。' } : null, error: account.status === 'failed' ? { code: 'provision_failed', message: '演示：初始化失败，请重试。' } : null, can_regenerate: ['awaiting_auth', 'needs_reauth', 'failed'].includes(account.status) }
+    onboarding = { account_id: account.id, status: account.status, auth_url: null, auth_url_expires_at: null, bootstrap: account.status === 'active' ? { state: 'succeeded', message: '演示账号已就绪。' } : null, error: account.status === 'failed' && account.selfcheck?.state !== 'exhausted' ? { code: 'provision_failed', message: '演示：初始化失败，请重试。' } : null, can_regenerate: ['awaiting_auth', 'needs_reauth', 'failed'].includes(account.status), selfcheck: account.selfcheck }
     onboardings.set(account.id, onboarding)
   }
+  onboarding.selfcheck = account.selfcheck
   return onboarding
 }
+function requireSelfcheck(account: Account) {
+  if (account.selfcheck?.state === 'exhausted') fail(409, 'selfcheck_exhausted', '多次自检未通过，已转人工处理，请联系管理员。', account.selfcheck.checks)
+  if (account.selfcheck?.checks.some((check) => check.code === 'account_unique' && !check.ok)) fail(409, 'account_duplicate', '该账号已在其它槽位托管，请勿重复添加。', account.selfcheck.checks)
+  if (account.selfcheck?.state !== 'pass') fail(409, 'selfcheck_failed', '运行环境自检未通过，请等待自动重建完成后重试。', account.selfcheck?.checks ?? [])
+}
 function generateAuthURL(account: Account): Onboarding {
+  requireSelfcheck(account)
   const onboarding = onboardingFor(account)
   const url = new URL('https://oauth.invalid.example/authorize')
   url.searchParams.set('demo', 'true'); url.searchParams.set('account_id', String(account.id)); url.searchParams.set('generation', String(nextId()))
@@ -373,7 +404,16 @@ function generateAuthURL(account: Account): Onboarding {
   return onboarding
 }
 function pollOnboarding(account: Account): Onboarding {
-  if (account.status === 'provisioning') return generateAuthURL(account)
+  if (account.status === 'provisioning') {
+    if (account.selfcheck?.state === 'pending') {
+      if (account.label.includes('重复')) account.selfcheck = duplicateSelfcheck()
+      else if (account.label.includes('耗尽')) { account.selfcheck = selfcheck('exhausted', settings.selfcheck_max_rebuilds); account.status = 'failed'; account.status_reason = '多次自检未通过，已转人工处理。' }
+      else if (account.label.includes('自检失败')) account.selfcheck = selfcheck('fail', Math.min(2, settings.selfcheck_max_rebuilds))
+      else account.selfcheck = selfcheck('pass')
+    }
+    if (account.selfcheck?.state === 'pass') return generateAuthURL(account)
+    return onboardingFor(account)
+  }
   const onboarding = onboardingFor(account)
   if (account.status === 'bootstrapping') {
     if (bootstrapFailures.delete(account.id)) {
@@ -387,7 +427,7 @@ function pollOnboarding(account: Account): Onboarding {
   return onboarding
 }
 function restartAccount(account: Account): Onboarding {
-  account.status = 'provisioning'; account.status_reason = null; account.usage = null; onboardings.delete(account.id); bootstrapFailures.delete(account.id)
+  account.status = 'provisioning'; account.status_reason = null; account.usage = null; account.selfcheck = selfcheck('pending'); onboardings.delete(account.id); bootstrapFailures.delete(account.id)
   return onboardingFor(account)
 }
 function orderNumber() { return `PT${new Date().toISOString().replace(/\D/g, '').slice(0, 17)}${nextId()}` }
@@ -459,7 +499,7 @@ function fulfill(entry: Owned<Order>) {
   if (order.kind === 'rental_account') {
     for (const resource of available.slice(0, needed)) {
       resource.status = 'leased'; resource.leased_to_user_id = entry.userId; resource.leased_to_email = emailOf(entry.userId)
-      const account: Account = { id: nextId(), kind: 'rental', label: resource.vm.label, email_masked: resource.vm.email_masked, status: 'active', status_reason: null, tier: resource.tier, created_at: new Date().toISOString(), expires_at: subscription.expires_at, usage: accountUsage(0) }
+      const account: Account = { id: nextId(), kind: 'rental', label: resource.vm.label, email_masked: resource.vm.email_masked, status: 'active', status_reason: null, tier: resource.tier, created_at: new Date().toISOString(), expires_at: subscription.expires_at, usage: accountUsage(0), selfcheck: resource.selfcheck }
       accounts.unshift({ userId: entry.userId, value: account }); accountVMs.set(account.id, resource.vm_id); rentalSubscriptions.set(account.id, subscription.id)
     }
   }
@@ -575,6 +615,11 @@ function patchSettings(input: Input) {
   if (input.registration_open !== undefined) updated.registration_open = boolean(input, 'registration_open', true)
   const numberKeys = ['base_concurrency', 'concurrency_per_hosted_seat', 'concurrency_per_rental_account', 'hosted_grace_hours', 'rental_grace_hours', 'gateway_queue_timeout_ms'] as const
   for (const key of numberKeys) if (input[key] !== undefined) updated[key] = integer(input, key)
+  if (input.selfcheck_require_dedicated_proxy !== undefined) updated.selfcheck_require_dedicated_proxy = boolean(input, 'selfcheck_require_dedicated_proxy', true)
+  if (input.selfcheck_require_timezone_match !== undefined) updated.selfcheck_require_timezone_match = boolean(input, 'selfcheck_require_timezone_match', true)
+  if (input.selfcheck_max_rebuilds !== undefined) updated.selfcheck_max_rebuilds = integer(input, 'selfcheck_max_rebuilds')
+  if (input.selfcheck_recheck_minutes !== undefined) updated.selfcheck_recheck_minutes = integer(input, 'selfcheck_recheck_minutes', 5)
+  if (updated.selfcheck_max_rebuilds > 10 || updated.selfcheck_recheck_minutes > 1440) fail(422, 'invalid_selfcheck_settings', '最多重建次数须为 0–10，复检间隔须为 5–1440 分钟。')
   if (input.hosted_vm_template !== undefined) updated.hosted_vm_template = structuredClone(record(input.hosted_vm_template))
   let configured = epayKeyConfigured
   if (input.payment !== undefined) {
@@ -606,6 +651,31 @@ function patchSettings(input: Input) {
     }
   }
   settings = updated; epayKeyConfigured = configured
+}
+
+function recordSelfcheck(account: Account) {
+  const current = account.selfcheck ?? selfcheck('pending')
+  const reports = selfcheckReports.get(account.id) ?? []
+  reports.unshift({ id: nextId(), vm_id: accountVMs.get(account.id) ?? '', attempt: current.attempts, passed: current.state === 'pass', checks: current.checks, created_at: new Date().toISOString() })
+  selfcheckReports.set(account.id, reports)
+}
+function runAccountSelfcheck(account: Account, rebuild: boolean): Selfcheck {
+  const previous = account.selfcheck ?? selfcheck('pending')
+  const duplicate = previous.checks.some((check) => check.code === 'account_unique' && !check.ok)
+  if (duplicate) account.selfcheck = duplicateSelfcheck()
+  else if (rebuild || previous.state === 'pass' || previous.state === 'pending') account.selfcheck = selfcheck('pass')
+  else account.selfcheck = { ...previous, checked_at: new Date().toISOString() }
+  if (account.selfcheck.state === 'pass' && account.status === 'failed') {
+    account.status = 'awaiting_auth'; account.status_reason = null
+    const onboarding = onboardings.get(account.id)
+    if (onboarding) Object.assign(onboarding, { status: 'awaiting_auth', error: null, can_regenerate: true })
+  }
+  recordSelfcheck(account)
+  return account.selfcheck
+}
+function selfcheckHistory(account: Account): SelfcheckReport[] {
+  if (!selfcheckReports.has(account.id)) recordSelfcheck(account)
+  return selfcheckReports.get(account.id) ?? []
 }
 
 function adminRequest(path: string, method: string, query: URLSearchParams, input: Input): Response | undefined {
@@ -701,8 +771,18 @@ function adminRequest(path: string, method: string, query: URLSearchParams, inpu
       const note = limitedText(input, 'note', '', 1_000)
       const candidates = ids.map(id => rentalCandidates.find(candidate => candidate.vm_id === id) ?? fail(404, 'not_found', '待入池资源不存在。'))
       if (new Set(ids).size !== ids.length || candidates.some(candidate => pool.some(item => item.vm_id === candidate.vm_id) || vmHasOwner(candidate.vm_id))) fail(409, 'vm_unavailable', '资源已入池或已归属用户。')
-      for (const candidate of candidates) pool.push({ vm_id: candidate.vm_id, tier: candidate.tier, status: 'available', leased_to_user_id: null, leased_to_email: null, note, vm: { label: candidate.label, email_masked: candidate.email_masked, cred_status: candidate.cred_status, schedule_state: candidate.schedule_state, tier: candidate.tier, five_hour: null, seven_day: null } })
+      const failedCandidate = candidates.find((candidate) => candidate.vm_id === 'demo-vm-8')
+      if (failedCandidate) {
+        const failed = selfcheck('fail')
+        fail(409, 'selfcheck_failed', `${failedCandidate.label} 入池自检未通过。`, failed.checks)
+      }
+      for (const candidate of candidates) pool.push({ vm_id: candidate.vm_id, tier: candidate.tier, status: 'available', leased_to_user_id: null, leased_to_email: null, note, vm: { label: candidate.label, email_masked: candidate.email_masked, cred_status: candidate.cred_status, schedule_state: candidate.schedule_state, tier: candidate.tier, five_hour: null, seven_day: null }, selfcheck: selfcheck('pass') })
       return ok()
+    }
+    if (rawId && parts.length === 4 && action === 'selfcheck' && method === 'POST') {
+      const item = pool.find((candidate) => candidate.vm_id === rawId) ?? fail(404, 'not_found', '资源池账号不存在。')
+      item.selfcheck = selfcheck('pass')
+      return ok(item.selfcheck)
     }
     if (rawId && parts.length === 3 && ['PATCH', 'DELETE'].includes(method)) {
       const index = pool.findIndex(item => item.vm_id === rawId)
@@ -717,6 +797,14 @@ function adminRequest(path: string, method: string, query: URLSearchParams, inpu
   }
   if (resource === 'accounts') {
     if (!rawId && method === 'GET') return ok(paginate(accounts.filter(item => (!query.get('kind') || item.value.kind === query.get('kind')) && (!query.get('status') || item.value.status === query.get('status')) && (!query.get('user_id') || item.userId === Number(query.get('user_id')))).map(adminAccount), query))
+    if (rawId && parts.length === 4 && action === 'selfchecks' && method === 'GET') {
+      const account = accounts.find(item => item.value.id === positiveId(rawId))?.value ?? fail(404, 'not_found', '账号不存在。')
+      return ok({ items: selfcheckHistory(account) })
+    }
+    if (rawId && parts.length === 4 && action === 'selfcheck' && method === 'POST') {
+      const account = accounts.find(item => item.value.id === positiveId(rawId))?.value ?? fail(404, 'not_found', '账号不存在。')
+      return ok(runAccountSelfcheck(account, boolean(input, 'rebuild', false)))
+    }
     if (rawId && parts.length === 4 && method === 'POST' && (action === 'retry' || action === 'release')) {
       const account = accounts.find(item => item.value.id === positiveId(rawId))?.value ?? fail(404, 'not_found', '账号不存在。')
       if (action === 'release') releaseAccount(account)
@@ -772,7 +860,7 @@ function userRequest(path: string, method: string, query: URLSearchParams, input
   if (path === '/hosted' && method === 'POST') {
     const summary = overview(user.id)
     if (summary.hosted_seats.used >= summary.hosted_seats.total) fail(409, 'no_free_seat', '没有空闲托管席位，请先购买席位。')
-    const account: Account = { id: nextId(), kind: 'hosted', label: limitedText(input, 'label', '新的托管账号'), email_masked: '', status: 'provisioning', status_reason: null, tier: null, created_at: new Date().toISOString(), expires_at: null, usage: null }
+    const account: Account = { id: nextId(), kind: 'hosted', label: limitedText(input, 'label', '新的托管账号'), email_masked: '', status: 'provisioning', status_reason: null, tier: null, created_at: new Date().toISOString(), expires_at: null, usage: null, selfcheck: selfcheck('pending') }
     accounts.unshift({ userId: user.id, value: account }); accountVMs.set(account.id, `demo-hosted-${account.id}`)
     return ok({ account, onboarding: onboardingFor(account) }, 201)
   }
@@ -794,6 +882,10 @@ function userRequest(path: string, method: string, query: URLSearchParams, input
       const code = text(input, 'code')
       if (code.length < 8 || code.length > 8_192 || /\s/.test(code)) fail(422, 'invalid_code', '授权码格式不正确，请输入至少 8 位演示授权码。')
       const onboarding = onboardingFor(account)
+      requireSelfcheck(account)
+      if (code.startsWith('duplicate-account')) fail(409, 'account_duplicate', '该账号已在其它槽位托管，请勿重复添加。', duplicateSelfcheck().checks)
+      if (code.startsWith('selfcheck-exhausted')) fail(409, 'selfcheck_exhausted', '多次自检未通过，已转人工处理，请联系管理员。', selfcheck('exhausted', 3).checks)
+      if (code.startsWith('selfcheck-failed')) fail(409, 'selfcheck_failed', '运行环境自检未通过，请等待自动重建完成后重试。', selfcheck('fail', 2).checks)
       if (!['awaiting_auth', 'needs_reauth'].includes(account.status)) fail(409, 'invalid_account_status', '当前账号不处于等待授权状态。')
       if (!onboarding.auth_url_expires_at || Date.parse(onboarding.auth_url_expires_at) <= Date.now()) fail(409, 'auth_url_expired', '授权链接已过期，请重新生成。')
       if (/^(invalid|fail|expired)/i.test(code)) fail(422, 'exchange_failed', '演示：授权码无效或已使用，请重新获取授权码。')
@@ -864,6 +956,6 @@ export async function mockRequest(path: string, method: string, body?: unknown):
     return userRequest(normalized, verb, url.searchParams, input, user) ?? fail(404, 'not_found', '此演示接口不存在。')
   } catch (error: unknown) {
     const known = error instanceof MockError
-    return new Response(JSON.stringify({ ok: false, error: { code: known ? error.code : 'mock_error', message: known ? error.message : '演示请求处理失败，请刷新页面后重试。' } }), { status: known ? error.status : 500, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } })
+    return new Response(JSON.stringify({ ok: false, error: { code: known ? error.code : 'mock_error', message: known ? error.message : '演示请求处理失败，请刷新页面后重试。', ...(known && error.checks.length ? { checks: error.checks } : {}) } }), { status: known ? error.status : 500, headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' } })
   }
 }

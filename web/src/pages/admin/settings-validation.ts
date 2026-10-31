@@ -9,9 +9,15 @@ export const numericSettings = [
   { key: 'gateway_queue_timeout_ms', label: '网关排队超时（毫秒）', hint: '0 表示不等待；数值必须为非负整数。' },
 ] as const
 
+export const selfcheckNumericSettings = [
+  { key: 'selfcheck_max_rebuilds', label: '最多重建次数', hint: '自检失败后的自动重建上限，范围为 0–10 次。', min: 0, max: 10 },
+  { key: 'selfcheck_recheck_minutes', label: '复检间隔分钟', hint: '后台巡检与授权前复检间隔，范围为 5–1440 分钟。', min: 5, max: 1440 },
+] as const
+
 const DEFAULT_EPAY = { enabled: false, gateway_url: '', pid: '', key: '', types: ['alipay', 'wxpay'] }
 const DEFAULT_MANUAL = { enabled: false, instructions: '' }
 const DEFAULT_NUMBERS = { base_concurrency: 1, concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0, hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0 }
+const DEFAULT_SELFCHECK = { selfcheck_require_dedicated_proxy: true, selfcheck_require_timezone_match: true, selfcheck_max_rebuilds: 3, selfcheck_recheck_minutes: 30 }
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {}
@@ -38,6 +44,10 @@ export function normalizeSettings(input: Settings | null | undefined): Normalize
     hosted_grace_hours: numberOr(source.hosted_grace_hours, DEFAULT_NUMBERS.hosted_grace_hours),
     rental_grace_hours: numberOr(source.rental_grace_hours, DEFAULT_NUMBERS.rental_grace_hours),
     gateway_queue_timeout_ms: numberOr(source.gateway_queue_timeout_ms, DEFAULT_NUMBERS.gateway_queue_timeout_ms),
+    selfcheck_require_dedicated_proxy: booleanOr(source.selfcheck_require_dedicated_proxy, DEFAULT_SELFCHECK.selfcheck_require_dedicated_proxy),
+    selfcheck_require_timezone_match: booleanOr(source.selfcheck_require_timezone_match, DEFAULT_SELFCHECK.selfcheck_require_timezone_match),
+    selfcheck_max_rebuilds: numberOr(source.selfcheck_max_rebuilds, DEFAULT_SELFCHECK.selfcheck_max_rebuilds),
+    selfcheck_recheck_minutes: numberOr(source.selfcheck_recheck_minutes, DEFAULT_SELFCHECK.selfcheck_recheck_minutes),
     hosted_vm_template: Object.keys(record(source.hosted_vm_template)).length ? record(source.hosted_vm_template) : {},
     payment: {
       epay: {
@@ -60,6 +70,10 @@ export function validateSettings(draft: Settings, templateJSON: string, typesJSO
   if (!settings.site_name.trim()) throw new Error('站点名称不能为空。')
   for (const field of numericSettings) {
     if (!Number.isSafeInteger(settings[field.key]) || settings[field.key] < 0) throw new Error(`${field.label}必须为非负安全整数。`)
+  }
+  for (const field of selfcheckNumericSettings) {
+    const value = settings[field.key]
+    if (!Number.isSafeInteger(value) || value < field.min || value > field.max) throw new Error(`${field.label}必须为 ${field.min}–${field.max} 之间的整数。`)
   }
   let template: unknown
   try { template = JSON.parse(templateJSON) } catch { throw new Error('托管 VM 模板不是有效 JSON，请检查引号、逗号和括号。') }

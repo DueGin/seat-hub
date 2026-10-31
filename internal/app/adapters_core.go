@@ -195,16 +195,20 @@ func (a *settingsAdapter) Put(ctx context.Context, p api.SettingsPayload, actorI
 		return err
 	}
 	site := store.Site{
-		SiteName:                 p.SiteName,
-		RegistrationOpen:         p.RegistrationOpen,
-		BaseConcurrency:          p.BaseConcurrency,
-		ConcurrencyPerHostedSeat: p.ConcurrencyPerHostedSeat,
-		ConcurrencyPerRental:     p.ConcurrencyPerRental,
-		HostedGraceHours:         p.HostedGraceHours,
-		RentalGraceHours:         p.RentalGraceHours,
-		GatewayQueueTimeoutMS:    p.GatewayQueueTimeoutMS,
-		HostedVMTemplate:         p.HostedVMTemplate,
-		Payment:                  merged,
+		SiteName:                       p.SiteName,
+		RegistrationOpen:               p.RegistrationOpen,
+		BaseConcurrency:                p.BaseConcurrency,
+		ConcurrencyPerHostedSeat:       p.ConcurrencyPerHostedSeat,
+		ConcurrencyPerRental:           p.ConcurrencyPerRental,
+		HostedGraceHours:               p.HostedGraceHours,
+		RentalGraceHours:               p.RentalGraceHours,
+		GatewayQueueTimeoutMS:          p.GatewayQueueTimeoutMS,
+		HostedVMTemplate:               p.HostedVMTemplate,
+		Payment:                        merged,
+		SelfcheckRequireDedicatedProxy: p.SelfcheckRequireDedicatedProxy,
+		SelfcheckRequireTimezoneMatch:  p.SelfcheckRequireTimezoneMatch,
+		SelfcheckMaxRebuilds:           p.SelfcheckMaxRebuilds,
+		SelfcheckRecheckMinutes:        p.SelfcheckRecheckMinutes,
 	}
 	if site.SiteName == "" {
 		site.SiteName = prev.SiteName
@@ -215,6 +219,10 @@ func (a *settingsAdapter) Put(ctx context.Context, p api.SettingsPayload, actorI
 	}
 	if len(site.HostedVMTemplate) == 0 {
 		site.HostedVMTemplate = prev.HostedVMTemplate
+	}
+	if site.SelfcheckMaxRebuilds < 0 || site.SelfcheckMaxRebuilds > 10 ||
+		site.SelfcheckRecheckMinutes < 5 || site.SelfcheckRecheckMinutes > 1440 {
+		return &api.UserError{Status: 422, Code: "invalid_settings", Message: "自检重建次数须为 0 至 10，巡检间隔须为 5 至 1440 分钟"}
 	}
 	if err := a.settings.Put(ctx, "site", site); err != nil {
 		return err
@@ -227,16 +235,20 @@ func (a *settingsAdapter) Put(ctx context.Context, p api.SettingsPayload, actorI
 
 func toSettingsPayload(site store.Site) api.SettingsPayload {
 	return api.SettingsPayload{
-		SiteName:                 site.SiteName,
-		RegistrationOpen:         site.RegistrationOpen,
-		BaseConcurrency:          site.BaseConcurrency,
-		ConcurrencyPerHostedSeat: site.ConcurrencyPerHostedSeat,
-		ConcurrencyPerRental:     site.ConcurrencyPerRental,
-		HostedGraceHours:         site.HostedGraceHours,
-		RentalGraceHours:         site.RentalGraceHours,
-		GatewayQueueTimeoutMS:    site.GatewayQueueTimeoutMS,
-		HostedVMTemplate:         site.HostedVMTemplate,
-		Payment:                  site.Payment,
+		SiteName:                       site.SiteName,
+		RegistrationOpen:               site.RegistrationOpen,
+		BaseConcurrency:                site.BaseConcurrency,
+		ConcurrencyPerHostedSeat:       site.ConcurrencyPerHostedSeat,
+		ConcurrencyPerRental:           site.ConcurrencyPerRental,
+		HostedGraceHours:               site.HostedGraceHours,
+		RentalGraceHours:               site.RentalGraceHours,
+		GatewayQueueTimeoutMS:          site.GatewayQueueTimeoutMS,
+		HostedVMTemplate:               site.HostedVMTemplate,
+		Payment:                        site.Payment,
+		SelfcheckRequireDedicatedProxy: site.SelfcheckRequireDedicatedProxy,
+		SelfcheckRequireTimezoneMatch:  site.SelfcheckRequireTimezoneMatch,
+		SelfcheckMaxRebuilds:           site.SelfcheckMaxRebuilds,
+		SelfcheckRecheckMinutes:        site.SelfcheckRecheckMinutes,
 	}
 }
 

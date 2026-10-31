@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/DueGin/vm2api-portal/internal/api"
+	"github.com/DueGin/vm2api-portal/internal/provision"
 	"github.com/DueGin/vm2api-portal/internal/secret"
 	"github.com/DueGin/vm2api-portal/internal/store"
 	"github.com/DueGin/vm2api-portal/internal/vm2api"
@@ -75,7 +76,7 @@ func adminWindow(window *vm2api.Window) *api.WindowUsage {
 
 func (service *Service) RentalPool(ctx context.Context) ([]api.RentalPoolRowDTO, error) {
 	rows, err := service.db.QueryContext(ctx, `SELECT pool.vm_id,pool.tier,pool.status,
-		resource.user_id,COALESCE(user.email,''),pool.note FROM rental_pool AS pool
+		resource.user_id,COALESCE(user.email,''),pool.note,pool.selfcheck_state,pool.selfcheck_checked_at FROM rental_pool AS pool
 		LEFT JOIN resources AS resource ON resource.id=pool.leased_resource_id
 		LEFT JOIN users AS user ON user.id=resource.user_id ORDER BY pool.vm_id`)
 	if err != nil {
@@ -85,8 +86,14 @@ func (service *Service) RentalPool(ctx context.Context) ([]api.RentalPoolRowDTO,
 	items := make([]api.RentalPoolRowDTO, 0)
 	for rows.Next() {
 		var item api.RentalPoolRowDTO
-		if err := rows.Scan(&item.VMID, &item.Tier, &item.Status, &item.LeasedToUserID, &item.LeasedToEmail, &item.Note); err != nil {
+		var state string
+		var checkedAt sql.NullString
+		if err := rows.Scan(&item.VMID, &item.Tier, &item.Status, &item.LeasedToUserID, &item.LeasedToEmail, &item.Note, &state, &checkedAt); err != nil {
 			return nil, fmt.Errorf("读取租赁池账号失败: %w", err)
+		}
+		item.Selfcheck = &api.SelfcheckDTO{State: state}
+		if checkedAt.Valid {
+			item.Selfcheck.CheckedAt = &checkedAt.String
 		}
 		items = append(items, item)
 	}
@@ -185,6 +192,37 @@ func (service *Service) RentalAdd(ctx context.Context, vmIDs []string, note stri
 		if !adminRentable(vm) {
 			return adminError(http.StatusConflict, "vm_not_available", "账号已归属用户或不符合入池条件")
 		}
+		var unavailable bool
+		if err := service.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM rental_pool WHERE vm_id=?)
+			OR EXISTS(SELECT 1 FROM resources WHERE vm_id=? AND status<>'released')`, vmID, vmID).Scan(&unavailable); err != nil {
+			return fmt.Errorf("check rental vm availability: %w", err)
+		}
+		if unavailable {
+			return adminError(http.StatusConflict, "vm_not_available", "账号已入池或已归属用户")
+		}
+	}
+	checked := make(map[string]provision.SelfcheckState, len(vmIDs))
+	for _, vmID := range vmIDs {
+		state, err := service.provisioning.AdmitPoolVM(ctx, vmID)
+		if err != nil || state.State != "pass" {
+			codes := make([]string, 0)
+			for _, check := range state.Checks {
+				if !check.OK && !check.Skipped {
+					codes = append(codes, string(check.Code))
+				}
+			}
+			detail := vmID
+			if len(codes) > 0 {
+				detail += " [" + strings.Join(codes, ", ") + "]"
+			}
+			if err == nil {
+				err = provision.ErrSelfcheckFailed
+			} else if !errors.Is(err, provision.ErrSelfcheckFailed) {
+				err = fmt.Errorf("%w: %w", provision.ErrSelfcheckFailed, err)
+			}
+			return fmt.Errorf("check rental vm %s: %w", detail, err)
+		}
+		checked[vmID] = state
 	}
 	tx, err := service.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -194,10 +232,10 @@ func (service *Service) RentalAdd(ctx context.Context, vmIDs []string, note stri
 	now := store.FmtTime(service.now())
 	for _, vmID := range vmIDs {
 		var inserted string
-		err := tx.QueryRowContext(ctx, `INSERT INTO rental_pool(vm_id,tier,status,note,created_at,updated_at)
-			SELECT ?,?,'available',?,?,? WHERE NOT EXISTS
+		err := tx.QueryRowContext(ctx, `INSERT INTO rental_pool(vm_id,tier,status,note,selfcheck_state,selfcheck_checked_at,created_at,updated_at)
+			SELECT ?,?,'available',?,'pass',?,?,? WHERE NOT EXISTS
 			(SELECT 1 FROM resources WHERE vm_id=? AND status<>'released')
-			ON CONFLICT(vm_id) DO NOTHING RETURNING vm_id`, vmID, byID[vmID].Tier, note, now, now, vmID).Scan(&inserted)
+			ON CONFLICT(vm_id) DO NOTHING RETURNING vm_id`, vmID, byID[vmID].Tier, note, checked[vmID].CheckedAt, now, now, vmID).Scan(&inserted)
 		if errors.Is(err, sql.ErrNoRows) {
 			return adminError(http.StatusConflict, "vm_not_available", "账号已入池或已归属用户")
 		}
@@ -446,7 +484,7 @@ func (service *Service) rentalStock(ctx context.Context, kind string, quantity i
 		return false, nil
 	}
 	var available int
-	if err := service.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rental_pool WHERE status='available'`).Scan(&available); err != nil {
+	if err := service.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rental_pool WHERE status='available' AND selfcheck_state='pass'`).Scan(&available); err != nil {
 		return false, fmt.Errorf("查询租赁库存失败: %w", err)
 	}
 	if available < quantity {

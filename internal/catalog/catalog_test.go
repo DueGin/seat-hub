@@ -8,8 +8,7 @@ import (
 	"time"
 
 	"github.com/DueGin/vm2api-portal/internal/catalog"
-	"github.com/DueGin/vm2api-portal/internal/store/migrations"
-	_ "modernc.org/sqlite"
+	"github.com/DueGin/vm2api-portal/internal/store"
 )
 
 func database(t *testing.T) *sql.DB {
@@ -20,11 +19,7 @@ func database(t *testing.T) *sql.DB {
 	}
 	database.SetMaxOpenConns(1)
 	t.Cleanup(func() { database.Close() })
-	schema, err := migrations.FS.ReadFile("001_init.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.Exec(string(schema)); err != nil {
+	if err := (&store.DB{DB: database}).Migrate(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	return database
@@ -134,7 +129,7 @@ func TestRentalStockSharedPoolAndDeleteReferenced(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, vmID := range []string{"a", "b", "c", "d", "e", "unhealthy", "unfetched"} {
-		if _, err := database.Exec(`INSERT INTO rental_pool(vm_id, status, created_at, updated_at) VALUES (?, 'available', '', '')`, vmID); err != nil {
+		if _, err := database.Exec(`INSERT INTO rental_pool(vm_id, status, selfcheck_state, created_at, updated_at) VALUES (?, 'available', 'pass', '', '')`, vmID); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -171,5 +166,56 @@ func TestRentalStockSharedPoolAndDeleteReferenced(t *testing.T) {
 	insertOrder(t, database, created.ID, "overreserved", "pending", 20, now.Add(time.Hour), false)
 	if stock, err := service.Stock(ctx, created); err != nil || stock != 0 {
 		t.Fatalf("overreserved stock=%d, err=%v", stock, err)
+	}
+}
+
+func TestAvailableVMsRequiresPassedSelfcheck(t *testing.T) {
+	for _, withHealth := range []bool{false, true} {
+		name := "without_health"
+		if withHealth {
+			name = "with_health"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			database := database(t)
+			for _, item := range []struct{ vmID, status, selfcheck string }{
+				{"healthy", "available", "pass"},
+				{"unfetched", "available", "pass"},
+				{"unhealthy", "available", "pass"},
+				{"pending", "available", "pending"},
+				{"failed", "available", "fail"},
+				{"exhausted", "available", "exhausted"},
+				{"running", "available", "running"},
+				{"unknown", "available", ""},
+				{"leased", "leased", "pass"},
+				{"maintenance", "maintenance", "pass"},
+			} {
+				if _, err := database.Exec(`INSERT INTO rental_pool(vm_id,status,selfcheck_state,created_at,updated_at)
+					VALUES (?,?,?,'','')`, item.vmID, item.status, item.selfcheck); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := database.Exec(`INSERT INTO rental_pool(vm_id,status,created_at,updated_at)
+				VALUES ('unchecked','available','','')`); err != nil {
+				t.Fatal(err)
+			}
+			service := catalog.New(database, nil)
+			want := int64(3)
+			probed := make(map[string]bool)
+			if withHealth {
+				service.SetHealth(func(vmID string) (bool, bool) {
+					probed[vmID] = true
+					return vmID != "unhealthy", vmID != "unfetched"
+				})
+				want = 2
+			}
+			available, err := service.AvailableVMs(ctx)
+			if err != nil || available != want {
+				t.Fatalf("available=%d, err=%v; want %d", available, err, want)
+			}
+			if withHealth && (len(probed) != 3 || !probed["healthy"] || !probed["unhealthy"] || !probed["unfetched"]) {
+				t.Fatalf("health probe received unchecked or unavailable VMs: %v", probed)
+			}
+		})
 	}
 }

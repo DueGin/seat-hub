@@ -430,6 +430,89 @@ func (s *Server) handleAdminRentalRemove(w http.ResponseWriter, r *http.Request)
 	writeOK(w, map[string]any{})
 }
 
+func (s *Server) handleAdminRentalSelfcheck(w http.ResponseWriter, r *http.Request) {
+	vmID := r.PathValue("vm_id")
+	if strings.TrimSpace(vmID) == "" {
+		writeErr(w, http.StatusUnprocessableEntity, "invalid_request", "VM ID 不能为空")
+		return
+	}
+	result, err := s.Deps.Admin.RunPoolSelfcheck(r.Context(), vmID)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeOK(w, result)
+}
+
+func (s *Server) handleAdminAccountSelfcheck(w http.ResponseWriter, r *http.Request) {
+	id, ok := adminSelfcheckRequestID(w, r)
+	if !ok {
+		return
+	}
+	body := &struct {
+		Rebuild json.RawMessage `json:"rebuild"`
+	}{}
+	if err := readJSON(r, &body); err != nil || body == nil {
+		writeErr(w, http.StatusUnprocessableEntity, "invalid_request", "请求体须为 JSON 对象，rebuild 须为布尔值")
+		return
+	}
+	rebuild := false
+	if len(body.Rebuild) > 0 {
+		switch string(body.Rebuild) {
+		case "true":
+			rebuild = true
+		case "false":
+		default:
+			writeErr(w, http.StatusUnprocessableEntity, "invalid_request", "rebuild 须为布尔值")
+			return
+		}
+	}
+	result, err := s.Deps.Admin.RunSelfcheck(r.Context(), id, rebuild)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeOK(w, result)
+}
+
+func (s *Server) handleAdminAccountSelfchecks(w http.ResponseWriter, r *http.Request) {
+	id, ok := adminSelfcheckRequestID(w, r)
+	if !ok {
+		return
+	}
+	limit := 20
+	if values, exists := r.URL.Query()["limit"]; exists {
+		if len(values) != 1 {
+			writeErr(w, http.StatusUnprocessableEntity, "invalid_request", "limit 须为 1 到 100 的整数，且只能提供一次")
+			return
+		}
+		value, err := strconv.Atoi(values[0])
+		if err != nil || value < 1 || value > 100 {
+			writeErr(w, http.StatusUnprocessableEntity, "invalid_request", "limit 须为 1 到 100 的整数")
+			return
+		}
+		limit = value
+	}
+	items, err := s.Deps.Admin.SelfcheckHistory(r.Context(), id, limit)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if items == nil {
+		items = []SelfcheckReportDTO{}
+	}
+	writeOK(w, map[string]any{"items": items})
+}
+
+func adminSelfcheckRequestID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, http.StatusUnprocessableEntity, "invalid_request", "ID 必须是正整数")
+		return 0, false
+	}
+	return id, true
+}
+
 func (s *Server) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 	userID, ok := adminQueryUserID(w, r)
 	if !ok {

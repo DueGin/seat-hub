@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"io/fs"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,12 +41,21 @@ func setup(t *testing.T, kind string, fulfiller order.Fulfiller) fixture {
 	}
 	database.SetMaxOpenConns(1)
 	t.Cleanup(func() { database.Close() })
-	schema, err := migrations.FS.ReadFile("001_init.sql")
+	// Apply every migration in order: the fixture must match the schema the
+	// production code queries, including later ALTER TABLE additions.
+	names, err := fs.Glob(migrations.FS, "*.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.Exec(string(schema)); err != nil {
-		t.Fatal(err)
+	sort.Strings(names)
+	for _, name := range names {
+		schema, err := migrations.FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Exec(string(schema)); err != nil {
+			t.Fatalf("apply %s: %v", name, err)
+		}
 	}
 	if _, err := database.Exec(`PRAGMA foreign_keys = ON`); err != nil {
 		t.Fatal(err)
@@ -87,7 +98,7 @@ func (fixture fixture) subscription(t *testing.T, userID int64, kind string, qua
 func (fixture fixture) stock(t *testing.T, vmIDs ...string) {
 	t.Helper()
 	for _, vmID := range vmIDs {
-		if _, err := fixture.db.Exec(`INSERT INTO rental_pool(vm_id, status, created_at, updated_at) VALUES (?, 'available', '', '')`, vmID); err != nil {
+		if _, err := fixture.db.Exec(`INSERT INTO rental_pool(vm_id, status, selfcheck_state, created_at, updated_at) VALUES (?, 'available', 'pass', '', '')`, vmID); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -174,7 +185,7 @@ func TestRentalReservationAtomicAndRelease(t *testing.T) {
 	ctx := context.Background()
 	fixture := setup(t, catalog.KindRentalAccount, nil)
 	for _, vmID := range []string{"a", "b", "c", "d"} {
-		if _, err := fixture.db.Exec(`INSERT INTO rental_pool(vm_id, status, created_at, updated_at) VALUES (?, 'available', '', '')`, vmID); err != nil {
+		if _, err := fixture.db.Exec(`INSERT INTO rental_pool(vm_id, status, selfcheck_state, created_at, updated_at) VALUES (?, 'available', 'pass', '', '')`, vmID); err != nil {
 			t.Fatal(err)
 		}
 	}

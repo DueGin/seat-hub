@@ -192,7 +192,7 @@ func (service *Service) list(ctx context.Context, public bool) ([]Product, error
 }
 
 func (service *Service) AvailableVMs(ctx context.Context) (int64, error) {
-	rows, err := service.db.QueryContext(ctx, `SELECT vm_id FROM rental_pool WHERE status = 'available'`)
+	rows, err := service.db.QueryContext(ctx, `SELECT vm_id FROM rental_pool WHERE status = 'available' AND selfcheck_state = 'pass'`)
 	if err != nil {
 		return 0, fmt.Errorf("list rental pool: %w", err)
 	}

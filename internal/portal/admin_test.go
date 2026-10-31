@@ -7,12 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/DueGin/vm2api-portal/internal/api"
+	"github.com/DueGin/vm2api-portal/internal/provision"
 	"github.com/DueGin/vm2api-portal/internal/secret"
+	"github.com/DueGin/vm2api-portal/internal/selfcheck"
 	"github.com/DueGin/vm2api-portal/internal/store"
 	"github.com/DueGin/vm2api-portal/internal/vm2api"
 )
@@ -37,6 +40,29 @@ func (client *adminClient) ListVMs(ctx context.Context, filter vm2api.VMFilter) 
 	return client.Fake.ListVMs(ctx, filter)
 }
 
+type adminChecker struct {
+	now     func() time.Time
+	check   func(context.Context, string, selfcheck.Options) (selfcheck.Result, error)
+	vmIDs   []string
+	options []selfcheck.Options
+	records []selfcheck.Result
+}
+
+func (checker *adminChecker) Check(ctx context.Context, vmID string, options selfcheck.Options) (selfcheck.Result, error) {
+	checker.vmIDs = append(checker.vmIDs, vmID)
+	checker.options = append(checker.options, options)
+	if checker.check != nil {
+		return checker.check(ctx, vmID, options)
+	}
+	return selfcheck.Result{VMID: vmID, Passed: true, CheckedAt: checker.now(),
+		Checks: []selfcheck.Check{{Code: selfcheck.FingerprintUnique, OK: true, Message: "设备指纹未重复"}}}, nil
+}
+
+func (checker *adminChecker) Record(_ context.Context, _ int64, _ int, result selfcheck.Result) error {
+	checker.records = append(checker.records, result)
+	return nil
+}
+
 func adminFixture(t *testing.T) (*Service, *adminClient) {
 	t.Helper()
 	database, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
@@ -52,6 +78,7 @@ func adminFixture(t *testing.T) (*Service, *adminClient) {
 	service := New(database, client, box)
 	service.Now = func() time.Time { return time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC) }
 	service.provisioning.Engine().Now = service.now
+	service.provisioning.SetChecker(&adminChecker{now: service.now})
 	stamp := store.FmtTime(service.now())
 	adminExec(t, service, `INSERT INTO users(id,email,password_hash,role,created_at,updated_at)
 		VALUES (1,'admin@example.com','hash','admin',?,?),
@@ -96,7 +123,8 @@ func adminPoolVM(t *testing.T, service *Service, client *adminClient, vmID strin
 	t.Helper()
 	client.AddVM(vm2api.VM{ID: vmID, Label: vmID, Platform: "anthropic", Origin: "platform", CredStatus: "valid"})
 	stamp := store.FmtTime(service.now())
-	return adminExec(t, service, `INSERT INTO rental_pool(vm_id,status,created_at,updated_at) VALUES (?,'available',?,?)`, vmID, stamp, stamp)
+	return adminExec(t, service, `INSERT INTO rental_pool(vm_id,status,selfcheck_state,selfcheck_checked_at,created_at,updated_at)
+		VALUES (?,'available','pass',?,?,?)`, vmID, stamp, stamp, stamp)
 }
 
 func adminProduct(t *testing.T, service *Service, kind string) int64 {
@@ -261,6 +289,188 @@ func TestAdminRentalPoolAllocationAndConflicts(t *testing.T) {
 	}
 	adminWantError(t, service.RentalRemove(ctx, "third"), 404, "pool_vm_not_found")
 	adminWantError(t, service.RentalPatch(ctx, "missing", "available", ""), 404, "pool_vm_not_found")
+}
+
+func TestAdminRentalAddRequiresPassedSelfchecks(t *testing.T) {
+	for _, failedVM := range []string{"first", "second"} {
+		t.Run(failedVM, func(t *testing.T) {
+			service, client := adminFixture(t)
+			ctx := context.Background()
+			for _, vmID := range []string{"first", "second"} {
+				client.AddVM(vm2api.VM{ID: vmID, Tier: "pro"})
+			}
+			checker := &adminChecker{now: service.now}
+			checker.check = func(_ context.Context, vmID string, _ selfcheck.Options) (selfcheck.Result, error) {
+				if count := adminCount(t, service, `SELECT COUNT(*) FROM rental_pool`); count != 0 {
+					t.Fatalf("admission exposed %d unchecked pool rows", count)
+				}
+				result := selfcheck.Result{VMID: vmID, Passed: vmID != failedVM, CheckedAt: service.now()}
+				if !result.Passed {
+					result.Checks = []selfcheck.Check{
+						{Code: selfcheck.ProxyExclusive, OK: true},
+						{Code: selfcheck.ExitIPUnique, Remedy: selfcheck.RemedyReproxy, Message: "出口 IP 已被其它槽位使用"},
+						{Code: selfcheck.FingerprintUnique, Remedy: selfcheck.RemedyReset, Message: "设备指纹重复"},
+						{Code: selfcheck.ExitGeoTimezone, Skipped: true},
+					}
+				}
+				return result, nil
+			}
+			service.provisioning.SetChecker(checker)
+			err := service.RentalAdd(ctx, []string{"first", "second"}, "禁止入池")
+			if !errors.Is(err, provision.ErrSelfcheckFailed) || !strings.Contains(err.Error(), failedVM) ||
+				!strings.Contains(err.Error(), string(selfcheck.ExitIPUnique)) || !strings.Contains(err.Error(), string(selfcheck.FingerprintUnique)) {
+				t.Fatalf("admission lost self-check failure or codes: %v", err)
+			}
+			if strings.Contains(err.Error(), string(selfcheck.ProxyExclusive)) || strings.Contains(err.Error(), string(selfcheck.ExitGeoTimezone)) {
+				t.Fatalf("passed or skipped check reported as a failure: %v", err)
+			}
+			if count := adminCount(t, service, `SELECT COUNT(*) FROM rental_pool`); count != 0 {
+				t.Fatalf("failed admission persisted %d pool rows", count)
+			}
+			wantCalls := []string{"first"}
+			if failedVM == "second" {
+				wantCalls = append(wantCalls, "second")
+			}
+			if !slices.Equal(checker.vmIDs, wantCalls) || len(checker.records) != len(wantCalls) {
+				t.Fatalf("checks=%v records=%d; want checks %v", checker.vmIDs, len(checker.records), wantCalls)
+			}
+		})
+	}
+}
+
+func TestAdminRentalAddPersistsEachPassedVerdict(t *testing.T) {
+	service, client := adminFixture(t)
+	ctx := context.Background()
+	checked := map[string]time.Time{
+		"first":  service.now().Add(-2 * time.Minute),
+		"second": service.now().Add(-time.Minute),
+	}
+	for vmID := range checked {
+		client.AddVM(vm2api.VM{ID: vmID, Tier: "max"})
+	}
+	checker := &adminChecker{now: service.now}
+	checker.check = func(_ context.Context, vmID string, _ selfcheck.Options) (selfcheck.Result, error) {
+		if count := adminCount(t, service, `SELECT COUNT(*) FROM rental_pool`); count != 0 {
+			t.Fatalf("admission inserted %d rows before all checks passed", count)
+		}
+		return selfcheck.Result{VMID: vmID, Passed: true, CheckedAt: checked[vmID].In(time.FixedZone("local", 8*3600))}, nil
+	}
+	service.provisioning.SetChecker(checker)
+	if err := service.RentalAdd(ctx, []string{"first", "second"}, "已通过自检"); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(checker.vmIDs, []string{"first", "second"}) || len(checker.records) != 2 {
+		t.Fatalf("checks=%v records=%d", checker.vmIDs, len(checker.records))
+	}
+	for _, options := range checker.options {
+		if !options.CheckAccount {
+			t.Fatal("rental admission did not check for duplicate accounts")
+		}
+	}
+	for vmID, when := range checked {
+		if count := adminCount(t, service, `SELECT COUNT(*) FROM rental_pool WHERE vm_id=? AND status='available'
+			AND tier='max' AND selfcheck_state='pass' AND selfcheck_checked_at=? AND note='已通过自检'`, vmID, store.FmtTime(when)); count != 1 {
+			t.Fatalf("passed verdict not stored for %s", vmID)
+		}
+	}
+	pool, err := service.RentalPool(ctx)
+	if err != nil || len(pool) != 2 {
+		t.Fatalf("pool=%+v err=%v", pool, err)
+	}
+	for _, item := range pool {
+		if item.Selfcheck == nil || item.Selfcheck.State != "pass" || item.Selfcheck.CheckedAt == nil ||
+			*item.Selfcheck.CheckedAt != store.FmtTime(checked[item.VMID]) {
+			t.Fatalf("pool self-check=%+v for %s", item.Selfcheck, item.VMID)
+		}
+	}
+}
+
+func TestAdminRentalAddPreservesCheckerErrors(t *testing.T) {
+	for _, cause := range []error{vm2api.ErrUnavailable, context.Canceled} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			service, client := adminFixture(t)
+			client.AddVM(vm2api.VM{ID: "first"})
+			client.AddVM(vm2api.VM{ID: "second"})
+			checker := &adminChecker{now: service.now}
+			checker.check = func(_ context.Context, vmID string, _ selfcheck.Options) (selfcheck.Result, error) {
+				if vmID == "second" {
+					return selfcheck.Result{}, cause
+				}
+				return selfcheck.Result{VMID: vmID, Passed: true, CheckedAt: service.now()}, nil
+			}
+			service.provisioning.SetChecker(checker)
+			err := service.RentalAdd(context.Background(), []string{"first", "second"}, "")
+			if !errors.Is(err, cause) || !errors.Is(err, provision.ErrSelfcheckFailed) {
+				t.Fatalf("admission lost checker error: %v", err)
+			}
+			if count := adminCount(t, service, `SELECT COUNT(*) FROM rental_pool`); count != 0 {
+				t.Fatalf("checker error persisted %d pool rows", count)
+			}
+		})
+	}
+}
+
+func TestAdminRentalPoolMapsStoredSelfcheck(t *testing.T) {
+	service, _ := adminFixture(t)
+	ctx := context.Background()
+	pool, err := service.RentalPool(ctx)
+	if err != nil || pool == nil || len(pool) != 0 {
+		t.Fatalf("empty pool=%+v err=%v", pool, err)
+	}
+	stamp := store.FmtTime(service.now())
+	for _, state := range []string{"pending", "pass", "fail", "exhausted"} {
+		var checkedAt any
+		if state != "pending" {
+			checkedAt = stamp
+		}
+		adminExec(t, service, `INSERT INTO rental_pool(vm_id,status,selfcheck_state,selfcheck_checked_at,created_at,updated_at)
+			VALUES (?,'available',?,?,?,?)`, state, state, checkedAt, stamp, stamp)
+	}
+	pool, err = service.RentalPool(ctx)
+	if err != nil || len(pool) != 4 {
+		t.Fatalf("pool=%+v err=%v", pool, err)
+	}
+	for _, item := range pool {
+		if item.Selfcheck == nil || item.Selfcheck.State != item.VMID || item.VM != nil {
+			t.Fatalf("stored self-check not mapped without upstream VM: %+v", item)
+		}
+		if item.VMID == "pending" {
+			if item.Selfcheck.CheckedAt != nil {
+				t.Fatalf("pending checked_at=%v", item.Selfcheck.CheckedAt)
+			}
+		} else if item.Selfcheck.CheckedAt == nil || *item.Selfcheck.CheckedAt != stamp {
+			t.Fatalf("checked_at not mapped: %+v", item.Selfcheck)
+		}
+	}
+}
+
+func TestAdminRentalGrantStockRequiresPassedSelfcheck(t *testing.T) {
+	for _, state := range []string{"pending", "fail", "exhausted", "running", ""} {
+		t.Run(state, func(t *testing.T) {
+			service, client := adminFixture(t)
+			ctx := context.Background()
+			adminPoolVM(t, service, client, "unchecked")
+			adminExec(t, service, `UPDATE rental_pool SET selfcheck_state=? WHERE vm_id='unchecked'`, state)
+			adminWantError(t, service.GrantSubscription(ctx, 1, 2, "rental_account", 1, 30, "自检未通过"), 409, "out_of_stock")
+			for _, table := range []string{"products", "orders", "subscriptions", "resources", "jobs", "audit_log"} {
+				if count := adminCount(t, service, `SELECT COUNT(*) FROM `+table); count != 0 {
+					t.Fatalf("grant with unchecked stock persisted %d rows in %s", count, table)
+				}
+			}
+			adminPoolVM(t, service, client, "passed")
+			adminWantError(t, service.GrantSubscription(ctx, 1, 2, "rental_account", 2, 30, "库存不足"), 409, "out_of_stock")
+			adminExec(t, service, `UPDATE rental_pool SET selfcheck_state='pass',status='maintenance' WHERE vm_id='unchecked'`)
+			if stock, err := service.rentalStock(ctx, "rental_account", 1); err != nil || !stock {
+				t.Fatalf("passed stock=%t err=%v", stock, err)
+			}
+			if err := service.GrantSubscription(ctx, 1, 2, "rental_account", 1, 30, "自检通过"); err != nil {
+				t.Fatal(err)
+			}
+			if count := adminCount(t, service, `SELECT COUNT(*) FROM resources WHERE vm_id='passed' AND status='active'`); count != 1 {
+				t.Fatal("grant did not allocate the passed VM")
+			}
+		})
+	}
 }
 
 func TestAdminJobsPaginationAndRetry(t *testing.T) {

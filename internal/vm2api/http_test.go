@@ -160,6 +160,44 @@ func panelCallTests() []panelCallTest {
 			invoke: func(client *HTTPClient) error { return client.DeleteVM(ctx, "vm-one") },
 		},
 		{
+			name: "collect identity", method: http.MethodPost, path: "/vms/vm-one/collect-identity", body: `{}`,
+			response: `{"ok":true,"fingerprint":{"device_id":"wrong-envelope"},"data":{"fingerprint":{"device_id":"device-one","guest_machine_id":"machine-one","hostname":"host-one","timezone":"Asia/Tokyo","locale":"en-US","collected_at":"2026-10-31T00:00:00Z"}}}`,
+			invoke: func(client *HTTPClient) error {
+				value, err := client.CollectIdentity(ctx, "vm-one")
+				expected := Fingerprint{DeviceID: "device-one", GuestMachineID: "machine-one", Hostname: "host-one", Timezone: "Asia/Tokyo", Locale: "en-US", CollectedAt: "2026-10-31T00:00:00Z"}
+				if err == nil && value != expected {
+					return fmt.Errorf("unexpected fingerprint: %+v", value)
+				}
+				return err
+			},
+		},
+		{
+			name: "probe exit", method: http.MethodPost, path: "/vms/vm-one/exit-probe", body: `{}`,
+			response: `{"ok":true,"via":"wrong-envelope","data":{"via":"socks5","ip":"wrong-level","timezone":"UTC","geo":{"ip":"203.0.113.10","country_code":"JP","timezone":"Asia/Tokyo"}}}`,
+			invoke: func(client *HTTPClient) error {
+				value, err := client.ProbeExit(ctx, "vm-one")
+				if err == nil && value != (ExitProbe{Via: "socks5", IP: "203.0.113.10", CountryCode: "JP", Timezone: "Asia/Tokyo"}) {
+					return fmt.Errorf("unexpected exit probe: %+v", value)
+				}
+				return err
+			},
+		},
+		{
+			name: "reset vm", method: http.MethodPost, path: "/vms/vm-one/reset", body: `{"mode":"traits"}`,
+			response: `{"ok":true,"data":{"vm":{"id":"vm-one"},"recreated":true,"mode":"traits"}}`,
+			invoke:   func(client *HTTPClient) error { return client.ResetVM(ctx, "vm-one") },
+		},
+		{
+			name: "unbind proxy", method: http.MethodPost, path: "/proxies/proxy-one/unbind", body: `{"vm_id":"vm-one"}`,
+			response: `{"ok":true,"data":{"id":"proxy-one","bound_vm_ids":[]}}`,
+			invoke:   func(client *HTTPClient) error { return client.UnbindProxy(ctx, "proxy-one", "vm-one") },
+		},
+		{
+			name: "disable proxy", method: http.MethodPost, path: "/proxies/proxy-one/disable", body: `{}`,
+			response: `{"ok":true,"data":{"id":"proxy-one","enabled":false}}`,
+			invoke:   func(client *HTTPClient) error { return client.DisableProxy(ctx, "proxy-one") },
+		},
+		{
 			name: "generate auth url", method: http.MethodPost, path: "/vms/vm-one/oauth/generate-auth-url", body: `{"flavor":"claude_code"}`,
 			response: `{"ok":true,"data":{"auth_url":"https://example.test/authorize","session_id":"session-one","expires_at":1793406600000}}`,
 			invoke: func(client *HTTPClient) error {
@@ -523,6 +561,291 @@ func TestHTTPClientStructuredCredentialStatus(t *testing.T) {
 			usage, err := NewHTTPClient(server.URL, "master", server.Client()).GetAccountUsage(context.Background(), "vm-one")
 			if err != nil || usage.VM.CredStatus != test.expected {
 				t.Fatalf("credential status = %q, %v; want %q", usage.VM.CredStatus, err, test.expected)
+			}
+		})
+	}
+}
+
+func TestHTTPClientVMIdentityAndProxyFields(t *testing.T) {
+	fingerprint := Fingerprint{
+		DeviceID: "device-one", GuestMachineID: "machine-one", Hostname: "host-one",
+		Timezone: "Asia/Tokyo", Locale: "en-US", CollectedAt: "2026-10-31T00:00:00Z",
+	}
+	for _, test := range []struct {
+		name  string
+		raw   string
+		proxy *ProxyView
+	}{
+		{
+			name: "enabled proxy",
+			raw:  `{"id":"proxy-one","scheme":"socks5","status":"ok","enabled":true,"blocked_reason":"","geo":{"ip":"203.0.113.10","timezone":"Asia/Tokyo"}}`,
+			proxy: &ProxyView{ID: "proxy-one", Scheme: "socks5", Status: "ok", Enabled: true,
+				GeoIP: "203.0.113.10", GeoTimezone: "Asia/Tokyo"},
+		},
+		{
+			name: "disabled blocked proxy",
+			raw:  `{"id":"proxy-one","scheme":"socks5","status":"dead","enabled":false,"blocked_reason":"probe_failed","geo":{"ip":"203.0.113.11","timezone":"America/New_York"}}`,
+			proxy: &ProxyView{ID: "proxy-one", Scheme: "socks5", Status: "dead", BlockedReason: "probe_failed",
+				GeoIP: "203.0.113.11", GeoTimezone: "America/New_York"},
+		},
+		{
+			name: "enabled omitted and geo null", raw: `{"id":"proxy-one","scheme":"local","status":"unknown","geo":null}`,
+			proxy: &ProxyView{ID: "proxy-one", Scheme: "local", Status: "unknown", Enabled: true},
+		},
+		{
+			name: "enabled null and geo omitted", raw: `{"id":"proxy-one","enabled":null}`,
+			proxy: &ProxyView{ID: "proxy-one", Enabled: true},
+		},
+		{name: "unbound proxy", raw: `null`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, path := range []string{"/vms", "/vms/vm-one"} {
+				t.Run(path, func(t *testing.T) {
+					server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+						if request.Method != http.MethodGet || request.URL.Path != "/api/panel"+path || request.URL.RawQuery != "" {
+							t.Errorf("unexpected request: %s %s", request.Method, request.URL)
+						}
+						vm := `{"id":"vm-one","fingerprint":{"device_id":"device-one","guest_machine_id":"machine-one","hostname":"host-one","timezone":"Asia/Tokyo","locale":"en-US","collected_at":"2026-10-31T00:00:00Z"},"timezone":"Asia/Singapore","locale":"zh-CN","email":"alice@example.test","account_uuid":"account-one","proxy":` + test.raw + `}`
+						if path == "/vms" {
+							_, _ = io.WriteString(writer, `{"ok":true,"items":[],"data":{"items":[`+vm+`]}}`)
+						} else {
+							_, _ = io.WriteString(writer, `{"ok":true,"vm":{"id":"wrong-envelope"},"data":{"vm":`+vm+`}}`)
+						}
+					}))
+					defer server.Close()
+					client := NewHTTPClient(server.URL, "master", server.Client())
+					var vm VM
+					if path == "/vms" {
+						items, err := client.ListVMs(context.Background(), VMFilter{})
+						if err != nil || len(items) != 1 {
+							t.Fatalf("list vms = %+v, %v", items, err)
+						}
+						vm = items[0]
+					} else {
+						usage, err := client.GetAccountUsage(context.Background(), "vm-one")
+						if err != nil {
+							t.Fatal(err)
+						}
+						vm = usage.VM
+					}
+					if vm.ID != "vm-one" || vm.Fingerprint != fingerprint || vm.Timezone != "Asia/Singapore" || vm.Locale != "zh-CN" || vm.Email != "alice@example.test" || vm.EmailMasked != "a***@example.test" || vm.AccountUUID != "account-one" {
+						t.Fatalf("unexpected vm identity: %+v", vm)
+					}
+					if !reflect.DeepEqual(vm.Proxy, test.proxy) {
+						t.Fatalf("proxy = %+v, want %+v", vm.Proxy, test.proxy)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestHTTPClientSelfcheckEscapedPaths(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name   string
+		path   string
+		body   string
+		invoke func(*HTTPClient) error
+	}{
+		{name: "collect identity", path: "/vms/slot%20%3F%23/collect-identity", body: `{}`, invoke: func(client *HTTPClient) error {
+			_, err := client.CollectIdentity(ctx, "slot ?#")
+			return err
+		}},
+		{name: "probe exit", path: "/vms/slot%20%3F%23/exit-probe", body: `{}`, invoke: func(client *HTTPClient) error {
+			_, err := client.ProbeExit(ctx, "slot ?#")
+			return err
+		}},
+		{name: "reset vm", path: "/vms/slot%20%3F%23/reset", body: `{"mode":"traits"}`, invoke: func(client *HTTPClient) error {
+			return client.ResetVM(ctx, "slot ?#")
+		}},
+		{name: "unbind proxy", path: "/proxies/proxy%20%3F%23/unbind", body: `{"vm_id":"slot ?#"}`, invoke: func(client *HTTPClient) error {
+			return client.UnbindProxy(ctx, "proxy ?#", "slot ?#")
+		}},
+		{name: "disable proxy", path: "/proxies/proxy%20%3F%23/disable", body: `{}`, invoke: func(client *HTTPClient) error {
+			return client.DisableProxy(ctx, "proxy ?#")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.Method != http.MethodPost || request.URL.EscapedPath() != "/api/panel"+test.path || request.URL.RawQuery != "" {
+					t.Errorf("unexpected request: %s %s", request.Method, request.URL)
+				}
+				body, err := io.ReadAll(request.Body)
+				if err != nil {
+					t.Error(err)
+				}
+				if !reflect.DeepEqual(decodeTestJSON(t, string(body)), decodeTestJSON(t, test.body)) {
+					t.Errorf("body = %s, want %s", body, test.body)
+				}
+				_, _ = io.WriteString(writer, `{"ok":true,"data":{}}`)
+			}))
+			defer server.Close()
+			if err := test.invoke(NewHTTPClient(server.URL, "master", server.Client())); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestFakeHTTPSelfcheckRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	fake := NewFake()
+	fake.AddVM(VM{ID: "vm-one", HasCredential: true, CredStatus: "valid", Timezone: "Asia/Tokyo", Locale: "en-US"})
+	fake.SetAccount("vm-one", "account-one", "alice@example.test")
+	server := httptest.NewServer(fake.Handler("master"))
+	defer server.Close()
+	client := NewHTTPClient(server.URL, "master", server.Client())
+	readVM := func() VM {
+		t.Helper()
+		usage, err := client.GetAccountUsage(ctx, "vm-one")
+		if err != nil {
+			t.Fatal(err)
+		}
+		items, err := client.ListVMs(ctx, VMFilter{})
+		if err != nil || len(items) != 1 || !reflect.DeepEqual(items[0], usage.VM) {
+			t.Fatalf("list/detail mismatch: %+v, %+v, %v", items, usage.VM, err)
+		}
+		return usage.VM
+	}
+	vm := readVM()
+	if vm.Fingerprint.DeviceID == "" || vm.Proxy != nil || vm.ProxyConfigured || vm.AccountUUID != "account-one" || vm.Email != "alice@example.test" || vm.EmailMasked != "a***@example.test" || vm.Timezone != "Asia/Tokyo" || vm.Locale != "en-US" {
+		t.Fatalf("unexpected initial vm: %+v", vm)
+	}
+	fingerprint, err := client.CollectIdentity(ctx, vm.ID)
+	if err != nil || fingerprint.DeviceID != vm.Fingerprint.DeviceID || fingerprint.GuestMachineID != vm.Fingerprint.GuestMachineID || fingerprint.Hostname != vm.Fingerprint.Hostname || fingerprint.CollectedAt == "" {
+		t.Fatalf("collect identity = %+v, %v", fingerprint, err)
+	}
+	proxy := ProxyView{ID: "proxy-one", Scheme: "socks5", Status: "ok", Enabled: true, GeoIP: "203.0.113.10", GeoTimezone: "Asia/Tokyo"}
+	fake.QueueProxies(proxy)
+	if err := client.AllocateProxy(ctx, vm.ID); err != nil {
+		t.Fatal(err)
+	}
+	vm = readVM()
+	if !vm.ProxyConfigured || !reflect.DeepEqual(vm.Proxy, &proxy) {
+		t.Fatalf("allocated proxy = %+v", vm)
+	}
+	probe, err := client.ProbeExit(ctx, vm.ID)
+	if err != nil || probe != (ExitProbe{Via: proxy.Scheme, IP: proxy.GeoIP, Timezone: proxy.GeoTimezone}) {
+		t.Fatalf("probe exit = %+v, %v", probe, err)
+	}
+	if err := client.ResetVM(ctx, vm.ID); err != nil {
+		t.Fatal(err)
+	}
+	reset := readVM()
+	if fake.ResetCalls(vm.ID) != 1 || reset.ID != vm.ID || reset.Fingerprint.DeviceID == fingerprint.DeviceID || reset.Fingerprint.GuestMachineID == fingerprint.GuestMachineID || reset.Fingerprint.Hostname == fingerprint.Hostname || reset.AccountUUID != "" || reset.Email != "" || reset.EmailMasked != "" || reset.HasCredential || reset.UnschedulableCode != "no_credential" || !reflect.DeepEqual(reset.Proxy, &proxy) {
+		t.Fatalf("unexpected reset vm: %+v", reset)
+	}
+	if err := client.DisableProxy(ctx, proxy.ID); err != nil {
+		t.Fatal(err)
+	}
+	vm = readVM()
+	proxy.Enabled = false
+	if !fake.ProxyDisabled(proxy.ID) || !reflect.DeepEqual(vm.Proxy, &proxy) {
+		t.Fatalf("disabled proxy = %+v", vm.Proxy)
+	}
+	if err := client.UnbindProxy(ctx, proxy.ID, vm.ID); err != nil {
+		t.Fatal(err)
+	}
+	vm = readVM()
+	if vm.Proxy != nil || vm.ProxyConfigured {
+		t.Fatalf("proxy still bound: %+v", vm)
+	}
+	proxy.Enabled = true
+	fake.QueueProxies(proxy)
+	if err := client.AllocateProxy(ctx, vm.ID); err != nil {
+		t.Fatal(err)
+	}
+	vm = readVM()
+	if vm.Proxy == nil || vm.Proxy.ID == proxy.ID || !vm.Proxy.Enabled {
+		t.Fatalf("disabled proxy was reused: %+v", vm.Proxy)
+	}
+}
+
+func TestFakeHTTPSelfcheckWire(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		path string
+		body string
+		data string
+	}{
+		{name: "collect identity", path: "/vms/vm-one/collect-identity", body: `{}`,
+			data: `{"fingerprint":{"device_id":"device-one","guest_machine_id":"machine-one","hostname":"host-one","timezone":"Asia/Tokyo","locale":"en-US","collected_at":"2026-10-31T00:00:00Z"}}`},
+		{name: "probe exit", path: "/vms/vm-one/exit-probe", body: `{}`,
+			data: `{"via":"socks5","geo":{"ip":"203.0.113.10","country_code":"JP","timezone":"Asia/Tokyo"}}`},
+		{name: "reset vm", path: "/vms/vm-one/reset", body: `{"mode":"traits"}`},
+		{name: "unbind proxy", path: "/proxies/proxy-one/unbind", body: `{"vm_id":"vm-one"}`, data: `{"id":"proxy-one"}`},
+		{name: "disable proxy", path: "/proxies/proxy-one/disable", body: `{}`, data: `{"id":"proxy-one","enabled":false}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := NewFake()
+			fake.now = func() time.Time { return time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC) }
+			fake.AddVM(VM{ID: "vm-one", Fingerprint: Fingerprint{DeviceID: "device-one", GuestMachineID: "machine-one", Hostname: "host-one", Timezone: "Asia/Tokyo", Locale: "en-US"}})
+			fake.SetProxy("vm-one", &ProxyView{ID: "proxy-one", Scheme: "socks5", Status: "ok", Enabled: true})
+			fake.SetExitProbe("vm-one", ExitProbe{Via: "socks5", IP: "203.0.113.10", CountryCode: "JP", Timezone: "Asia/Tokyo"}, nil)
+			payload := fakeTestRaw(t, fake.Handler("master"), http.MethodPost, "/api/panel"+test.path, "master", test.body, http.StatusOK)
+			if payload["ok"] != true || payload["data"] == nil || len(payload) != 2 {
+				t.Fatalf("unexpected envelope: %+v", payload)
+			}
+			if test.data != "" {
+				if !reflect.DeepEqual(payload["data"], decodeTestJSON(t, test.data)) {
+					t.Fatalf("data = %+v, want %s", payload["data"], test.data)
+				}
+			} else {
+				data := payload["data"].(map[string]any)
+				vm, ok := data["vm"].(map[string]any)
+				if !ok || vm["id"] != "vm-one" || data["mode"] != "traits" || data["recreated"] != true || fake.ResetCalls("vm-one") != 1 {
+					t.Fatalf("unexpected reset response: %+v", data)
+				}
+			}
+		})
+	}
+}
+
+func TestFakeHTTPSelfcheckErrors(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+		status int
+		code   string
+	}{
+		{name: "collect missing vm", path: "/vms/missing/collect-identity", body: `{}`, status: 404, code: "vm_not_found"},
+		{name: "probe missing vm", path: "/vms/missing/exit-probe", body: `{}`, status: 404, code: "vm_not_found"},
+		{name: "probe without proxy", path: "/vms/unbound/exit-probe", body: `{}`, status: 502, code: "proxy_required"},
+		{name: "probe failure", path: "/vms/vm-one/exit-probe", body: `{}`, status: 502, code: "exit_probe_failed"},
+		{name: "reset missing vm", path: "/vms/missing/reset", body: `{"mode":"traits"}`, status: 404, code: "vm_not_found"},
+		{name: "reset malformed body", path: "/vms/vm-one/reset", body: `{`, status: 400, code: "invalid_json"},
+		{name: "reset unsupported mode", path: "/vms/vm-one/reset", body: `{"mode":"unknown"}`, status: 400, code: "unsupported_mode"},
+		{name: "unbind missing vm", path: "/proxies/proxy-one/unbind", body: `{"vm_id":"missing"}`, status: 404, code: "vm_not_found"},
+		{name: "unbind wrong proxy", path: "/proxies/missing/unbind", body: `{"vm_id":"vm-one"}`, status: 404, code: "proxy_not_found"},
+		{name: "unbind missing vm id", path: "/proxies/proxy-one/unbind", body: `{}`, status: 400, code: "missing_field"},
+		{name: "unbind malformed body", path: "/proxies/proxy-one/unbind", body: `{`, status: 400, code: "invalid_json"},
+		{name: "collect wrong method", method: http.MethodGet, path: "/vms/vm-one/collect-identity", status: 404, code: "route_not_found"},
+		{name: "probe wrong method", method: http.MethodGet, path: "/vms/vm-one/exit-probe", status: 404, code: "route_not_found"},
+		{name: "reset wrong method", method: http.MethodGet, path: "/vms/vm-one/reset", status: 404, code: "route_not_found"},
+		{name: "unbind wrong method", method: http.MethodGet, path: "/proxies/proxy-one/unbind", status: 404, code: "route_not_found"},
+		{name: "disable wrong method", method: http.MethodGet, path: "/proxies/proxy-one/disable", status: 404, code: "route_not_found"},
+		{name: "disable extra suffix", path: "/proxies/proxy-one/disable/extra", status: 404, code: "route_not_found"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := NewFake()
+			fake.AddVM(VM{ID: "vm-one"})
+			fake.AddVM(VM{ID: "unbound"})
+			fake.SetProxy("vm-one", &ProxyView{ID: "proxy-one", Enabled: true})
+			fake.SetExitProbe("vm-one", ExitProbe{}, &Error{Status: http.StatusBadGateway, Code: "exit_probe_failed", Message: "probe failed"})
+			method := test.method
+			if method == "" {
+				method = http.MethodPost
+			}
+			payload := fakeTestRaw(t, fake.Handler("master"), method, "/api/panel"+test.path, "master", test.body, test.status)
+			panelError, ok := payload["error"].(map[string]any)
+			if payload["ok"] != false || payload["data"] != nil || !ok || panelError["code"] != test.code || panelError["message"] == "" {
+				t.Fatalf("unexpected error envelope: %+v", payload)
+			}
+			if fake.ResetCalls("vm-one") != 0 || fake.ProxyDisabled("proxy-one") {
+				t.Fatal("failed request mutated self-check state")
 			}
 		})
 	}

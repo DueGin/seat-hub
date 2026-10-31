@@ -261,6 +261,11 @@ func newTestServer(t *testing.T, role string) *httptest.Server {
 
 func newTestServerWithAuth(t *testing.T, role string) (*httptest.Server, *fakeAuth) {
 	t.Helper()
+	return newTestServerWithAdmin(t, role, fakeAdmin{})
+}
+
+func newTestServerWithAdmin(t *testing.T, role string, admin AdminService) (*httptest.Server, *fakeAuth) {
+	t.Helper()
 	var user *UserDTO
 	if role != "" {
 		user = &UserDTO{ID: 1, Email: "u@example.com", Role: role, Status: "active"}
@@ -271,7 +276,7 @@ func newTestServerWithAuth(t *testing.T, role string) (*httptest.Server, *fakeAu
 			Users: fakeUsers{}, Settings: fakeSettings{}, Audit: fakeAudit{},
 			Auth:    auth,
 			Catalog: fakeCatalog{}, Orders: fakeOrders{}, Payments: fakePayments{},
-			Accounts: fakeAccounts{}, Usage: fakeUsage{}, Keys: fakeKeys{}, Admin: fakeAdmin{},
+			Accounts: fakeAccounts{}, Usage: fakeUsage{}, Keys: fakeKeys{}, Admin: admin,
 			Site: func(r *http.Request) SiteConfig { return SiteConfig{SiteName: "测试站", BaseURL: "http://x"} },
 			Dev:  true,
 		},
@@ -498,4 +503,278 @@ func (fakeAdmin) SelfcheckHistory(ctx context.Context, resourceID int64, limit i
 
 func (fakeAdmin) RunPoolSelfcheck(ctx context.Context, vmID string) (SelfcheckDTO, error) {
 	return SelfcheckDTO{State: "pass", MaxAttempts: 3}, nil
+}
+
+type fakeSelfcheckAdmin struct {
+	fakeAdmin
+	runSelfcheck     func(context.Context, int64, bool) (SelfcheckDTO, error)
+	selfcheckHistory func(context.Context, int64, int) ([]SelfcheckReportDTO, error)
+	runPoolSelfcheck func(context.Context, string) (SelfcheckDTO, error)
+}
+
+func (admin fakeSelfcheckAdmin) RunSelfcheck(ctx context.Context, resourceID int64, rebuild bool) (SelfcheckDTO, error) {
+	return admin.runSelfcheck(ctx, resourceID, rebuild)
+}
+
+func (admin fakeSelfcheckAdmin) SelfcheckHistory(ctx context.Context, resourceID int64, limit int) ([]SelfcheckReportDTO, error) {
+	return admin.selfcheckHistory(ctx, resourceID, limit)
+}
+
+func (admin fakeSelfcheckAdmin) RunPoolSelfcheck(ctx context.Context, vmID string) (SelfcheckDTO, error) {
+	return admin.runPoolSelfcheck(ctx, vmID)
+}
+
+func TestAdminSelfcheckRequiresRole(t *testing.T) {
+	for _, authCase := range []struct {
+		role   string
+		status int
+		code   string
+	}{
+		{"", http.StatusUnauthorized, "unauthorized"},
+		{"user", http.StatusForbidden, "forbidden"},
+	} {
+		t.Run(authCase.code, func(t *testing.T) {
+			srv, _ := newTestServerWithAdmin(t, authCase.role, fakeSelfcheckAdmin{})
+			for _, endpoint := range []struct {
+				method string
+				path   string
+			}{
+				{http.MethodPost, "/api/admin/accounts/7/selfcheck"},
+				{http.MethodGet, "/api/admin/accounts/7/selfchecks"},
+				{http.MethodPost, "/api/admin/rental-pool/vm-7/selfcheck"},
+			} {
+				t.Run(endpoint.path, func(t *testing.T) {
+					resp, body := doJSON(t, endpoint.method, srv.URL+endpoint.path, "{}")
+					if resp.StatusCode != authCase.status || body["ok"] != false {
+						t.Fatalf("status=%d body=%v", resp.StatusCode, body)
+					}
+					if code := body["error"].(map[string]any)["code"]; code != authCase.code {
+						t.Fatalf("code=%v want=%s", code, authCase.code)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestAdminSelfcheckInvalidParameters(t *testing.T) {
+	srv, _ := newTestServerWithAdmin(t, "admin", fakeSelfcheckAdmin{})
+	assertInvalid := func(t *testing.T, method, path, requestBody string) {
+		t.Helper()
+		resp, body := doJSON(t, method, srv.URL+path, requestBody)
+		if resp.StatusCode != http.StatusUnprocessableEntity || body["ok"] != false {
+			t.Fatalf("status=%d body=%v", resp.StatusCode, body)
+		}
+		if code := body["error"].(map[string]any)["code"]; code != "invalid_request" {
+			t.Fatalf("code=%v", code)
+		}
+	}
+	for _, id := range []string{"abc", "0", "-1", "1.5", "9223372036854775808"} {
+		t.Run("id="+id, func(t *testing.T) {
+			assertInvalid(t, http.MethodPost, "/api/admin/accounts/"+id+"/selfcheck", "{}")
+			assertInvalid(t, http.MethodGet, "/api/admin/accounts/"+id+"/selfchecks", "")
+		})
+	}
+	for _, query := range []string{
+		"limit=", "limit=abc", "limit=0", "limit=-1", "limit=101", "limit=1.5",
+		"limit=999999999999999999999", "limit=%2020", "limit=20%20", "limit=1&limit=2",
+	} {
+		t.Run(query, func(t *testing.T) {
+			assertInvalid(t, http.MethodGet, "/api/admin/accounts/7/selfchecks?"+query, "")
+		})
+	}
+	for _, requestBody := range []string{
+		`{"rebuild":"true"}`, `{"rebuild":1}`, `{"rebuild":null}`, `{"rebuild":[]}`,
+		`{"rebuild":{}}`, `{"unknown":true}`, `{"rebuild":`, `null`, `[]`, `true`,
+	} {
+		t.Run(requestBody, func(t *testing.T) {
+			assertInvalid(t, http.MethodPost, "/api/admin/accounts/7/selfcheck", requestBody)
+		})
+	}
+
+	t.Run("blank_vm_id", func(t *testing.T) {
+		assertInvalid(t, http.MethodPost, "/api/admin/rental-pool/%20%20/selfcheck", "{}")
+	})
+}
+
+func TestAdminAccountSelfcheck(t *testing.T) {
+	checkedAt := "2026-10-31T00:00:00Z"
+	for _, testCase := range []struct {
+		name    string
+		body    string
+		rebuild bool
+		state   string
+	}{
+		{"default", "{}", false, "pass"},
+		{"empty_body", "", false, "pass"},
+		{"no_rebuild", `{"rebuild":false}`, false, "fail"},
+		{"rebuild", `{"rebuild": true}`, true, "exhausted"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			admin := fakeSelfcheckAdmin{
+				runSelfcheck: func(ctx context.Context, resourceID int64, rebuild bool) (SelfcheckDTO, error) {
+					if resourceID != 7 || rebuild != testCase.rebuild {
+						return SelfcheckDTO{}, fmt.Errorf("unexpected selfcheck arguments: id=%d rebuild=%t", resourceID, rebuild)
+					}
+					return SelfcheckDTO{
+						State: testCase.state, Attempts: 2, MaxAttempts: 3, CheckedAt: &checkedAt,
+						Checks: []SelfcheckCheckDTO{{
+							Code: "proxy_exclusive", OK: false, Remedy: "rebuild", Message: "代理不独占", Detail: "vm-8",
+						}},
+					}, nil
+				},
+			}
+			srv, _ := newTestServerWithAdmin(t, "admin", admin)
+			resp, body := doJSON(t, http.MethodPost, srv.URL+"/api/admin/accounts/7/selfcheck", testCase.body)
+			if resp.StatusCode != http.StatusOK || body["ok"] != true {
+				t.Fatalf("status=%d body=%v", resp.StatusCode, body)
+			}
+			data := body["data"].(map[string]any)
+			if data["state"] != testCase.state || data["attempts"] != float64(2) ||
+				data["max_attempts"] != float64(3) || data["checked_at"] != checkedAt {
+				t.Fatalf("data=%v", data)
+			}
+			checks := data["checks"].([]any)
+			if len(checks) != 1 {
+				t.Fatalf("checks=%v", checks)
+			}
+			check := checks[0].(map[string]any)
+			if check["code"] != "proxy_exclusive" || check["ok"] != false || check["remedy"] != "rebuild" ||
+				check["message"] != "代理不独占" || check["detail"] != "vm-8" {
+				t.Fatalf("check=%v", check)
+			}
+		})
+	}
+}
+
+func TestAdminSelfcheckHistory(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		query string
+		limit int
+		empty bool
+	}{
+		{"default", "", 20, false},
+		{"minimum", "?limit=1", 1, false},
+		{"maximum", "?limit=100", 100, false},
+		{"empty", "", 20, true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			admin := fakeSelfcheckAdmin{
+				selfcheckHistory: func(ctx context.Context, resourceID int64, limit int) ([]SelfcheckReportDTO, error) {
+					if resourceID != 7 || limit != testCase.limit {
+						return nil, fmt.Errorf("unexpected history arguments: id=%d limit=%d", resourceID, limit)
+					}
+					if testCase.empty {
+						return nil, nil
+					}
+					return []SelfcheckReportDTO{{
+						ID: 12, VMID: "vm-7", Attempt: 1, Passed: true, CreatedAt: "2026-10-31T00:00:00Z",
+						Checks: []SelfcheckCheckDTO{{Code: "proxy_exclusive", OK: true, Message: "检查通过"}},
+					}}, nil
+				},
+			}
+			srv, _ := newTestServerWithAdmin(t, "admin", admin)
+			resp, body := doJSON(t, http.MethodGet, srv.URL+"/api/admin/accounts/7/selfchecks"+testCase.query, "")
+			if resp.StatusCode != http.StatusOK || body["ok"] != true {
+				t.Fatalf("status=%d body=%v", resp.StatusCode, body)
+			}
+			items, ok := body["data"].(map[string]any)["items"].([]any)
+			if !ok {
+				t.Fatalf("history must be an array: body=%v", body)
+			}
+			if testCase.empty {
+				if len(items) != 0 {
+					t.Fatalf("items=%v", items)
+				}
+				return
+			}
+			if len(items) != 1 {
+				t.Fatalf("items=%v", items)
+			}
+			item := items[0].(map[string]any)
+			if item["id"] != float64(12) || item["vm_id"] != "vm-7" || item["attempt"] != float64(1) ||
+				item["passed"] != true || item["created_at"] != "2026-10-31T00:00:00Z" {
+				t.Fatalf("item=%v", item)
+			}
+			checks := item["checks"].([]any)
+			if len(checks) != 1 || checks[0].(map[string]any)["code"] != "proxy_exclusive" {
+				t.Fatalf("checks=%v", checks)
+			}
+		})
+	}
+}
+
+func TestAdminRentalPoolSelfcheck(t *testing.T) {
+	admin := fakeSelfcheckAdmin{
+		runPoolSelfcheck: func(ctx context.Context, vmID string) (SelfcheckDTO, error) {
+			if vmID != "vm-7" {
+				return SelfcheckDTO{}, fmt.Errorf("unexpected vm id: %s", vmID)
+			}
+			return SelfcheckDTO{
+				State: "pass", MaxAttempts: 3,
+				Checks: []SelfcheckCheckDTO{{Code: "exit_geo_timezone", OK: true, Skipped: true, Message: "已跳过"}},
+			}, nil
+		},
+	}
+	srv, _ := newTestServerWithAdmin(t, "admin", admin)
+	resp, body := doJSON(t, http.MethodPost, srv.URL+"/api/admin/rental-pool/vm-7/selfcheck", "{}")
+	if resp.StatusCode != http.StatusOK || body["ok"] != true {
+		t.Fatalf("status=%d body=%v", resp.StatusCode, body)
+	}
+	data := body["data"].(map[string]any)
+	if data["state"] != "pass" || data["attempts"] != float64(0) || data["max_attempts"] != float64(3) || data["checked_at"] != nil {
+		t.Fatalf("data=%v", data)
+	}
+	checks := data["checks"].([]any)
+	if len(checks) != 1 {
+		t.Fatalf("checks=%v", checks)
+	}
+	check := checks[0].(map[string]any)
+	if check["code"] != "exit_geo_timezone" || check["ok"] != true || check["skipped"] != true || check["message"] != "已跳过" {
+		t.Fatalf("check=%v", check)
+	}
+}
+
+func TestAdminSelfcheckServiceErrors(t *testing.T) {
+	for _, serviceError := range []*UserError{
+		{Status: http.StatusNotFound, Code: "not_found", Message: "资源不存在"},
+		{Status: http.StatusConflict, Code: "selfcheck_failed", Message: "自检未通过"},
+		{Status: http.StatusConflict, Code: "selfcheck_exhausted", Message: "重建次数已耗尽"},
+		{Status: http.StatusConflict, Code: "account_duplicate", Message: "账号已在其它槽位托管"},
+	} {
+		t.Run(serviceError.Code, func(t *testing.T) {
+			admin := fakeSelfcheckAdmin{
+				runSelfcheck: func(context.Context, int64, bool) (SelfcheckDTO, error) {
+					return SelfcheckDTO{}, fmt.Errorf("run selfcheck: %w", serviceError)
+				},
+				selfcheckHistory: func(context.Context, int64, int) ([]SelfcheckReportDTO, error) {
+					return nil, fmt.Errorf("load history: %w", serviceError)
+				},
+				runPoolSelfcheck: func(context.Context, string) (SelfcheckDTO, error) {
+					return SelfcheckDTO{}, fmt.Errorf("run pool selfcheck: %w", serviceError)
+				},
+			}
+			srv, _ := newTestServerWithAdmin(t, "admin", admin)
+			for _, endpoint := range []struct {
+				method string
+				path   string
+			}{
+				{http.MethodPost, "/api/admin/accounts/7/selfcheck"},
+				{http.MethodGet, "/api/admin/accounts/7/selfchecks"},
+				{http.MethodPost, "/api/admin/rental-pool/vm-7/selfcheck"},
+			} {
+				t.Run(endpoint.path, func(t *testing.T) {
+					resp, body := doJSON(t, endpoint.method, srv.URL+endpoint.path, "{}")
+					if resp.StatusCode != serviceError.Status || body["ok"] != false {
+						t.Fatalf("status=%d body=%v", resp.StatusCode, body)
+					}
+					failure := body["error"].(map[string]any)
+					if failure["code"] != serviceError.Code || failure["message"] != serviceError.Message {
+						t.Fatalf("error=%v", failure)
+					}
+				})
+			}
+		})
+	}
 }

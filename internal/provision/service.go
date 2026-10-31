@@ -44,6 +44,7 @@ func New(db *sql.DB, client vm2api.Client) *Service {
 	service.engine.Register("release_resource", service.releaseJob)
 	service.engine.Register("sync_concurrency", service.syncJob)
 	service.engine.Register("sweep_expiry", func(ctx context.Context, job Job) error { return service.SweepExpiry(ctx) })
+	service.engine.Register("selfcheck_sweep", func(ctx context.Context, job Job) error { return service.SweepSelfcheck(ctx) })
 	return service
 }
 
@@ -161,11 +162,24 @@ func (service *Service) Run(ctx context.Context) error {
 	go func() { done <- service.engine.Run(workerCtx) }()
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
+	var nextSelfcheck time.Time
 	for {
 		if _, err := service.engine.Enqueue(workerCtx, "sweep_expiry", jobPayload{}, "sweep_expiry", service.now(), 8); err != nil {
 			cancel()
 			<-done
 			return fmt.Errorf("schedule expiry sweep: %w", err)
+		}
+		if !service.now().Before(nextSelfcheck) {
+			site, err := service.site(workerCtx)
+			if err == nil {
+				_, err = service.engine.Enqueue(workerCtx, "selfcheck_sweep", jobPayload{}, "selfcheck_sweep", service.now(), 8)
+			}
+			if err != nil {
+				cancel()
+				<-done
+				return fmt.Errorf("schedule self-check sweep: %w", err)
+			}
+			nextSelfcheck = service.now().Add(selfcheckInterval(site))
 		}
 		select {
 		case <-ctx.Done():

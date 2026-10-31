@@ -9,27 +9,31 @@ import (
 )
 
 type Account struct {
-	ID             int64   `json:"id"`
-	UserID         int64   `json:"-"`
-	Kind           string  `json:"kind"`
-	VMID           string  `json:"-"`
-	SubscriptionID *int64  `json:"-"`
-	Label          string  `json:"label"`
-	EmailMasked    string  `json:"email_masked"`
-	Tier           string  `json:"tier"`
-	Status         string  `json:"status"`
-	StatusReason   *string `json:"status_reason"`
-	LastError      *string `json:"-"`
-	CreatedAt      string  `json:"created_at"`
-	ExpiresAt      *string `json:"expires_at"`
-	ReleaseAfter   *string `json:"-"`
+	ID                 int64   `json:"id"`
+	UserID             int64   `json:"-"`
+	Kind               string  `json:"kind"`
+	VMID               string  `json:"-"`
+	SubscriptionID     *int64  `json:"-"`
+	Label              string  `json:"label"`
+	EmailMasked        string  `json:"email_masked"`
+	Tier               string  `json:"tier"`
+	Status             string  `json:"status"`
+	StatusReason       *string `json:"status_reason"`
+	LastError          *string `json:"-"`
+	CreatedAt          string  `json:"created_at"`
+	ExpiresAt          *string `json:"expires_at"`
+	ReleaseAfter       *string `json:"-"`
+	SelfcheckState     string  `json:"-"`
+	SelfcheckAttempts  int     `json:"-"`
+	SelfcheckCheckedAt *string `json:"-"`
+	SelfcheckSummary   *string `json:"-"`
 }
 
-const accountColumns = `r.id,r.user_id,r.kind,COALESCE(r.vm_id,''),r.subscription_id,r.label,r.email_masked,r.tier,r.status,r.status_reason,r.last_error,r.created_at,s.expires_at,r.release_after`
+const accountColumns = `r.id,r.user_id,r.kind,COALESCE(r.vm_id,''),r.subscription_id,r.label,r.email_masked,r.tier,r.status,r.status_reason,r.last_error,r.created_at,s.expires_at,r.release_after,r.selfcheck_state,r.selfcheck_attempts,r.selfcheck_checked_at,r.selfcheck_summary`
 
 func scanAccount(scanner interface{ Scan(...any) error }) (Account, error) {
 	var account Account
-	if err := scanner.Scan(&account.ID, &account.UserID, &account.Kind, &account.VMID, &account.SubscriptionID, &account.Label, &account.EmailMasked, &account.Tier, &account.Status, &account.StatusReason, &account.LastError, &account.CreatedAt, &account.ExpiresAt, &account.ReleaseAfter); err != nil {
+	if err := scanner.Scan(&account.ID, &account.UserID, &account.Kind, &account.VMID, &account.SubscriptionID, &account.Label, &account.EmailMasked, &account.Tier, &account.Status, &account.StatusReason, &account.LastError, &account.CreatedAt, &account.ExpiresAt, &account.ReleaseAfter, &account.SelfcheckState, &account.SelfcheckAttempts, &account.SelfcheckCheckedAt, &account.SelfcheckSummary); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return account, ErrNotFound
 		}

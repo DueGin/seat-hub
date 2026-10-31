@@ -45,6 +45,10 @@ type Fake struct {
 	exitErr         map[string]error
 	proxyQueue      []ProxyView
 	resetCalls      map[string]int
+	// hostileSelfcheck makes every slot share one fingerprint and one exit, so
+	// a self-check can never pass no matter how many times it rebuilds. Only
+	// cmd/mock-vm2api enables it, to exercise the rebuild budget end to end.
+	hostileSelfcheck bool
 }
 
 type fakeKey struct {
@@ -740,13 +744,21 @@ func fakeUserWire(user User) map[string]any {
 	}
 }
 
+func fakeProxyWire(proxy *ProxyView) any {
+	if proxy == nil {
+		return nil
+	}
+	return map[string]any{
+		"id": proxy.ID, "scheme": proxy.Scheme, "status": proxy.Status,
+		"enabled": proxy.Enabled, "blocked_reason": proxy.BlockedReason,
+		"geo": map[string]any{"ip": proxy.GeoIP, "timezone": proxy.GeoTimezone},
+	}
+}
+
 func fakeVMWire(vm VM) map[string]any {
-	var owner, proxy any
+	var owner any
 	if vm.OwnerUserID != "" {
 		owner = vm.OwnerUserID
-	}
-	if vm.ProxyConfigured {
-		proxy = map[string]any{"id": "proxy_" + vm.ID, "host": "127.0.0.1", "port": 1080, "type": "socks5"}
 	}
 	reason := vm.UnschedulableCode
 	if vm.CredentialRejected && reason == "" {
@@ -754,10 +766,11 @@ func fakeVMWire(vm VM) map[string]any {
 	}
 	result := map[string]any{
 		"id": vm.ID, "name": vm.Label, "platform": vm.Platform, "owner_user_id": owner,
-		"origin": vm.Origin, "email": vm.EmailMasked, "account_tier": vm.Tier,
+		"origin": vm.Origin, "email": vm.Email, "email_masked": vm.EmailMasked, "account_tier": vm.Tier,
+		"account_uuid": vm.AccountUUID, "fingerprint": vm.Fingerprint, "timezone": vm.Timezone, "locale": vm.Locale,
 		"has_token": vm.HasCredential, "cred_status": map[string]any{"key": vm.CredStatus, "text": vm.CredStatus},
 		"schedule_state": vm.ScheduleState, "unschedulable_reason": reason,
-		"restriction_text": vm.RestrictionText, "proxy": proxy,
+		"restriction_text": vm.RestrictionText, "proxy": fakeProxyWire(vm.Proxy), "proxy_configured": vm.ProxyConfigured,
 		"seats_used": vm.SeatsUsed, "seats_max": vm.SeatsMax, "inflight": vm.Inflight,
 	}
 	for _, pair := range []struct {
@@ -1042,6 +1055,32 @@ func (fake *Fake) panel(request *http.Request) (int, any, error) {
 	if parts[0] == "vms" {
 		return fake.panelVM(request, id, parts[2:])
 	}
+	if parts[0] == "proxies" {
+		return fake.panelProxy(request, id, parts[2:])
+	}
+	return 0, nil, fakeMissing("route")
+}
+
+func (fake *Fake) panelProxy(request *http.Request, id string, suffix []string) (int, any, error) {
+	if request.Method != http.MethodPost || len(suffix) != 1 {
+		return 0, nil, fakeMissing("route")
+	}
+	switch suffix[0] {
+	case "unbind":
+		body, err := fakeDecodeBody[struct {
+			VMID string `json:"vm_id"`
+		}](request)
+		if err != nil {
+			return 0, nil, err
+		}
+		vmID := strings.TrimSpace(body.VMID)
+		if vmID == "" {
+			return 0, nil, fakeError(400, "missing_field", "vm_id required")
+		}
+		return 200, fakeOK(map[string]any{"id": id}), fake.UnbindProxy(request.Context(), id, vmID)
+	case "disable":
+		return 200, fakeOK(map[string]any{"id": id, "enabled": false}), fake.DisableProxy(request.Context(), id)
+	}
 	return 0, nil, fakeMissing("route")
 }
 
@@ -1157,11 +1196,34 @@ func (fake *Fake) panelVM(request *http.Request, id string, suffix []string) (in
 		return 0, nil, fakeMissing("route")
 	}
 	switch action {
+	case "collect-identity":
+		fingerprint, err := fake.CollectIdentity(ctx, id)
+		return 200, fakeOK(map[string]any{"fingerprint": fingerprint}), err
+	case "exit-probe":
+		probe, err := fake.ProbeExit(ctx, id)
+		return 200, fakeOK(map[string]any{
+			"via": probe.Via,
+			"geo": map[string]any{"ip": probe.IP, "country_code": probe.CountryCode, "timezone": probe.Timezone},
+		}), err
+	case "reset":
+		body, err := fakeDecodeBody[struct{ Mode string }](request)
+		if err != nil {
+			return 0, nil, err
+		}
+		if body.Mode != "traits" {
+			return 0, nil, fakeError(400, "unsupported_mode", "traits mode required")
+		}
+		if err := fake.ResetVM(ctx, id); err != nil {
+			return 0, nil, err
+		}
+		usage, err := fake.GetAccountUsage(ctx, id)
+		return 200, fakeOK(map[string]any{"vm": fakeVMWire(usage.VM), "recreated": true, "mode": body.Mode}), err
 	case "allocate-proxy":
 		if err := fake.AllocateProxy(ctx, id); err != nil {
 			return 0, nil, err
 		}
-		return 200, fakeOK(map[string]any{"proxy": map[string]any{"id": "proxy_" + id}}), nil
+		usage, err := fake.GetAccountUsage(ctx, id)
+		return 200, fakeOK(map[string]any{"proxy": fakeProxyWire(usage.VM.Proxy)}), err
 	case "schedulable":
 		body, err := fakeDecodeBody[struct{ Schedulable *bool }](request)
 		if err != nil {

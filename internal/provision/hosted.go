@@ -41,6 +41,9 @@ func (service *Service) ProvisionHosted(ctx context.Context, resourceID int64) e
 	if account.Status != "provisioning" && account.Status != "failed" {
 		return nil
 	}
+	if account.SelfcheckState == "exhausted" {
+		return ErrSelfcheckExhausted
+	}
 	owner, err := service.upstreamUser(ctx, account.UserID)
 	if err != nil {
 		return service.failResource(ctx, resourceID, err)
@@ -63,6 +66,12 @@ func (service *Service) ProvisionHosted(ctx context.Context, resourceID int64) e
 		}
 	}
 	if err := service.prepareHosted(ctx, account, owner); err != nil {
+		return err
+	}
+	if err := service.ensureSlotHealthy(ctx, account); err != nil {
+		if errors.Is(err, ErrSelfcheckFailed) {
+			return service.failStage(ctx, resourceID, "selfcheck_failed", err)
+		}
 		return err
 	}
 	return service.markAwaitingAuth(ctx, resourceID)
@@ -101,12 +110,19 @@ func (service *Service) markAwaitingAuth(ctx context.Context, resourceID int64) 
 // resource whose owner assignment never succeeded must not be onboarded: the VM
 // would stay shared and the user's credential would sit on someone else's slot.
 func (service *Service) ensureOnboardable(ctx context.Context, account Account) error {
+	account, err := service.resource(ctx, account.ID)
+	if err != nil {
+		return err
+	}
 	owner, err := service.upstreamUser(ctx, account.UserID)
 	if err != nil {
 		return err
 	}
 	if provisioningIncomplete(account) {
 		if err := service.prepareHosted(ctx, account, owner); err != nil {
+			return err
+		}
+		if err := service.ensureSlotHealthy(ctx, account); err != nil {
 			return err
 		}
 		return service.markAwaitingAuth(ctx, account.ID)
@@ -122,6 +138,9 @@ func (service *Service) ensureOnboardable(ctx context.Context, account Account) 
 		return nil
 	}
 	if err := service.prepareHosted(ctx, account, owner); err != nil {
+		return err
+	}
+	if err := service.ensureSlotHealthy(ctx, account); err != nil {
 		return err
 	}
 	return service.markAwaitingAuth(ctx, account.ID)
@@ -202,6 +221,9 @@ func (service *Service) GenerateAuthURL(ctx context.Context, userID, resourceID 
 	if account.Kind != "hosted" || account.VMID == "" || (account.Status != "awaiting_auth" && account.Status != "needs_reauth" && account.Status != "failed") {
 		return vm2api.AuthURL{}, ErrInvalidState
 	}
+	if err := service.ensureFreshSelfcheck(ctx, account); err != nil {
+		return vm2api.AuthURL{}, err
+	}
 	if err := service.ensureOnboardable(ctx, account); err != nil {
 		return vm2api.AuthURL{}, err
 	}
@@ -244,6 +266,9 @@ func (service *Service) SubmitAuthCode(ctx context.Context, userID, resourceID i
 	if account.Kind != "hosted" || account.VMID == "" || (account.Status != "awaiting_auth" && account.Status != "needs_reauth" && account.Status != "failed") {
 		return ErrInvalidState
 	}
+	if err := service.ensureFreshSelfcheck(ctx, account); err != nil {
+		return err
+	}
 	if err := service.ensureOnboardable(ctx, account); err != nil {
 		return err
 	}
@@ -278,6 +303,9 @@ func (service *Service) SubmitAuthCode(ctx context.Context, userID, resourceID i
 			return errors.Join(failure, fmt.Errorf("save auth failure: %w", saveErr))
 		}
 		return service.failResource(ctx, resourceID, failure)
+	}
+	if err := service.checkAuthorizedAccount(ctx, account); err != nil {
+		return err
 	}
 	tx, err := service.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -365,6 +393,9 @@ func (service *Service) RetryHosted(ctx context.Context, userID, resourceID int6
 	}
 	if account.Kind != "hosted" || account.Status != "failed" {
 		return ErrInvalidState
+	}
+	if account.SelfcheckState == "exhausted" {
+		return ErrSelfcheckExhausted
 	}
 	status, kind := "provisioning", "provision_hosted"
 	if account.VMID != "" {
