@@ -55,7 +55,9 @@ func (b *Box) Seal(plaintext string) (string, error) {
 }
 
 func (b *Box) Open(sealed string) (string, error) {
-	raw, err := base64.RawStdEncoding.DecodeString(sealed)
+	// Strict: Seal only emits canonical encodings, so non-zero padding bits
+	// mean the text was altered even when the decoded bytes would match.
+	raw, err := base64.RawStdEncoding.Strict().DecodeString(sealed)
 	if err != nil {
 		return "", fmt.Errorf("decode: %w", err)
 	}
