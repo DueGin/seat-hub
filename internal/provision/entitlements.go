@@ -71,6 +71,11 @@ func EffectiveConcurrency(total int) int {
 	return total
 }
 
+// syncConcurrency only pushes max_concurrency to keys whose synced value is
+// stale. The expiry sweep calls it for every user every minute, so it must
+// stay cheap: no pool or scope traffic. Event-driven sync_concurrency jobs run
+// the full SyncUserScope instead (syncJob), and scope_reconcile backs both up.
+// It never changes a key's active flag or scope, so legacy keys are safe here.
 func (service *Service) syncConcurrency(ctx context.Context, userID int64) error {
 	entitlements, err := service.Entitlements(ctx, userID)
 	if err != nil {

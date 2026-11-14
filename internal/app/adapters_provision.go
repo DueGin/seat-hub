@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,6 +28,7 @@ type provisionSpan struct {
 	settings *store.Settings
 	// keyStats reads one upstream key's usage from vm2api; nil disables it.
 	keyStats func(ctx context.Context, vm2apiKeyID string) (vm2api.UsageBreakdown, error)
+	keyLogs  func(context.Context, string, vm2api.LogQuery) (vm2api.LogPage, error)
 	// inflight reports the gateway's live request count for a user.
 	inflight func(userID int64) int
 }
@@ -556,24 +558,107 @@ func (p *provisionSpan) Logs(ctx context.Context, userID int64, q api.UsageLogQu
 // KeyStats is the per-key usage panel. It must check ownership: without it any
 // user could read another user's aggregate by guessing a key id.
 func (p *provisionSpan) KeyStats(ctx context.Context, userID, keyID int64) ([]api.DailyDTO, []api.ModelDTO, error) {
-	var upstreamKeyID string
+	var upstreamKeyID, previous string
 	err := p.db.QueryRowContext(ctx,
-		`SELECT vm2api_key_id FROM api_keys WHERE id = ? AND user_id = ? AND status <> 'deleted'`,
-		keyID, userID).Scan(&upstreamKeyID)
+		`SELECT vm2api_key_id,previous_vm2api_key_ids FROM api_keys WHERE id = ? AND user_id = ? AND status <> 'deleted'`,
+		keyID, userID).Scan(&upstreamKeyID, &previous)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, api.Err(errKeyNotFound, 404, "key_not_found", "API Key 不存在")
 	}
 	if err != nil {
 		return nil, nil, fmt.Errorf("look up key: %w", err)
 	}
-	if p.keyStats == nil || upstreamKeyID == "" {
+	if p.keyStats == nil {
 		return []api.DailyDTO{}, []api.ModelDTO{}, nil
 	}
-	breakdown, err := p.keyStats(ctx, upstreamKeyID)
-	if err != nil {
-		return nil, nil, err
+	ids := store.DecodeStrings(previous)
+	if upstreamKeyID != "" {
+		ids = append(ids, upstreamKeyID)
 	}
+	seen := make(map[string]bool)
+	daily := make(map[string]vm2api.DailyUsage)
+	models := make(map[string]vm2api.ModelUsage)
+	for _, id := range ids {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		breakdown, err := p.keyStats(ctx, id)
+		if id != upstreamKeyID && vm2api.IsStatus(err, 404) && p.keyLogs != nil {
+			breakdown, err = p.previousKeyStats(ctx, id)
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("load key stats: %w", err)
+		}
+		for _, day := range breakdown.Daily {
+			sum := daily[day.Date]
+			sum.Date = day.Date
+			sum.Requests += day.Requests
+			sum.Tokens += day.Tokens
+			sum.CostUSD += day.CostUSD
+			daily[day.Date] = sum
+		}
+		for _, model := range breakdown.ByModel {
+			sum := models[model.Model]
+			sum.Model = model.Model
+			sum.Requests += model.Requests
+			sum.Tokens += model.Tokens
+			sum.CostUSD += model.CostUSD
+			models[model.Model] = sum
+		}
+	}
+	breakdown := vm2api.UsageBreakdown{}
+	for _, day := range daily {
+		breakdown.Daily = append(breakdown.Daily, day)
+	}
+	for _, model := range models {
+		breakdown.ByModel = append(breakdown.ByModel, model)
+	}
+	sort.Slice(breakdown.Daily, func(i, j int) bool { return breakdown.Daily[i].Date < breakdown.Daily[j].Date })
+	sort.Slice(breakdown.ByModel, func(i, j int) bool { return breakdown.ByModel[i].Model < breakdown.ByModel[j].Model })
 	return toDaily(breakdown.Daily), toModels(breakdown.ByModel), nil
+}
+
+func (p *provisionSpan) previousKeyStats(ctx context.Context, id string) (vm2api.UsageBreakdown, error) {
+	until := time.Now().UTC()
+	query := vm2api.LogQuery{KeyID: id, From: until.Add(-30 * 24 * time.Hour), Until: until, PageSize: 500}
+	daily := make(map[string]vm2api.DailyUsage)
+	models := make(map[string]vm2api.ModelUsage)
+	shanghai := time.FixedZone("Asia/Shanghai", 8*60*60)
+	// Bound the historical scan to 10,000 rows per deleted upstream key.
+	for query.Page = 1; query.Page <= 20; query.Page++ {
+		page, err := p.keyLogs(ctx, "", query)
+		if err != nil {
+			return vm2api.UsageBreakdown{}, fmt.Errorf("load historical key logs: %w", err)
+		}
+		for _, row := range page.Items {
+			date := row.CreatedAt.In(shanghai).Format("2006-01-02")
+			tokens := row.InputTokens + row.OutputTokens + row.CacheReadTokens + row.CacheCreationTokens
+			day := daily[date]
+			day.Date = date
+			day.Requests++
+			day.Tokens += tokens
+			day.CostUSD += row.CostUSD
+			daily[date] = day
+			model := models[row.Model]
+			model.Model = row.Model
+			model.Requests++
+			model.Tokens += tokens
+			model.CostUSD += row.CostUSD
+			models[row.Model] = model
+		}
+		if len(page.Items) < query.PageSize || int64(query.Page*query.PageSize) >= page.Total {
+			break
+		}
+	}
+	result := vm2api.UsageBreakdown{}
+	for _, day := range daily {
+		result.Daily = append(result.Daily, day)
+	}
+	for _, model := range models {
+		result.ByModel = append(result.ByModel, model)
+	}
+	return result, nil
 }
 
 var errKeyNotFound = errors.New("key not found")

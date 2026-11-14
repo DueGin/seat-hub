@@ -167,13 +167,15 @@ utilization 为 0–100；窗口缺失为 `null`。
 
 ## API Key
 
-`ApiKey`: `{"id":1,"name":"默认","prefix":"sk-pt-AbC1","status":"active|disabled","created_at":"…","last_used_at":null}`
+`ApiKey`: `{"id":1,"name":"默认","prefix":"sk-pt-AbC1","status":"active|disabled","created_at":"…","last_used_at":null,"scope":{"mode":"all|selected","accounts":[12,15],"usable":true}}`
+
+`scope` 是这个密钥能调用哪些账号（[KEY_SCOPE.md](KEY_SCOPE.md)）：`all` = 该用户现在和以后的全部账号；`selected` = 只能调 `accounts` 里的账号（资源 id）。`usable=false` 表示所选账号当前都不可用，网关以 403 `key_no_accounts` 拒绝，重新选择后恢复。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/keys` | `{items:[ApiKey]}` |
-| POST | `/api/keys` | `{name}` → `{key:ApiKey, secret:"sk-pt-…"}`（明文只此一次）。上限 20 个 422 `key_limit` |
-| PATCH | `/api/keys/{id}` | `{name?, status?:"active|disabled"}` |
+| POST | `/api/keys` | `{name, scope?:{mode, accounts}}` → `{key:ApiKey, secret:"sk-pt-…"}`（明文只此一次）。不带 `scope` 即全部账号。上限 20 个 422 `key_limit`；所选账号不属于自己 422 `key_scope_invalid`；所选账号都不可用 422 `key_scope_empty` |
+| PATCH | `/api/keys/{id}` | `{name?, status?:"active|disabled", scope?:{mode, accounts}}`。升级中的旧密钥改范围返回 409 `key_migrating` |
 | DELETE | `/api/keys/{id}` | |
 | GET | `/api/keys/{id}/stats` | `{daily:[DailyUsage], by_model:[ModelUsage]}`（vm2api 近 30 天） |
 
@@ -232,11 +234,11 @@ utilization 为 0–100；窗口缺失为 `null`。
 | POST | `/api/admin/orders/{order_no}/mark-paid` | `{trade_no?}` 人工确认收款 → 履约 |
 | POST | `/api/admin/orders/{order_no}/cancel` | pending 取消 |
 | POST | `/api/admin/orders/{order_no}/refulfill` | `fulfill_failed` 重试 |
-| GET | `/api/admin/users?q&role&status&page` | `User` + `{concurrency_total, hosted_used, hosted_total, rental_used, rental_total, vm2api_user_id, note, last_login_at, last_login_ip, active_sessions}`。`q` 匹配邮箱或备注，`#12`/`12` 按用户 ID 精确匹配；`role`=`user|admin`，`status`=`active|disabled` |
+| GET | `/api/admin/users?q&role&status&page` | `User` + `{concurrency_total, hosted_used, hosted_total, rental_used, rental_total, vm2api_user_id, vm2api_pool_id, note, last_login_at, last_login_ip, active_sessions}`（`vm2api_user_id` 仅旧数据迁移前有值）。`q` 匹配邮箱或备注，`#12`/`12` 按用户 ID 精确匹配；`role`=`user|admin`，`status`=`active|disabled` |
 | POST | `/api/admin/users` | `{email, password?, role?, note?}` 新增用户，返回 201 `{user, password?}`。不传 `password` 时自动生成 16 位密码，只在本次响应里返回一次；邮箱已占用 409 `email_taken` |
 | GET | `/api/admin/users/{id}` | `{user, subscriptions, accounts, keys, orders, sessions:[{created_at, expires_at, ip, user_agent}], records:{orders, subscriptions, resources}}` |
-| PATCH | `/api/admin/users/{id}` | `{email?, status?, role?, note?}` 至少一项。停用时同步停用 vm2api 用户及其密钥，重新启用时一并恢复。改邮箱后用户须用新邮箱登录 |
-| DELETE | `/api/admin/users/{id}` | 删除用户及其 API 密钥（先删 vm2api 上的密钥，vm2api 用户只停用不删除）。有订单、订阅或账号资源的用户返回 409 `user_has_records`，只能停用 |
+| PATCH | `/api/admin/users/{id}` | `{email?, status?, role?, note?}` 至少一项。停用时同步停用该用户的上游密钥，重新启用时一并恢复（用户自己停用的密钥保持停用）。改邮箱后用户须用新邮箱登录 |
+| DELETE | `/api/admin/users/{id}` | 删除用户及其 API 密钥（先删上游密钥，再删该用户的账号池）。有订单、订阅或账号资源的用户返回 409 `user_has_records`，只能停用 |
 | POST | `/api/admin/users/{id}/password` | `{password?}` 重置密码，并让该用户所有设备的登录失效。不传 `password` 时自动生成，返回 `{password}`（只显示一次） |
 | POST | `/api/admin/users/{id}/sessions/revoke` | `{}` 强制下线：让该用户所有设备的登录失效，API 密钥不受影响 |
 | PATCH/DELETE | `/api/admin/users/{id}/keys/{key_id}` | 管理员停用、启用（`{status}`）或删除该用户的某个 API 密钥，例如密钥泄露时使用 |

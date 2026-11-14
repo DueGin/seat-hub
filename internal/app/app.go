@@ -86,7 +86,8 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	prov.svc.SetChecker(selfcheck.NewEngine(vmClient, db.DB))
 	orderSvc.SetFulfiller(prov)
 
-	usersAdv := &usersAdapter{users: users, db: db.DB, client: vmClient, sessions: sessions}
+	usersAdv := &usersAdapter{users: users, db: db.DB, client: vmClient, sessions: sessions,
+		syncScope: prov.prov.SyncUserScope, deleteScope: prov.prov.DeleteUserScope}
 	usersAdv.entitle = func(ctx context.Context, userID int64) (api.AdminUserDTO, error) {
 		ent, err := prov.prov.Entitlements(ctx, userID)
 		if err != nil {
@@ -130,7 +131,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	}
 	apiServer := &api.Server{Deps: deps, Log: logger, Secure: cfg.SecureCookies()}
 
-	res := newResolver(db.DB, box, prov.Entitlement)
+	res := newResolver(db.DB, box, prov.Entitlement, prov.prov.SchedulableVMs)
 
 	mux := http.NewServeMux()
 	mux.Handle("/api/", authSvc.Middleware(apiServer.Handler()))

@@ -20,10 +20,12 @@ import (
 
 // usersAdapter implements api.UserStore over the SQLite repositories.
 type usersAdapter struct {
-	users    *store.Users
-	db       *sql.DB
-	client   vm2api.Client
-	sessions *store.Sessions
+	users       *store.Users
+	db          *sql.DB
+	client      vm2api.Client
+	sessions    *store.Sessions
+	syncScope   func(context.Context, int64) error
+	deleteScope func(context.Context, int64) error
 	// entitle is injected by the wiring layer (provision.Service.Entitlements).
 	// It is a function rather than a concrete service to keep this package's
 	// dependency graph acyclic.
@@ -69,47 +71,14 @@ func (a *usersAdapter) SetPassword(ctx context.Context, id int64, hash string) e
 // SetStatus flips the local account and mirrors the change upstream: a
 // disabled portal user must not be able to spend through a live vm2api key.
 func (a *usersAdapter) SetStatus(ctx context.Context, id int64, status string) error {
-	u, err := a.users.GetByID(ctx, id)
-	if err != nil {
+	if _, err := a.users.GetByID(ctx, id); err != nil {
 		return err
 	}
 	if err := a.users.SetStatus(ctx, id, status); err != nil {
 		return err
 	}
-	if u.VM2APIUserID == "" || a.client == nil {
-		return nil
-	}
-	if err := a.client.SetUserEnabled(ctx, u.VM2APIUserID, status == "active"); err != nil {
-		// The local state already changed; surface the upstream miss so the
-		// admin console can retry instead of silently diverging.
-		return fmt.Errorf("sync vm2api user state: %w", err)
-	}
-	{
-		// Disabling switches the user's active keys off upstream; enabling
-		// switches them back on. Local key status is unchanged either way, so
-		// a key the user had disabled stays disabled.
-		rows, err := a.db.QueryContext(ctx, `SELECT vm2api_key_id FROM api_keys WHERE user_id = ? AND status = 'active'`, id)
-		if err != nil {
-			return fmt.Errorf("list keys to disable: %w", err)
-		}
-		defer rows.Close()
-		var keys []string
-		for rows.Next() {
-			var keyID string
-			if err := rows.Scan(&keyID); err != nil {
-				return err
-			}
-			keys = append(keys, keyID)
-		}
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		active := status == "active"
-		for _, keyID := range keys {
-			if err := a.client.UpdateKey(ctx, keyID, vm2api.UpdateKeyInput{Active: &active}); err != nil {
-				return fmt.Errorf("sync vm2api key %s: %w", keyID, err)
-			}
-		}
+	if err := a.syncScope(ctx, id); err != nil {
+		return fmt.Errorf("sync user scope: %w", err)
 	}
 	return nil
 }
@@ -142,7 +111,7 @@ func (a *usersAdapter) AdminList(ctx context.Context, filter api.AdminUserFilter
 }
 
 func (a *usersAdapter) toAdminDTO(ctx context.Context, u store.User) api.AdminUserDTO {
-	dto := api.AdminUserDTO{UserDTO: toUserDTO(u), VM2APIUserID: u.VM2APIUserID, Note: u.Note, LastLoginAt: u.LastLoginAt, LastLoginIP: u.LastLoginIP}
+	dto := api.AdminUserDTO{UserDTO: toUserDTO(u), VM2APIUserID: u.VM2APIUserID, VM2APIPoolID: u.VM2APIPoolID, Note: u.Note, LastLoginAt: u.LastLoginAt, LastLoginIP: u.LastLoginIP}
 	a.fillEntitlement(ctx, u.ID, &dto)
 	if a.sessions != nil {
 		dto.ActiveSessions, _ = a.sessions.CountActive(ctx, u.ID)
@@ -184,9 +153,8 @@ func (a *usersAdapter) RevokeSessions(ctx context.Context, id int64) error {
 }
 
 // Delete removes a user that never bought anything. Upstream keys go first, so
-// a key cannot outlive its owner and keep spending; the upstream user is only
-// disabled, never deleted (deleting a vm2api user hands its VMs back to the
-// platform pool).
+// a key cannot outlive its owner and keep spending. Delete the user's pool,
+// but only disable a legacy per-user identity, never the shared service user.
 func (a *usersAdapter) Delete(ctx context.Context, id int64) error {
 	u, err := a.users.GetByID(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
@@ -202,18 +170,21 @@ func (a *usersAdapter) Delete(ctx context.Context, id int64) error {
 	if records.Any() {
 		return userHasRecords(records)
 	}
-	rows, err := a.db.QueryContext(ctx, `SELECT vm2api_key_id FROM api_keys WHERE user_id = ? AND status <> 'deleted' AND vm2api_key_id <> ''`, id)
+	rows, err := a.db.QueryContext(ctx, `SELECT vm2api_key_id,previous_vm2api_key_ids FROM api_keys WHERE user_id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("list keys to delete: %w", err)
 	}
 	var keys []string
 	for rows.Next() {
-		var keyID string
-		if err := rows.Scan(&keyID); err != nil {
+		var keyID, previous string
+		if err := rows.Scan(&keyID, &previous); err != nil {
 			rows.Close()
 			return err
 		}
-		keys = append(keys, keyID)
+		keys = append(keys, store.DecodeStrings(previous)...)
+		if keyID != "" {
+			keys = append(keys, keyID)
+		}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -224,6 +195,9 @@ func (a *usersAdapter) Delete(ctx context.Context, id int64) error {
 			if err := a.client.DeleteKey(ctx, keyID); err != nil && !vm2api.IsStatus(err, 404) {
 				return fmt.Errorf("delete vm2api key %s: %w", keyID, err)
 			}
+		}
+		if err := a.deleteScope(ctx, id); err != nil {
+			return fmt.Errorf("delete user scope: %w", err)
 		}
 		if u.VM2APIUserID != "" {
 			if err := a.client.SetUserEnabled(ctx, u.VM2APIUserID, false); err != nil && !vm2api.IsStatus(err, 404) {

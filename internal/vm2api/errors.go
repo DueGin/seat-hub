@@ -27,6 +27,15 @@ func IsCode(err error, code string) bool {
 	return errors.As(err, &e) && e.Code == code
 }
 
+// ErrorCode returns the upstream error code, including through wrapped errors.
+func ErrorCode(err error) string {
+	var e *Error
+	if errors.As(err, &e) {
+		return e.Code
+	}
+	return ""
+}
+
 func IsStatus(err error, status int) bool {
 	var e *Error
 	return errors.As(err, &e) && e.Status == status

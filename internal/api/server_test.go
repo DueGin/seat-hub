@@ -229,11 +229,18 @@ func (fakeUsage) KeyStats(ctx context.Context, userID, keyID int64) ([]DailyDTO,
 type fakeKeys struct{}
 
 func (fakeKeys) List(ctx context.Context, userID int64) ([]KeyDTO, error) { return nil, nil }
-func (fakeKeys) Create(ctx context.Context, userID int64, name string) (KeyDTO, string, error) {
-	return KeyDTO{ID: 1, Name: name, Prefix: "sk-pt-AbCd"}, "sk-pt-AbCdEfGh", nil
+func (fakeKeys) Create(ctx context.Context, userID int64, in KeyInput) (KeyDTO, string, error) {
+	return KeyDTO{ID: 1, Name: in.Name, Prefix: "sk-pt-AbCd", Scope: KeyScopeDTO{Mode: "all", Accounts: []int64{}, Usable: true}}, "sk-pt-AbCdEfGh", nil
 }
-func (fakeKeys) Update(ctx context.Context, userID, id int64, name, status string) (KeyDTO, error) {
-	return KeyDTO{ID: id, Name: name, Status: status}, nil
+func (fakeKeys) Update(ctx context.Context, userID, id int64, in KeyPatch) (KeyDTO, error) {
+	item := KeyDTO{ID: id}
+	if in.Name != nil {
+		item.Name = *in.Name
+	}
+	if in.Status != nil {
+		item.Status = *in.Status
+	}
+	return item, nil
 }
 func (fakeKeys) Delete(ctx context.Context, userID, id int64) error { return nil }
 

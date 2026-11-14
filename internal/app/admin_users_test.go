@@ -204,7 +204,7 @@ func TestAdminDisableEnableSyncsUpstreamKeys(t *testing.T) {
 	dave.login("dave@example.com", password)
 	dave.mustOK(http.MethodPost, "/api/keys", `{"name":"笔记本"}`, nil)
 	var upstreamKey, upstreamUser string
-	if err := h.app.DB.QueryRow(`SELECT k.vm2api_key_id, u.vm2api_user_id FROM api_keys k JOIN users u ON u.id=k.user_id WHERE u.id=?`, user.ID).Scan(&upstreamKey, &upstreamUser); err != nil {
+	if err := h.app.DB.QueryRow(`SELECT k.vm2api_key_id, k.upstream_owner FROM api_keys k JOIN users u ON u.id=k.user_id WHERE u.id=?`, user.ID).Scan(&upstreamKey, &upstreamUser); err != nil {
 		t.Fatal(err)
 	}
 	id := strconv.FormatInt(user.ID, 10)
@@ -250,15 +250,15 @@ func TestAdminDeletesOnlyUsersWithoutRecords(t *testing.T) {
 	erin.login("erin@example.com", password)
 	erin.mustOK(http.MethodPost, "/api/keys", `{"name":"k"}`, nil)
 	var upstreamKey, upstreamUser string
-	if err := h.app.DB.QueryRow(`SELECT k.vm2api_key_id, u.vm2api_user_id FROM api_keys k JOIN users u ON u.id=k.user_id WHERE u.id=?`, user.ID).Scan(&upstreamKey, &upstreamUser); err != nil {
+	if err := h.app.DB.QueryRow(`SELECT k.vm2api_key_id, k.upstream_owner FROM api_keys k JOIN users u ON u.id=k.user_id WHERE u.id=?`, user.ID).Scan(&upstreamKey, &upstreamUser); err != nil {
 		t.Fatal(err)
 	}
 	h.mustOK(http.MethodDelete, "/api/admin/users/"+strconv.FormatInt(user.ID, 10), "", nil)
 	if exists, _ := h.fake.KeyState(upstreamKey); exists {
 		t.Fatal("upstream key survived the user")
 	}
-	if exists, enabled := h.fake.UserEnabled(upstreamUser); !exists || enabled {
-		t.Fatalf("upstream user should be kept but disabled: exists=%v enabled=%v", exists, enabled)
+	if exists, enabled := h.fake.UserEnabled(upstreamUser); !exists || !enabled {
+		t.Fatalf("shared service user must remain enabled: exists=%v enabled=%v", exists, enabled)
 	}
 	if erin.tryLogin("erin@example.com", password) == 200 {
 		t.Fatal("deleted user can still sign in")

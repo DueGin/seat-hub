@@ -92,6 +92,9 @@ func TestSwapsAuthorizationAndStripsClientHeaders(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages?beta=1", strings.NewReader(`{"model":"x"}`))
 	req.Header.Set("Authorization", "Bearer sk-pt-good")
 	req.Header.Set("X-Kin-Debug", "1")
+	req.Header.Set("X-Kin-Pin-Account", "other-user-vm")
+	req.Header["x-kIN-rewrite-model"] = []string{"unsafe"}
+	req.Header.Set("X-Kin-Future-Control", "1")
 	req.Header.Set("Cookie", "portal_session=secret")
 	req.Header.Set("X-Session-Id", "conv-1")
 	rec := httptest.NewRecorder()
@@ -103,7 +106,7 @@ func TestSwapsAuthorizationAndStripsClientHeaders(t *testing.T) {
 	if auth := r.Header.Get("Authorization"); auth != "Bearer sk-vm-up" {
 		t.Fatalf("authorization = %q", auth)
 	}
-	for _, h := range []string{"X-Kin-Debug", "Cookie"} {
+	for _, h := range []string{"X-Kin-Debug", "X-Kin-Pin-Account", "X-Kin-Rewrite-Model", "X-Kin-Future-Control", "Cookie"} {
 		if v := r.Header.Get(h); v != "" {
 			t.Fatalf("%s leaked upstream: %q", h, v)
 		}
@@ -113,6 +116,17 @@ func TestSwapsAuthorizationAndStripsClientHeaders(t *testing.T) {
 	}
 	if r.URL.Query().Get("beta") != "1" {
 		t.Fatal("query lost")
+	}
+}
+
+func TestSelectedKeyWithoutAccounts(t *testing.T) {
+	g, _ := newGateway(t, &Principal{Active: false, Reason: "key_no_accounts"}, http.NotFoundHandler())
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader("{}"))
+	req.Header.Set("Authorization", "Bearer sk-pt-good")
+	rec := httptest.NewRecorder()
+	g.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "该密钥可用的账号都已失效，请在「API 密钥」里重新选择账号") {
+		t.Fatalf("response = %d %s", rec.Code, rec.Body.String())
 	}
 }
 

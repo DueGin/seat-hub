@@ -18,9 +18,10 @@ import (
 // status and entitlement snapshot are cached for a few seconds. Writes
 // (disable key, change concurrency) invalidate through Invalidate.
 type resolver struct {
-	db      *sql.DB
-	box     *secret.Box
-	entitle func(ctx context.Context, userID int64) (concurrency int, activeAccounts int, err error)
+	db          *sql.DB
+	box         *secret.Box
+	entitle     func(ctx context.Context, userID int64) (concurrency int, activeAccounts int, err error)
+	schedulable func(ctx context.Context, userID int64) (map[int64]string, error)
 
 	mu    sync.Mutex
 	cache map[string]cachedPrincipal
@@ -32,8 +33,8 @@ type cachedPrincipal struct {
 	expires time.Time
 }
 
-func newResolver(db *sql.DB, box *secret.Box, entitle func(ctx context.Context, userID int64) (int, int, error)) *resolver {
-	return &resolver{db: db, box: box, entitle: entitle, cache: map[string]cachedPrincipal{}, ttl: 5 * time.Second}
+func newResolver(db *sql.DB, box *secret.Box, entitle func(ctx context.Context, userID int64) (int, int, error), schedulable func(context.Context, int64) (map[int64]string, error)) *resolver {
+	return &resolver{db: db, box: box, entitle: entitle, schedulable: schedulable, cache: map[string]cachedPrincipal{}, ttl: 5 * time.Second}
 }
 
 func (r *resolver) Invalidate() {
@@ -78,11 +79,13 @@ func (r *resolver) lookup(ctx context.Context, hash string) (*gateway.Principal,
 		status        string
 		userStatus    string
 		secretInvalid bool
+		scopeMode     string
+		scopeAccounts string
 	)
 	err := r.db.QueryRowContext(ctx, `
-		SELECT k.id, k.user_id, k.vm2api_secret_enc, k.status, u.status
+		SELECT k.id, k.user_id, k.vm2api_secret_enc, k.status, u.status, k.scope_mode, k.scope_accounts
 		FROM api_keys k JOIN users u ON u.id = k.user_id
-		WHERE k.key_hash = ?`, hash).Scan(&id, &userID, &secretEnc, &status, &userStatus)
+		WHERE k.key_hash = ?`, hash).Scan(&id, &userID, &secretEnc, &status, &userStatus, &scopeMode, &scopeAccounts)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -110,6 +113,22 @@ func (r *resolver) lookup(ctx context.Context, hash string) (*gateway.Principal,
 	p.Concurrency = concurrency
 	if accounts == 0 {
 		p.Active, p.Reason = false, "no_active_accounts"
+	}
+	if p.Active && scopeMode == "selected" {
+		vms, err := r.schedulable(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		usable := false
+		for _, id := range store.DecodeIDs(scopeAccounts) {
+			if vms[id] != "" {
+				usable = true
+				break
+			}
+		}
+		if !usable {
+			p.Active, p.Reason = false, "key_no_accounts"
+		}
 	}
 	return p, nil
 }

@@ -89,6 +89,7 @@ server {
 - 用 `docker compose pull && docker compose up -d` 拉取更新的镜像也照常有效：镜像里的版本更新时，会优先于 `/data/app/` 里较旧的下载版本运行。
 - 服务器访问 GitHub 需要代理的话，在 `.env` 里设置 `HTTPS_PROXY`。GitHub API 匿名访问的额度是每小时 60 次，状态页本身有 10 分钟的缓存，一般够用；不够的话设置 `PORTAL_UPDATE_TOKEN`（一个不需要任何权限的 token 即可）。
 - 每次更新和回滚都会记入审计日志（`system.update` / `system.rollback`）。
+- **从 v0.3.x 及更早版本升级到 v0.4.0**：首次启动会自动迁移账号体系（[KEY_SCOPE.md](KEY_SCOPE.md)）。vm2api 里会出现一个 `seathub_xxxxxxxx` 服务账号和每个用户一个 `sh-xxxxxxxx-u<用户ID>` 账号池；旧的 `portal_<用户ID>` 用户被停用但保留。用户的 `sk-pt-` 密钥不变，迁移时个别请求可能失败几秒。迁移失败会在后台「任务队列」里看到 `scope_migrate`，之后每 10 分钟的 `scope_reconcile` 会自动重试。不要在 vm2api 面板里手动改这些账号池和服务账号下的密钥，对账会把它们改回来。
 
 ## 5. 发版
 

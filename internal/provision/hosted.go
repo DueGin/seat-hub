@@ -44,7 +44,7 @@ func (service *Service) ProvisionHosted(ctx context.Context, resourceID int64) e
 	if account.SelfcheckState == "exhausted" {
 		return ErrSelfcheckExhausted
 	}
-	owner, err := service.upstreamUser(ctx, account.UserID)
+	owner, err := service.ServiceUser(ctx)
 	if err != nil {
 		return service.failResource(ctx, resourceID, err)
 	}
@@ -61,6 +61,18 @@ func (service *Service) ProvisionHosted(ctx context.Context, resourceID int64) e
 		if _, err := service.db.ExecContext(ctx, `UPDATE resources SET vm_id=?,updated_at=? WHERE id=?`, vm.ID, timestamp(service.now()), resourceID); err != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			defer cancel()
+			if _, markErr := service.db.ExecContext(cleanupCtx, `UPDATE resources SET vm_id=?,status='releasing',release_after=?,updated_at=? WHERE id=?`, vm.ID, timestamp(service.now()), timestamp(service.now()), resourceID); markErr != nil {
+				return errors.Join(fmt.Errorf("save hosted vm: %w", err), fmt.Errorf("record hosted cleanup: %w", markErr))
+			}
+			if _, queueErr := service.engine.Enqueue(cleanupCtx, "release_resource", jobPayload{ResourceID: resourceID}, fmt.Sprintf("release_resource:%d", resourceID), service.now(), 8); queueErr != nil {
+				return service.releaseError(cleanupCtx, resourceID, errors.Join(fmt.Errorf("save hosted vm: %w", err), queueErr))
+			}
+			if stopErr := service.client.SetSchedulable(cleanupCtx, vm.ID, false); stopErr != nil && !vm2api.IsStatus(stopErr, 404) {
+				return service.releaseError(cleanupCtx, resourceID, errors.Join(fmt.Errorf("save hosted vm: %w", err), stopErr))
+			}
+			if syncErr := service.SyncUserScope(cleanupCtx, account.UserID); syncErr != nil {
+				return service.releaseError(cleanupCtx, resourceID, errors.Join(fmt.Errorf("save hosted vm: %w", err), syncErr))
+			}
 			cleanupErr := service.client.DeleteVM(cleanupCtx, vm.ID)
 			return errors.Join(fmt.Errorf("save hosted vm: %w", err), cleanupErr)
 		}
@@ -114,7 +126,7 @@ func (service *Service) ensureOnboardable(ctx context.Context, account Account) 
 	if err != nil {
 		return err
 	}
-	owner, err := service.upstreamUser(ctx, account.UserID)
+	owner, err := service.ServiceUser(ctx)
 	if err != nil {
 		return err
 	}
@@ -385,7 +397,7 @@ func (service *Service) watchBootstrap(ctx context.Context, resourceID int64, de
 			return fmt.Errorf("commit bootstrap completion: %w", err)
 		}
 		service.syncAccountIdentity(ctx, account.VMID)
-		return nil
+		return service.syncScopeAfterAdd(ctx, account.UserID)
 	default:
 		return service.failResource(ctx, resourceID, fmt.Errorf("unknown bootstrap state: %s", bootstrap.State))
 	}

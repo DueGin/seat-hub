@@ -60,15 +60,109 @@ func panelCallTests() []panelCallTest {
 		},
 		{
 			name: "create key", method: http.MethodPost, path: "/api-keys",
-			body:     `{"name":"tenant","user_id":"user-one","max_concurrency":0}`,
+			body:     `{"name":"tenant","user_id":"user-one","max_concurrency":0,"group_type":"anthropic","vm_pool_id":"pool_1234abcd"}`,
 			response: `{"ok":true,"item":{"id":"key-one","key":"sk-vm-0123456789abcdef","key_prefix":"sk-vm-0123"}}`,
 			invoke: func(client *HTTPClient) error {
-				value, err := client.CreateKey(ctx, CreateKeyInput{Name: "tenant", UserID: ownerID, MaxConcurrency: -1})
+				value, err := client.CreateKey(ctx, CreateKeyInput{Name: "tenant", UserID: ownerID, MaxConcurrency: -1, Scope: KeyScope{PoolID: "pool_1234abcd"}})
 				if err == nil && value != (Key{ID: "key-one", Secret: "sk-vm-0123456789abcdef", Prefix: "sk-vm-0123"}) {
 					return fmt.Errorf("unexpected key: %+v", value)
 				}
 				return err
 			},
+		},
+		{
+			name: "create allowlist key", method: http.MethodPost, path: "/api-keys",
+			body:     `{"name":"selected","user_id":"user-one","max_concurrency":2,"group_type":"anthropic","allowed_vms":["vm-one","vm-two"],"vm_pool_id":null}`,
+			response: `{"ok":true,"item":{"id":"key-one","key":"sk-vm-0123456789abcdef","key_prefix":"sk-vm-0123"}}`,
+			invoke: func(client *HTTPClient) error {
+				_, err := client.CreateKey(ctx, CreateKeyInput{Name: "selected", UserID: ownerID, MaxConcurrency: 2, Scope: KeyScope{AllowedVMs: []string{"vm-one", "vm-two"}}})
+				return err
+			},
+		},
+		{
+			name: "update pool key", method: http.MethodPatch, path: "/api-keys/key-one",
+			body: `{"group_type":"anthropic","vm_pool_id":"pool_1234abcd"}`,
+			invoke: func(client *HTTPClient) error {
+				return client.UpdateKey(ctx, "key-one", UpdateKeyInput{Scope: &KeyScope{PoolID: "pool_1234abcd"}})
+			},
+		},
+		{
+			name: "update allowlist key", method: http.MethodPatch, path: "/api-keys/key-one",
+			body: `{"group_type":"anthropic","allowed_vms":["vm-one"],"vm_pool_id":null}`,
+			invoke: func(client *HTTPClient) error {
+				return client.UpdateKey(ctx, "key-one", UpdateKeyInput{Scope: &KeyScope{AllowedVMs: []string{"vm-one"}}})
+			},
+		},
+		{
+			name: "get key", method: http.MethodGet, path: "/api-keys/key-one/stats",
+			response: `{"ok":true,"item":{"id":"key-one","name":"name","user_id":"user-one","status":"active","max_concurrency":7,"group_type":"anthropic","allowed_vms":[],"vm_pool_id":"pool_1234abcd"}}`,
+			invoke: func(client *HTTPClient) error {
+				key, err := client.GetKey(ctx, "key-one")
+				want := KeyInfo{ID: "key-one", Name: "name", UserID: ownerID, Active: true, MaxConcurrency: 7, GroupType: "anthropic", PoolID: "pool_1234abcd", AllowedVMs: []string{}}
+				if err == nil && !reflect.DeepEqual(key, want) {
+					return fmt.Errorf("key=%+v, want=%+v", key, want)
+				}
+				return err
+			},
+		},
+		{
+			name: "list keys", method: http.MethodGet, path: "/api-keys",
+			response: `{"ok":true,"keys":[{"id":"key-one","user_id":"user-one","status":"disabled","group_type":"anthropic","allowed_vms":["vm-one"],"vm_pool_id":null},{"id":"other","user_id":"user-two","status":"active","group_type":"all","allowed_vms":[]}]}`,
+			invoke: func(client *HTTPClient) error {
+				keys, err := client.ListKeys(ctx, ownerID)
+				if err == nil && (len(keys) != 1 || keys[0].ID != "key-one" || keys[0].Active || keys[0].PoolID != "" || !reflect.DeepEqual(keys[0].AllowedVMs, []string{"vm-one"})) {
+					return fmt.Errorf("keys=%+v", keys)
+				}
+				return err
+			},
+		},
+		{
+			name: "list all keys", method: http.MethodGet, path: "/api-keys",
+			response: `{"ok":true,"keys":[{"id":"master","user_id":null,"status":"active","group_type":"all","allowed_vms":[]},{"id":"tenant","user_id":"user-one","status":"disabled","group_type":"anthropic","allowed_vms":["vm-one"]}]}`,
+			invoke: func(client *HTTPClient) error {
+				keys, err := client.ListKeys(ctx, "")
+				if err == nil && (len(keys) != 2 || keys[0].UserID != "" || !keys[0].Active || keys[1].Active) {
+					return fmt.Errorf("keys=%+v", keys)
+				}
+				return err
+			},
+		},
+		{
+			name: "list pools", method: http.MethodGet, path: "/vm-pools",
+			response: `{"ok":true,"data":{"pools":[{"id":"pool_1234abcd","name":"name","enabled":true,"vm_ids":["vm-one"]},{"id":"pool_abcd1234","name":"empty","enabled":false,"vm_ids":null}]}}`,
+			invoke: func(client *HTTPClient) error {
+				pools, err := client.ListPools(ctx)
+				if err == nil && (len(pools) != 2 || !pools[0].Enabled || !reflect.DeepEqual(pools[0].VMIDs, []string{"vm-one"}) || pools[1].Enabled || pools[1].VMIDs == nil) {
+					return fmt.Errorf("pools=%+v", pools)
+				}
+				return err
+			},
+		},
+		{
+			name: "create pool", method: http.MethodPost, path: "/vm-pools", body: `{"name":"name","vm_ids":["vm-one"],"enabled":true}`,
+			response: `{"ok":true,"data":{"pool":{"id":"pool_1234abcd","name":"name","enabled":true,"vm_ids":["vm-one"]}}}`,
+			invoke: func(client *HTTPClient) error {
+				pool, err := client.CreatePool(ctx, "name", []string{"vm-one"})
+				if err == nil && (pool.ID != "pool_1234abcd" || pool.Name != "name" || !pool.Enabled || !reflect.DeepEqual(pool.VMIDs, []string{"vm-one"})) {
+					return fmt.Errorf("pool=%+v", pool)
+				}
+				return err
+			},
+		},
+		{
+			name: "set pool members", method: http.MethodPatch, path: "/vm-pools/pool_1234abcd", body: `{"vm_ids":[],"enabled":true}`,
+			response: `{"ok":true,"data":{"pool":{"id":"pool_1234abcd","name":"name","enabled":true,"vm_ids":[]}}}`,
+			invoke: func(client *HTTPClient) error {
+				pool, err := client.SetPoolMembers(ctx, "pool_1234abcd", nil)
+				if err == nil && (!pool.Enabled || pool.VMIDs == nil || len(pool.VMIDs) != 0) {
+					return fmt.Errorf("pool=%+v", pool)
+				}
+				return err
+			},
+		},
+		{
+			name: "delete pool", method: http.MethodDelete, path: "/vm-pools/pool_1234abcd",
+			invoke: func(client *HTTPClient) error { return client.DeletePool(ctx, "pool_1234abcd") },
 		},
 		{
 			name: "update key", method: http.MethodPatch, path: "/api-keys/key-one",
@@ -318,7 +412,7 @@ func TestHTTPClientMethods(t *testing.T) {
 					response = `{"ok":true}`
 				}
 				writer.Header().Set("Content-Type", "application/json")
-				if test.name == "create user" || test.name == "create key" {
+				if test.name == "create user" || test.name == "create key" || test.name == "create allowlist key" || test.name == "create pool" {
 					writer.WriteHeader(http.StatusCreated)
 				}
 				_, _ = io.WriteString(writer, response)
@@ -367,6 +461,115 @@ func TestHTTPClientMethodErrors(t *testing.T) {
 				t.Fatal("error helpers did not preserve panel error")
 			}
 		})
+	}
+}
+
+func TestHTTPClientRejectsInvalidScopeWithoutRequest(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		t.Error("invalid scope sent upstream")
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+	client := NewHTTPClient(server.URL, "master", server.Client())
+	for _, scope := range []KeyScope{{}, {PoolID: "pool_1234abcd", AllowedVMs: []string{"vm-one"}}} {
+		if _, err := client.CreateKey(context.Background(), CreateKeyInput{Scope: scope}); !errors.Is(err, ErrInvalidScope) {
+			t.Fatalf("create scope=%+v: %v", scope, err)
+		}
+		if err := client.UpdateKey(context.Background(), "key-one", UpdateKeyInput{Scope: &scope}); !errors.Is(err, ErrInvalidScope) {
+			t.Fatalf("update scope=%+v: %v", scope, err)
+		}
+	}
+	if calls != 0 {
+		t.Fatalf("calls=%d", calls)
+	}
+}
+
+func TestHTTPClientPoolAndKeyErrors(t *testing.T) {
+	for _, tc := range []struct {
+		code   string
+		status int
+		invoke func(*HTTPClient) error
+	}{
+		{"vm_pool_name_taken", 409, func(c *HTTPClient) error { _, err := c.CreatePool(context.Background(), "pool", nil); return err }},
+		{"vm_in_other_pool", 409, func(c *HTTPClient) error {
+			_, err := c.SetPoolMembers(context.Background(), "pool_1234abcd", []string{"vm-one"})
+			return err
+		}},
+		{"vm_pool_in_use", 409, func(c *HTTPClient) error { return c.DeletePool(context.Background(), "pool_1234abcd") }},
+		{"vm_pool_not_found", 404, func(c *HTTPClient) error {
+			_, err := c.SetPoolMembers(context.Background(), "pool_1234abcd", nil)
+			return err
+		}},
+		{"vm_pool_not_found", 404, func(c *HTTPClient) error { return c.DeletePool(context.Background(), "pool_1234abcd") }},
+		{"vm_pool_vm_unknown", 400, func(c *HTTPClient) error {
+			_, err := c.CreatePool(context.Background(), "pool", []string{"unknown"})
+			return err
+		}},
+		{"", 404, func(c *HTTPClient) error { _, err := c.GetKey(context.Background(), "missing"); return err }},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": map[string]string{"code": tc.code, "message": "请求失败"}})
+			}))
+			defer server.Close()
+			err := fmt.Errorf("wrapped: %w", tc.invoke(NewHTTPClient(server.URL, "master", server.Client())))
+			if !IsStatus(err, tc.status) || ErrorCode(err) != tc.code {
+				t.Fatalf("err=%v code=%q", err, ErrorCode(err))
+			}
+		})
+	}
+	if ErrorCode(nil) != "" || ErrorCode(errors.New("not upstream")) != "" {
+		t.Fatal("unexpected code on ordinary error")
+	}
+}
+
+func TestHTTPClientMasterUsageQuery(t *testing.T) {
+	calls := 0
+	from := time.Date(2026, 11, 14, 0, 0, 0, 0, time.UTC)
+	until := from.Add(time.Hour)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		q := r.URL.Query()
+		if _, exists := q["user_id"]; exists {
+			t.Errorf("master view must omit user_id: %s", r.URL)
+		}
+		if r.Method != http.MethodGet {
+			t.Errorf("method=%s", r.Method)
+		}
+		startKey := "since"
+		if r.URL.Path == "/api/panel/billing" {
+			startKey = "from"
+			if q.Get("group_by") != "vm" && q.Get("group_by") != "key" {
+				t.Errorf("group=%q", q.Get("group_by"))
+			}
+		} else if r.URL.Path == "/api/panel/request-logs" {
+			if q.Get("api_key_id") != "key-one" || q.Get("vm_id") != "vm-one" || q.Get("limit") != "10" || q.Get("offset") != "10" {
+				t.Errorf("log query=%s", q.Encode())
+			}
+		} else if r.URL.Path != "/api/panel/request-logs/stats" {
+			t.Errorf("path=%s", r.URL.Path)
+		}
+		if q.Get(startKey) != from.Format(time.RFC3339) || q.Get("until") != until.Format(time.RFC3339) {
+			t.Errorf("time query=%s", q.Encode())
+		}
+		_, _ = io.WriteString(w, `{"ok":true,"data":{}}`)
+	}))
+	defer server.Close()
+	c := NewHTTPClient(server.URL, "master", server.Client())
+	if _, err := c.UserBilling(context.Background(), "", from, until); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.UserRequestLogs(context.Background(), "", LogQuery{From: from, Until: until, KeyID: "key-one", VMID: "vm-one", Page: 2, PageSize: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.UserRequestStats(context.Background(), "", from, until); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 4 {
+		t.Fatalf("calls=%d", calls)
 	}
 }
 
@@ -433,7 +636,7 @@ func TestHTTPClientRejectsMaskedKey(t *testing.T) {
 		_, _ = io.WriteString(writer, `{"ok":true,"item":{"id":"key","key":"sk-vm-01…cdef"}}`)
 	}))
 	defer server.Close()
-	key, err := NewHTTPClient(server.URL, "master", server.Client()).CreateKey(context.Background(), CreateKeyInput{})
+	key, err := NewHTTPClient(server.URL, "master", server.Client()).CreateKey(context.Background(), CreateKeyInput{Scope: KeyScope{PoolID: "pool_1234abcd"}})
 	if err == nil || key.Secret != "" {
 		t.Fatalf("masked key escaped as plaintext: %+v, %v", key, err)
 	}

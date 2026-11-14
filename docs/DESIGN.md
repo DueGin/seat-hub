@@ -13,7 +13,7 @@
 │                           ├ auth / 商品 / 订单 / 支付   ├ 门面 key → vm2api key 换头 │
 │                           ├ 权益 / 资源 / 托管上号        ├ 用户级并发闸               │
 │                           └ 用量视图（读 vm2api）        └ SSE / WebSocket 原样透传   │
-│ provision（后台任务）：建 vm2api 用户/密钥、建槽、分配/回收租赁号、到期回收、同步并发    │
+│ provision（后台任务）：建密钥与账号池、建槽、分配/回收租赁号、到期回收、同步并发与范围  │
 │ SQLite                                                                              │
 └──────────────────────────────────┬─────────────────────────────────────────────────┘
                                    │ Master key：/api/panel/*；用户 sk-vm-…：/v1/*
@@ -23,19 +23,21 @@
 
 - 门面只用 vm2api 的 **Master key** 调 `/api/panel/*`，永不下发给浏览器。
 - 用户流量：门面 key `sk-pt-…` → 查出该 key 对应的 vm2api 密钥 `sk-vm-…` → 换掉鉴权头 → 透传到 vm2api `/v1/*`。
-- vm2api 里每个门面用户对应一个 role=`user` 的 vm2api 用户。vm2api 对 `user_id` 归属的密钥只会调度到**该用户名下的 VM**（`src/lib/admin/resource-owner.mjs` `ownerScopeFromApiKey`），这正是「只用自己托管的号 + 自己租的号」。
+- **账号体系分离**：门面用户只存在于门面。vm2api 里只有一个「seat-hub 服务账号」（role=`user`），门面名下所有号和所有上游密钥都归它。vm2api 对 `user_id` 归属的密钥只会调度到该用户名下的 VM（`ownerScopeFromApiKey`），所以 Master key、其他渠道的密钥都碰不到门面的号。
+- **按密钥限定可调用的号**：每个门面用户在 vm2api 有一个账号池（`vm_pool_id`），成员是他当前持有的号。门面密钥要么绑定这个池（「全部账号」），要么用白名单只放行勾选的号（「指定账号」）。门面之间的用户隔离完全靠池成员和白名单，由 vm2api 强制执行；号被收回前先移出池和白名单。详见 [KEY_SCOPE.md](KEY_SCOPE.md)。
 
 ## 2. vm2api 原语映射
 
 | 门面概念 | vm2api 原语 |
 |---|---|
-| 门面用户 | `POST /api/panel/users`（role=user，`vm_create_quota=0`）。停用用 `PATCH /users/:id {enabled:false}`，**不删除**（删除会把 `admin_assigned` 槽收回平台池，托管号会泄漏进平台池） |
-| 门面 API key | `POST /api/panel/api-keys {name, user_id, group_type:"all", max_concurrency}`，明文只返回一次 → AES-GCM 加密落库 |
-| 租赁账号 | 平台池里的 Claude VM，`PATCH /api/panel/vms/:id/owner {user_id}` 独占给用户；到期 `{user_id:null}` 收回平台池 |
+| 服务账号 | 首次需要时 `POST /api/panel/users`（role=user，`vm_create_quota=0`）建一个，id 存 `settings.vm2api_service`。**不删除**（删除会把 `admin_assigned` 槽收回平台池） |
+| 门面用户 | 不在 vm2api 建用户；只建一个账号池 `POST /api/panel/vm-pools {name:"sh-…-u<id>", vm_ids}`，成员随持有的号同步（`PATCH /vm-pools/:id`） |
+| 门面 API key | `POST /api/panel/api-keys {name, user_id:<服务账号>, group_type:"anthropic", vm_pool_id \| allowed_vms, max_concurrency}`，明文只返回一次 → AES-GCM 加密落库。门面绝不发出 `group_type:"all"` 的密钥 |
+| 租赁账号 | 平台池里的 Claude VM，`PATCH /api/panel/vms/:id/owner {user_id:<服务账号>}` 并加入该用户的账号池；到期先移出池和白名单，再 `{user_id:null}` 收回平台池 |
 | 托管席位 | 门面以 admin 身份 `POST /api/panel/vms/create`（模板来自后台设置）→ `PATCH owner` → `POST allocate-proxy` → OAuth 授权链接上号。到期/删除：先调度关，宽限期后 `DELETE /vms/:id`（凭证随槽销毁），**绝不**收回平台池 |
 | 并发 | 门面网关按用户计数（权威）；同时把每个 vm2api key 的 `max_concurrency` 同步为用户总并发（兜底） |
 | 账号真实用量 | `GET /api/panel/vms/:id`：5h/7d 利用率与重置时间、`estimate_*`、`billing.today/window_5h/window_7d`、`usage_stats`（30 天）、`cred_status`、`schedule_state`、席位占用 |
-| 用户真实用量 | `GET /api/panel/billing?user_id=`、`GET /api/panel/request-logs?user_id=`、`GET /api/panel/request-logs/stats?user_id=`、`GET /api/panel/api-keys/:id/stats` |
+| 用户真实用量 | 按该用户的上游密钥汇总：`GET /api/panel/billing?group_by=key`、`GET /api/panel/request-logs?api_key_id=`、`GET /api/panel/api-keys/:id/stats` |
 
 vm2api 文档与源码（另一个仓库，只读参考）：`docs/PANEL_API.md`、`docs/API.md`、`docs/OAUTH.md`、`src/lib/admin/panel-routes.mjs`、`src/lib/admin/api-keys.mjs`、`src/lib/admin/resource-owner.mjs`。
 
@@ -93,8 +95,8 @@ active ──凭证失效（vm2api 不可调度 oauth_*）──▶ needs_reauth
 ## 6. 网关
 
 - 路径：`/v1/*`（含 `POST /v1/messages`、`/v1/chat/completions`、`/v1/completions`、`/v1/responses`、`GET /v1/responses` WebSocket、`GET /v1/models`、`GET /v1/usage`、`POST /v1/messages/count_tokens`）。按原路径转发到 `VM2API_BASE_URL`。
-- 鉴权：`Authorization: Bearer sk-pt-…` 或 `x-api-key`。缺失 401 `missing_api_key`；无效 401 `invalid_api_key`；用户停用 403 `user_disabled`；没有任何 `active` 资源 403 `no_active_accounts`。错误体用 Anthropic 形状 `{"type":"error","error":{"type":"…","message":"…"}}`，`/v1/chat/completions`、`/v1/completions`、`/v1/responses` 用 OpenAI 形状 `{"error":{"message","type","code"}}`。
-- 换头：删掉入站 `Authorization`、`x-api-key`、`Cookie`、hop-by-hop 头、`x-kin-debug`、`x-kin-log`、`x-kin-pin*`、`x-forwarded-*`；写 `Authorization: Bearer sk-vm-…`；其余（`anthropic-*`、`x-session-id`、`x-claude-code-session-id`、`x-kin-delivery`、`x-kin-cache-ttl`、`X-Request-ID`、`content-type`、`accept`…）原样带上。响应头原样回（去 hop-by-hop）。
+- 鉴权：`Authorization: Bearer sk-pt-…` 或 `x-api-key`。缺失 401 `missing_api_key`；无效 401 `invalid_api_key`；用户停用 403 `user_disabled`；没有任何 `active` 资源 403 `no_active_accounts`；「指定账号」的密钥所选账号都不可用 403 `key_no_accounts`。错误体用 Anthropic 形状 `{"type":"error","error":{"type":"…","message":"…"}}`，`/v1/chat/completions`、`/v1/completions`、`/v1/responses` 用 OpenAI 形状 `{"error":{"message","type","code"}}`。
+- 换头：删掉入站 `Authorization`、`x-api-key`、`Cookie`、hop-by-hop 头、**所有 `x-kin-*`**（vm2api 的调试、指定槽位、改写等内部控制头，客户端不能碰）、`x-forwarded-*`；写 `Authorization: Bearer sk-vm-…`；其余（`anthropic-*`、`x-session-id`、`x-claude-code-session-id`、`X-Request-ID`、`content-type`、`accept`…）原样带上。响应头原样回（去 hop-by-hop）。
 - 流式：请求体不缓冲；响应逐块 flush（`FlushInterval: -1`）；客户端断开即取消上游。WebSocket Upgrade 原样桥接，一条连接占 1 路并发直到关闭。
 - 并发：每用户内存计数器，满了立即 429 `concurrency_limit_exceeded`（带 `Retry-After: 1`）；可选排队 `gateway.queue_timeout_ms`（默认 0 = 不排队）。单实例部署；多实例需换成共享计数（不在 MVP）。
 - 不做本地计量。计费只看 vm2api。
@@ -121,7 +123,7 @@ active ──凭证失效（vm2api 不可调度 oauth_*）──▶ needs_reauth
 - SQLite（`modernc.org/sqlite`，纯 Go，无 CGO），WAL。迁移文件 `internal/store/migrations/*.sql` 按序执行。
 - 密码 argon2id。会话 Cookie `portal_session`（HttpOnly、SameSite=Lax、Secure 跟随 `PORTAL_PUBLIC_BASE_URL` 是否 https），7 天。写操作要求 `Content-Type: application/json`（挡表单 CSRF）。登录限速。
 - 门面 key：`sk-pt-` + 40 位 base62；落库 `HMAC-SHA256(PORTAL_SECRET_KEY, key)` 与前 10 位展示前缀。
-- `vm2api` 密钥明文、vm2api 用户密码、易支付商户密钥：AES-256-GCM（密钥由 `PORTAL_SECRET_KEY` 派生）。
+- `vm2api` 密钥明文、易支付商户密钥：AES-256-GCM（密钥由 `PORTAL_SECRET_KEY` 派生）。服务账号的密码随机生成、不落库（没人用它登录）。
 - 管理员：首次启动由 `PORTAL_ADMIN_EMAIL` / `PORTAL_ADMIN_PASSWORD` 灌入。
 
 ## 10. 配置（环境变量）

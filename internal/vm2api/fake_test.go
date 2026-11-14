@@ -69,7 +69,11 @@ func TestFakeHTTPHostedRoundTrip(t *testing.T) {
 	if err := client.SetUserEnabled(ctx, owner.ID, true); err != nil {
 		t.Fatal(err)
 	}
-	key, err := client.CreateKey(ctx, CreateKeyInput{Name: "托管密钥", UserID: owner.ID, MaxConcurrency: 999})
+	keyPool, err := client.CreatePool(ctx, "owner", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := client.CreateKey(ctx, CreateKeyInput{Name: "托管密钥", UserID: owner.ID, MaxConcurrency: 999, Scope: KeyScope{PoolID: keyPool.ID}})
 	if err != nil || !strings.HasPrefix(key.Secret, "sk-vm-") || key.Prefix != key.Secret[:10] {
 		t.Fatalf("create key = %+v, %v", key, err)
 	}
@@ -282,17 +286,21 @@ func TestFakeKeySecrecyAndHandlerErrors(t *testing.T) {
 	fake := NewFake()
 	owner := fakeTestUser(t, fake, "owner")
 	other := fakeTestUser(t, fake, "other")
-	key, err := fake.CreateKey(ctx, CreateKeyInput{UserID: owner.ID, MaxConcurrency: 999})
+	pool, err := fake.CreatePool(ctx, "owner", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fake.CreateKey(ctx, CreateKeyInput{UserID: other.ID}); err != nil {
+	key, err := fake.CreateKey(ctx, CreateKeyInput{UserID: owner.ID, MaxConcurrency: 999, Scope: KeyScope{PoolID: pool.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fake.CreateKey(ctx, CreateKeyInput{UserID: other.ID, Scope: KeyScope{PoolID: pool.ID}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := fake.CreateUser(ctx, "owner", "password"); !IsCode(err, "username_exists") || !IsStatus(err, 409) {
 		t.Fatalf("duplicate user = %v", err)
 	}
-	if _, err := fake.CreateKey(ctx, CreateKeyInput{UserID: "missing"}); !IsStatus(err, 404) {
+	if _, err := fake.CreateKey(ctx, CreateKeyInput{UserID: "missing", Scope: KeyScope{PoolID: pool.ID}}); !IsStatus(err, 404) {
 		t.Fatalf("missing owner = %v", err)
 	}
 	if fake.keys[key.ID].key.Secret != "" || fake.keys[key.ID].maxConcurrency != 128 {
@@ -321,7 +329,7 @@ func TestFakeKeySecrecyAndHandlerErrors(t *testing.T) {
 		{"PATCH", "/api/panel/api-keys/" + key.ID, "master", `{"status":"paused"}`, 400},
 		{"POST", "/api/panel/api-keys/" + key.ID + "/reveal", "master", `{}`, 409},
 		{"GET", "/api/panel/api-keys/" + key.ID, "master", "", 404},
-		{"GET", "/api/panel/billing", "master", "", 400},
+		{"GET", "/api/panel/billing", "master", "", 200},
 		{"GET", "/api/panel/billing?user_id=" + owner.ID + "&from=bad", "master", "", 400},
 		{"GET", "/api/panel/request-logs?user_id=" + owner.ID + "&limit=-1", "master", "", 400},
 		{"DELETE", "/api/panel/users/" + owner.ID, "master", "", 404},
@@ -416,7 +424,7 @@ func TestFakeConcurrentOperations(t *testing.T) {
 			if err := client.ExchangeCode(ctx, vm.ID, auth.SessionID, "code"); err != nil {
 				t.Error(err)
 			}
-			key, err := client.CreateKey(ctx, CreateKeyInput{UserID: owner.ID})
+			key, err := client.CreateKey(ctx, CreateKeyInput{UserID: owner.ID, Scope: KeyScope{AllowedVMs: []string{vm.ID}}})
 			if err != nil {
 				t.Error(err)
 				return

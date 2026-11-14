@@ -101,6 +101,8 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			msg = "你还没有可用的账号：请先购买托管席位并添加账号，或租用账号"
 		case "key_disabled":
 			msg = "该 API Key 已停用"
+		case "key_no_accounts":
+			msg = "该密钥可用的账号都已失效，请在「API 密钥」里重新选择账号"
 		}
 		writeErr(w, r, http.StatusForbidden, p.Reason, msg)
 		return
@@ -154,10 +156,15 @@ func (g *Gateway) rewrite(pr *httputil.ProxyRequest) {
 
 	for _, h := range []string{
 		"Authorization", "X-Api-Key", "Cookie", "Proxy-Authorization",
-		"X-Kin-Debug", "X-Kin-Log", "X-Kin-Pin-Vm", "X-Forwarded-For",
+		"X-Forwarded-For",
 		"X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-Ip",
 	} {
 		pr.Out.Header.Del(h)
+	}
+	for h := range pr.Out.Header {
+		if strings.HasPrefix(strings.ToLower(h), "x-kin-") {
+			delete(pr.Out.Header, h)
+		}
 	}
 	if p := principalFrom(pr.In.Context()); p != nil {
 		pr.Out.Header.Set("Authorization", "Bearer "+p.UpstreamSecret)

@@ -33,6 +33,7 @@ type Fake struct {
 	sequence  uint64
 	users     map[string]User
 	keys      map[string]fakeKey
+	pools     map[string]Pool
 	vms       map[string]VM
 	sessions  map[string]fakeSession
 	bootstrap map[string]int
@@ -57,6 +58,8 @@ type fakeKey struct {
 	name, userID, suffix string
 	active               bool
 	maxConcurrency       int
+	groupType, poolID    string
+	allowedVMs           []string
 	createdAt, updatedAt time.Time
 }
 
@@ -80,6 +83,7 @@ func (fake *Fake) initLocked() {
 	if fake.users == nil {
 		fake.users = make(map[string]User)
 		fake.keys = make(map[string]fakeKey)
+		fake.pools = make(map[string]Pool)
 		fake.vms = make(map[string]VM)
 		fake.sessions = make(map[string]fakeSession)
 		fake.bootstrap = make(map[string]int)
@@ -233,12 +237,33 @@ func (fake *Fake) SetUserEnabled(ctx context.Context, userID string, enabled boo
 }
 
 func (fake *Fake) CreateKey(ctx context.Context, in CreateKeyInput) (Key, error) {
+	if !in.Scope.Valid() {
+		return Key{}, ErrInvalidScope
+	}
+	return fake.createKey(ctx, in, false)
+}
+
+// createKey stores a key. unscoped mirrors vm2api accepting a key with no
+// group_type / allowed_vms / vm_pool_id as group_type=all: the Go Client never
+// sends one, but older seat-hub releases did, and the mock must still serve
+// them so upgrades can be rehearsed against it.
+func (fake *Fake) createKey(ctx context.Context, in CreateKeyInput, unscoped bool) (Key, error) {
 	if err := fake.begin(ctx); err != nil {
 		return Key{}, err
 	}
 	defer fake.mu.Unlock()
-	if _, exists := fake.users[in.UserID]; !exists {
+	if _, exists := fake.users[in.UserID]; in.UserID != "" && !exists {
 		return Key{}, fakeMissing("user")
+	}
+	groupType := "anthropic"
+	var scope KeyScope
+	if unscoped {
+		groupType = "all"
+	} else {
+		var err error
+		if scope, err = fake.validateScopeLocked(in.Scope); err != nil {
+			return Key{}, err
+		}
 	}
 	secretBytes := make([]byte, 32)
 	if _, err := rand.Read(secretBytes); err != nil {
@@ -255,12 +280,16 @@ func (fake *Fake) CreateKey(ctx context.Context, in CreateKeyInput) (Key, error)
 		key: key, secret: secret, name: string([]rune(name)[:min(100, len([]rune(name)))]),
 		userID: in.UserID, suffix: secret[len(secret)-4:], active: true,
 		maxConcurrency: fakeClampConcurrency(in.MaxConcurrency), createdAt: stamp, updatedAt: stamp,
+		groupType: groupType, poolID: scope.PoolID, allowedVMs: scope.AllowedVMs,
 	}
 	key.Secret = secret
 	return key, nil
 }
 
 func (fake *Fake) UpdateKey(ctx context.Context, keyID string, in UpdateKeyInput) error {
+	if in.Scope != nil && !in.Scope.Valid() {
+		return ErrInvalidScope
+	}
 	if err := fake.begin(ctx); err != nil {
 		return err
 	}
@@ -268,6 +297,13 @@ func (fake *Fake) UpdateKey(ctx context.Context, keyID string, in UpdateKeyInput
 	record, exists := fake.keys[keyID]
 	if !exists {
 		return fakeMissing("api_key")
+	}
+	if in.Scope != nil {
+		scope, err := fake.validateScopeLocked(*in.Scope)
+		if err != nil {
+			return err
+		}
+		record.groupType, record.poolID, record.allowedVMs = "anthropic", scope.PoolID, scope.AllowedVMs
 	}
 	if in.Name != nil {
 		name := []rune(strings.TrimSpace(*in.Name))
@@ -464,6 +500,10 @@ func (fake *Fake) DeleteVM(ctx context.Context, vmID string) error {
 		return fakeMissing("vm")
 	}
 	delete(fake.vms, vmID)
+	for id, pool := range fake.pools {
+		pool.VMIDs = slices.DeleteFunc(pool.VMIDs, func(id string) bool { return id == vmID })
+		fake.pools[id] = pool
+	}
 	delete(fake.bootstrap, vmID)
 	fake.clearSessionsLocked(vmID)
 	return nil
@@ -631,7 +671,7 @@ func (fake *Fake) UserBilling(ctx context.Context, userID string, from, until ti
 		return UserBilling{}, err
 	}
 	defer fake.mu.Unlock()
-	if _, exists := fake.users[userID]; !exists {
+	if _, exists := fake.users[userID]; userID != "" && !exists {
 		return UserBilling{}, fakeMissing("user")
 	}
 	rows := fake.logsLocked(userID, "", "", from, until)
@@ -674,7 +714,7 @@ func (fake *Fake) UserRequestLogs(ctx context.Context, userID string, query LogQ
 		return LogPage{}, err
 	}
 	defer fake.mu.Unlock()
-	if _, exists := fake.users[userID]; !exists {
+	if _, exists := fake.users[userID]; userID != "" && !exists {
 		return LogPage{}, fakeMissing("user")
 	}
 	if query.Status != "" && query.Status != "success" && query.Status != "error" {
@@ -715,7 +755,7 @@ func (fake *Fake) UserRequestStats(ctx context.Context, userID string, from, unt
 		return RequestStats{}, err
 	}
 	defer fake.mu.Unlock()
-	if _, exists := fake.users[userID]; !exists {
+	if _, exists := fake.users[userID]; userID != "" && !exists {
 		return RequestStats{}, fakeMissing("user")
 	}
 	rows := fake.logsLocked(userID, "", "", from, until)
@@ -811,6 +851,7 @@ func (fake *Fake) keyWire(keyID string) (map[string]any, error) {
 		"id": keyID, "name": record.name, "key": record.key.Prefix[:8] + "…" + record.suffix,
 		"key_prefix": record.key.Prefix, "revealable": false, "status": status,
 		"user_id": record.userID, "max_concurrency": record.maxConcurrency,
+		"group_type": record.groupType, "allowed_vms": append([]string{}, record.allowedVMs...), "vm_pool_id": fakeNullableString(record.poolID),
 		"created_at": record.createdAt, "updated_at": record.updatedAt, "category": "oauth",
 		"requests": 0, "tokens_in": 0, "tokens_out": 0, "quota_used": 0,
 	}, nil
@@ -863,6 +904,13 @@ func fakeLogWire(row LogRow) map[string]any {
 
 func fakeOK(data any) map[string]any {
 	return map[string]any{"ok": true, "data": data}
+}
+
+func fakeNullableString(value string) any {
+	if value == "" {
+		return nil
+	}
+	return value
 }
 
 func fakeDecodeBody[T any](request *http.Request) (T, error) {
@@ -960,11 +1008,18 @@ func (fake *Fake) panel(request *http.Request) (int, any, error) {
 				Name           string `json:"name"`
 				UserID         string `json:"user_id"`
 				MaxConcurrency int    `json:"max_concurrency"`
+				fakeScopeWire
 			}](request)
 			if err != nil {
 				return 0, nil, err
 			}
-			key, err := fake.CreateKey(ctx, CreateKeyInput{Name: body.Name, UserID: body.UserID, MaxConcurrency: body.MaxConcurrency})
+			input := CreateKeyInput{Name: body.Name, UserID: body.UserID, MaxConcurrency: body.MaxConcurrency}
+			var key Key
+			if body.unscoped() {
+				key, err = fake.createKey(ctx, input, true)
+			} else if input.Scope, err = body.scope(); err == nil {
+				key, err = fake.CreateKey(ctx, input)
+			}
 			if err != nil {
 				return 0, nil, err
 			}
@@ -998,6 +1053,9 @@ func (fake *Fake) panel(request *http.Request) (int, any, error) {
 			}
 			return 200, map[string]any{"ok": true, "keys": items, "total": len(items), "active": active}, nil
 		}
+	}
+	if path == "/api/panel/vm-pools" || strings.HasPrefix(path, "/api/panel/vm-pools/") {
+		return fake.panelPool(request)
 	}
 	if path == "/api/panel/vms" && method == http.MethodGet {
 		filter := VMFilter{Unowned: request.URL.Query().Get("unowned") == "true", ClaudeOnly: request.URL.Query().Get("claude_only") == "true"}
@@ -1119,11 +1177,19 @@ func (fake *Fake) panelKey(request *http.Request, id string, suffix []string) (i
 			Name           *string `json:"name"`
 			Status         *string `json:"status"`
 			MaxConcurrency *int    `json:"max_concurrency"`
+			fakeScopeWire
 		}](request)
 		if err != nil {
 			return 0, nil, err
 		}
 		input := UpdateKeyInput{Name: body.Name, MaxConcurrency: body.MaxConcurrency}
+		if body.GroupType != nil || body.AllowedVMs != nil || body.PoolID != nil {
+			scope, err := body.scope()
+			if err != nil {
+				return 0, nil, err
+			}
+			input.Scope = &scope
+		}
 		if body.Status != nil {
 			if *body.Status != "active" && *body.Status != "disabled" {
 				return 0, nil, fakeError(400, "invalid_status", "invalid key status")
@@ -1273,9 +1339,6 @@ func (fake *Fake) panelVM(request *http.Request, id string, suffix []string) (in
 func (fake *Fake) panelUsage(request *http.Request) (int, any, error) {
 	ctx, query := request.Context(), request.URL.Query()
 	owner := query.Get("user_id")
-	if owner == "" {
-		return 0, nil, fakeError(400, "user_id_required", "user_id required")
-	}
 	from, err := fakeQueryTime(request, "since", "from")
 	if err != nil {
 		return 0, nil, err
@@ -1348,7 +1411,7 @@ func (fake *Fake) panelUsage(request *http.Request) (int, any, error) {
 			return 0, nil, err
 		}
 		defer fake.mu.Unlock()
-		if _, exists := fake.users[owner]; !exists {
+		if _, exists := fake.users[owner]; owner != "" && !exists {
 			return 0, nil, fakeMissing("user")
 		}
 		if status := query.Get("status"); status != "" && status != "success" && status != "error" {

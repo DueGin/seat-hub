@@ -16,6 +16,7 @@ type User struct {
 	Role              string `json:"role"`
 	Status            string `json:"status"`
 	VM2APIUserID      string `json:"vm2api_user_id"`
+	VM2APIPoolID      string `json:"vm2api_pool_id"`
 	VM2APIUsername    string `json:"vm2api_username"`
 	VM2APIPasswordEnc string `json:"-"`
 	CreatedAt         string `json:"created_at"`
@@ -32,13 +33,13 @@ func NewUsers(db *DB) *Users { return &Users{db: db} }
 
 const userColumns = `id, email, password_hash, role, status,
 	COALESCE(vm2api_user_id,''), COALESCE(vm2api_username,''), COALESCE(vm2api_password_enc,''),
-	created_at, updated_at, note, COALESCE(last_login_at,''), COALESCE(last_login_ip,'')`
+	created_at, updated_at, note, COALESCE(last_login_at,''), COALESCE(last_login_ip,''), COALESCE(vm2api_pool_id,'')`
 
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
 	err := row.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.Role, &u.Status,
 		&u.VM2APIUserID, &u.VM2APIUsername, &u.VM2APIPasswordEnc, &u.CreatedAt, &u.UpdatedAt,
-		&u.Note, &u.LastLoginAt, &u.LastLoginIP)
+		&u.Note, &u.LastLoginAt, &u.LastLoginIP, &u.VM2APIPoolID)
 	return u, err
 }
 

@@ -40,6 +40,7 @@ func newProvisioner(
 	logger *slog.Logger,
 ) *provisioner {
 	prov := provision.New(db.DB, client)
+	prov.Box = box
 	use := usage.New(db.DB, client)
 	keysAndAdmin := portal.New(db, client, box, prov)
 	p := &provisioner{
@@ -49,6 +50,7 @@ func newProvisioner(
 			db:       db.DB,
 			settings: settings,
 			keyStats: client.KeyStats,
+			keyLogs:  client.UserRequestLogs,
 		},
 		svc:   prov,
 		keys:  keysAndAdmin,
@@ -97,12 +99,12 @@ func (a *keyAdapter) List(ctx context.Context, userID int64) ([]api.KeyDTO, erro
 	return a.inner.List(ctx, userID)
 }
 
-func (a *keyAdapter) Create(ctx context.Context, userID int64, name string) (api.KeyDTO, string, error) {
-	return a.inner.Create(ctx, userID, name)
+func (a *keyAdapter) Create(ctx context.Context, userID int64, in api.KeyInput) (api.KeyDTO, string, error) {
+	return a.inner.Create(ctx, userID, in)
 }
 
-func (a *keyAdapter) Update(ctx context.Context, userID, id int64, name, status string) (api.KeyDTO, error) {
-	return a.inner.Update(ctx, userID, id, name, status)
+func (a *keyAdapter) Update(ctx context.Context, userID, id int64, in api.KeyPatch) (api.KeyDTO, error) {
+	return a.inner.Update(ctx, userID, id, in)
 }
 
 func (a *keyAdapter) Delete(ctx context.Context, userID, id int64) error {
