@@ -850,3 +850,29 @@ func TestFakeHTTPSelfcheckErrors(t *testing.T) {
 		})
 	}
 }
+
+// vm2api emits reset times as RFC3339, epoch milliseconds, or (reset_5h,
+// copied from Anthropic's headers) epoch seconds as a string. All must parse,
+// and an odd value must not fail the response it belongs to.
+func TestPanelTimeAcceptsEveryVm2apiShape(t *testing.T) {
+	want := time.Date(2026, 11, 13, 13, 50, 0, 0, time.UTC)
+	for _, raw := range []string{
+		`"2026-11-13T13:50:00Z"`, `"2026-11-13T21:50:00+08:00"`,
+		`1794577800`, `"1794577800"`, `1794577800000`, `"1794577800000"`, `1794577800.0`,
+	} {
+		var value panelTime
+		if err := json.Unmarshal([]byte(raw), &value); err != nil || !value.Time.Equal(want) {
+			t.Errorf("%s: time=%v err=%v", raw, value.Time, err)
+		}
+	}
+	for _, raw := range []string{`null`, `""`, `"  "`, `0`, `-5`, `"soon"`, `true`, `{}`} {
+		var value panelTime
+		if err := json.Unmarshal([]byte(raw), &value); err != nil || !value.Time.IsZero() {
+			t.Errorf("%s: time=%v err=%v", raw, value.Time, err)
+		}
+	}
+	var vm panelVM
+	if err := json.Unmarshal([]byte(`{"id":"vm-1","reset_5h":"1794577800","reset_7d":"later"}`), &vm); err != nil || !vm.Reset5h.Time.Equal(want) || !vm.Reset7d.Time.IsZero() {
+		t.Fatalf("vm=%+v err=%v", vm, err)
+	}
+}

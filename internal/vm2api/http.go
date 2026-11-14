@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -322,28 +323,38 @@ func (status *panelCredentialStatus) UnmarshalJSON(raw []byte) error {
 
 type panelTime struct{ time.Time }
 
+// UnmarshalJSON accepts every shape vm2api emits for a reset time: RFC3339
+// text, or a Unix timestamp in seconds or milliseconds, as a JSON number or a
+// numeric string (reset_5h is copied verbatim from Anthropic's rate-limit
+// headers, which are epoch seconds as text). These times are informational,
+// so an unrecognised value is left empty rather than failing the whole
+// response it is part of.
 func (value *panelTime) UnmarshalJSON(raw []byte) error {
-	if string(raw) == "null" || string(raw) == `""` {
+	text := strings.TrimSpace(string(raw))
+	if text == "null" {
 		return nil
 	}
-	if len(raw) > 0 && raw[0] == '"' {
-		var encoded string
-		if err := json.Unmarshal(raw, &encoded); err != nil {
-			return fmt.Errorf("decode panel time: %w", err)
+	if strings.HasPrefix(text, `"`) {
+		var decoded string
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			return nil
 		}
-		parsed, err := time.Parse(time.RFC3339Nano, encoded)
-		if err != nil {
-			return fmt.Errorf("parse panel time: %w", err)
-		}
+		text = strings.TrimSpace(decoded)
+	}
+	if text == "" {
+		return nil
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, text); err == nil {
 		value.Time = parsed.UTC()
 		return nil
 	}
-	var milliseconds int64
-	if err := json.Unmarshal(raw, &milliseconds); err != nil {
-		return fmt.Errorf("decode panel timestamp: %w", err)
-	}
-	if milliseconds > 0 {
-		value.Time = time.UnixMilli(milliseconds).UTC()
+	if epoch, err := strconv.ParseFloat(text, 64); err == nil && epoch > 0 && !math.IsInf(epoch, 0) {
+		// Seconds until the year 5138; anything larger is milliseconds.
+		if epoch < 1e11 {
+			value.Time = time.UnixMilli(int64(epoch * 1000)).UTC()
+		} else {
+			value.Time = time.UnixMilli(int64(epoch)).UTC()
+		}
 	}
 	return nil
 }
