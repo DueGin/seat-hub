@@ -344,8 +344,36 @@ type UserStore interface {
 	SetStatus(ctx context.Context, id int64, status string) error
 	SetRole(ctx context.Context, id int64, role string) error
 	List(ctx context.Context, q string, page, pageSize int) ([]UserDTO, int64, error)
-	AdminList(ctx context.Context, q string, page, pageSize int) ([]AdminUserDTO, int64, error)
+	AdminList(ctx context.Context, filter AdminUserFilter, page, pageSize int) ([]AdminUserDTO, int64, error)
 	AdminDetail(ctx context.Context, id int64) (AdminUserDTO, error)
+	SetEmail(ctx context.Context, id int64, email string) error
+	SetNote(ctx context.Context, id int64, note string) error
+	// Records counts orders, subscriptions and resources; any of them blocks Delete.
+	Records(ctx context.Context, id int64) (UserRecordsDTO, error)
+	// Delete removes a user without business records, its keys (upstream too) and sessions.
+	Delete(ctx context.Context, id int64) error
+	Sessions(ctx context.Context, id int64) ([]SessionDTO, error)
+	RevokeSessions(ctx context.Context, id int64) error
+}
+
+// AdminUserFilter narrows the admin user list; empty fields match everything.
+type AdminUserFilter struct {
+	Q      string
+	Role   string
+	Status string
+}
+
+type UserRecordsDTO struct {
+	Orders        int64 `json:"orders"`
+	Subscriptions int64 `json:"subscriptions"`
+	Resources     int64 `json:"resources"`
+}
+
+type SessionDTO struct {
+	CreatedAt string `json:"created_at"`
+	ExpiresAt string `json:"expires_at"`
+	IP        string `json:"ip"`
+	UserAgent string `json:"user_agent"`
 }
 
 type AdminUserDTO struct {
@@ -357,6 +385,10 @@ type AdminUserDTO struct {
 	RentalTotal      int    `json:"rental_total"`
 	VM2APIUserID     string `json:"vm2api_user_id"`
 	BaseURL          string `json:"-"`
+	Note             string `json:"note"`
+	LastLoginAt      string `json:"last_login_at"`
+	LastLoginIP      string `json:"last_login_ip"`
+	ActiveSessions   int64  `json:"active_sessions"`
 }
 
 type SettingsStore interface {

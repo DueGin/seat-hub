@@ -62,6 +62,40 @@ func (r *Sessions) DeleteAll(ctx context.Context, userID int64) error {
 	return err
 }
 
+// ActiveSession is a signed-in device, as the admin console lists it.
+type ActiveSession struct {
+	CreatedAt string `json:"created_at"`
+	ExpiresAt string `json:"expires_at"`
+	IP        string `json:"ip"`
+	UserAgent string `json:"user_agent"`
+}
+
+// ListActive returns the user's unexpired sessions, newest first.
+func (r *Sessions) ListActive(ctx context.Context, userID int64) ([]ActiveSession, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT created_at, expires_at, COALESCE(ip,''), COALESCE(user_agent,'')
+		FROM sessions WHERE user_id = ? AND julianday(expires_at) > julianday(?) ORDER BY created_at DESC LIMIT 50`, userID, Now())
+	if err != nil {
+		return nil, fmt.Errorf("list sessions: %w", err)
+	}
+	defer rows.Close()
+	out := []ActiveSession{}
+	for rows.Next() {
+		var item ActiveSession
+		if err := rows.Scan(&item.CreatedAt, &item.ExpiresAt, &item.IP, &item.UserAgent); err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, rows.Err()
+}
+
+// CountActive is how many devices the user is signed in on.
+func (r *Sessions) CountActive(ctx context.Context, userID int64) (int64, error) {
+	var n int64
+	err := r.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM sessions WHERE user_id = ? AND julianday(expires_at) > julianday(?)`, userID, Now()).Scan(&n)
+	return n, err
+}
+
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

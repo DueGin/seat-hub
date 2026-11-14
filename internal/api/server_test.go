@@ -92,9 +92,19 @@ func (fakeUsers) SetRole(ctx context.Context, id int64, role string) error     {
 func (fakeUsers) List(ctx context.Context, q string, page, size int) ([]UserDTO, int64, error) {
 	return nil, 0, nil
 }
-func (fakeUsers) AdminList(ctx context.Context, q string, page, size int) ([]AdminUserDTO, int64, error) {
+func (fakeUsers) AdminList(ctx context.Context, filter AdminUserFilter, page, size int) ([]AdminUserDTO, int64, error) {
 	return nil, 0, nil
 }
+func (fakeUsers) SetEmail(ctx context.Context, id int64, email string) error { return nil }
+func (fakeUsers) SetNote(ctx context.Context, id int64, note string) error   { return nil }
+func (fakeUsers) Records(ctx context.Context, id int64) (UserRecordsDTO, error) {
+	return UserRecordsDTO{}, nil
+}
+func (fakeUsers) Delete(ctx context.Context, id int64) error { return nil }
+func (fakeUsers) Sessions(ctx context.Context, id int64) ([]SessionDTO, error) {
+	return []SessionDTO{}, nil
+}
+func (fakeUsers) RevokeSessions(ctx context.Context, id int64) error { return nil }
 func (fakeUsers) AdminDetail(ctx context.Context, id int64) (AdminUserDTO, error) {
 	return AdminUserDTO{UserDTO: UserDTO{ID: id}}, nil
 }

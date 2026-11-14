@@ -41,7 +41,9 @@ export interface NormalizedSettings extends Omit<Settings, 'payment'> {
   payment: { epay: { enabled: boolean; gateway_url: string; pid: string; key: string; types: string[] }; manual: { enabled: boolean; instructions: string } }
 }
 export interface AdminDashboard { users: number; paying_users: number; revenue_cents_30d: number; orders_pending: number; accounts: { hosted_active: number; rental_active: number; failed: number }; rental_pool: { total: number; available: number; leased: number; maintenance: number }; vm2api: { ok: boolean; version: string; latency_ms: number; error: string | null } }
-export interface AdminUser extends User { concurrency_total: number; hosted_used: number; hosted_total: number; rental_used: number; rental_total: number; vm2api_user_id: string | null }
+export interface AdminUser extends User { concurrency_total: number; hosted_used: number; hosted_total: number; rental_used: number; rental_total: number; vm2api_user_id: string | null; note: string; last_login_at: string; last_login_ip: string; active_sessions: number }
+export interface UserSession { created_at: string; expires_at: string; ip: string; user_agent: string }
+export interface UserRecords { orders: number; subscriptions: number; resources: number }
 export interface PoolCandidate { vm_id: string; label: string; email_masked: string; cred_status: string; schedule_state: string; tier: string | null }
 export interface PoolItem { vm_id: string; tier: string | null; status: 'available' | 'leased' | 'maintenance'; leased_to_user_id?: number | null; leased_to_email?: string | null; note: string; vm: Omit<PoolCandidate, 'vm_id'> & { five_hour: UsageWindow | null; seven_day: UsageWindow | null }; selfcheck: Selfcheck | null }
 export interface Job { id: number; type: string; status: string; attempts: number; run_after: string; last_error: string | null; payload: unknown; created_at: string; updated_at: string }

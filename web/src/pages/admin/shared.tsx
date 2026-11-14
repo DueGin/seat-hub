@@ -4,7 +4,7 @@ import { toast } from 'sonner'
 import type { ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from 'react'
 import { Button, Field, FieldInput, Modal, Notice, Pagination } from '@/components/ui'
 
-export function useAdminMutation<T>(operation: (input: T) => Promise<unknown>, message: string, onSuccess?: () => void) {
+export function useAdminMutation<T, R = unknown>(operation: (input: T) => Promise<R>, message: string, onSuccess?: () => void) {
   const client = useQueryClient()
   return useMutation({
     mutationFn: operation,

@@ -1,4 +1,4 @@
-import{b as D,r as h,h as K,t as J,j as e,i as U,P as G,f as i,N as p,C as Q,R as V,Q as R,E as F,K as W,q as X,p as q,M as k,F as Z,e as ee,n as $,x as se,l as u}from"./index-NYEvX_5y.js";import{u as L}from"./useMutation-Barz6sQs.js";import{a as H,n as x,u as E,d as ae}from"./format-CqbfF7nU.js";import{P as te}from"./plus-Cwe8bDUw.js";function I(a){return`'${a.replace(/'/g,"'\\''")}'`}function le(a){return{curl:`export PORTAL_API_KEY='替换为你的 API Key'
+import{b as D,r as h,h as K,t as J,j as e,i as U,P as G,f as i,N as p,C as Q,R as V,Q as R,E as F,K as W,q as X,p as q,M as k,F as Z,e as ee,n as $,x as se,l as u}from"./index-BYhejBLU.js";import{u as L}from"./useMutation-Cqe2t7Ax.js";import{a as H,n as x,u as E,d as ae}from"./format-CqbfF7nU.js";import{P as te}from"./plus-BjHleHm5.js";function I(a){return`'${a.replace(/'/g,"'\\''")}'`}function le(a){return{curl:`export PORTAL_API_KEY='替换为你的 API Key'
 
 # List available models first.
 curl ${I(`${a}/v1/models`)} \\

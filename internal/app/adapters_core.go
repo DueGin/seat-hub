@@ -20,9 +20,10 @@ import (
 
 // usersAdapter implements api.UserStore over the SQLite repositories.
 type usersAdapter struct {
-	users  *store.Users
-	db     *sql.DB
-	client vm2api.Client
+	users    *store.Users
+	db       *sql.DB
+	client   vm2api.Client
+	sessions *store.Sessions
 	// entitle is injected by the wiring layer (provision.Service.Entitlements).
 	// It is a function rather than a concrete service to keep this package's
 	// dependency graph acyclic.
@@ -83,7 +84,10 @@ func (a *usersAdapter) SetStatus(ctx context.Context, id int64, status string) e
 		// admin console can retry instead of silently diverging.
 		return fmt.Errorf("sync vm2api user state: %w", err)
 	}
-	if status != "active" {
+	{
+		// Disabling switches the user's active keys off upstream; enabling
+		// switches them back on. Local key status is unchanged either way, so
+		// a key the user had disabled stays disabled.
 		rows, err := a.db.QueryContext(ctx, `SELECT vm2api_key_id FROM api_keys WHERE user_id = ? AND status = 'active'`, id)
 		if err != nil {
 			return fmt.Errorf("list keys to disable: %w", err)
@@ -100,10 +104,10 @@ func (a *usersAdapter) SetStatus(ctx context.Context, id int64, status string) e
 		if err := rows.Err(); err != nil {
 			return err
 		}
+		active := status == "active"
 		for _, keyID := range keys {
-			active := false
 			if err := a.client.UpdateKey(ctx, keyID, vm2api.UpdateKeyInput{Active: &active}); err != nil {
-				return fmt.Errorf("disable vm2api key %s: %w", keyID, err)
+				return fmt.Errorf("sync vm2api key %s: %w", keyID, err)
 			}
 		}
 	}
@@ -125,18 +129,119 @@ func (a *usersAdapter) List(ctx context.Context, q string, page, pageSize int) (
 	return out, total, nil
 }
 
-func (a *usersAdapter) AdminList(ctx context.Context, q string, page, pageSize int) ([]api.AdminUserDTO, int64, error) {
-	items, total, err := a.users.List(ctx, q, page, pageSize)
+func (a *usersAdapter) AdminList(ctx context.Context, filter api.AdminUserFilter, page, pageSize int) ([]api.AdminUserDTO, int64, error) {
+	items, total, err := a.users.Search(ctx, store.UserFilter{Q: filter.Q, Role: filter.Role, Status: filter.Status}, page, pageSize)
 	if err != nil {
 		return nil, 0, err
 	}
 	out := make([]api.AdminUserDTO, 0, len(items))
 	for _, u := range items {
-		dto := api.AdminUserDTO{UserDTO: toUserDTO(u), VM2APIUserID: u.VM2APIUserID}
-		a.fillEntitlement(ctx, u.ID, &dto)
-		out = append(out, dto)
+		out = append(out, a.toAdminDTO(ctx, u))
 	}
 	return out, total, nil
+}
+
+func (a *usersAdapter) toAdminDTO(ctx context.Context, u store.User) api.AdminUserDTO {
+	dto := api.AdminUserDTO{UserDTO: toUserDTO(u), VM2APIUserID: u.VM2APIUserID, Note: u.Note, LastLoginAt: u.LastLoginAt, LastLoginIP: u.LastLoginIP}
+	a.fillEntitlement(ctx, u.ID, &dto)
+	if a.sessions != nil {
+		dto.ActiveSessions, _ = a.sessions.CountActive(ctx, u.ID)
+	}
+	return dto
+}
+
+func (a *usersAdapter) SetEmail(ctx context.Context, id int64, email string) error {
+	err := a.users.SetEmail(ctx, id, email)
+	if errors.Is(err, store.ErrEmailTaken) {
+		return api.Err(err, http.StatusConflict, "email_taken", "该邮箱已被其他用户使用")
+	}
+	return err
+}
+
+func (a *usersAdapter) SetNote(ctx context.Context, id int64, note string) error {
+	return a.users.SetNote(ctx, id, note)
+}
+
+func (a *usersAdapter) Records(ctx context.Context, id int64) (api.UserRecordsDTO, error) {
+	records, err := a.users.Records(ctx, id)
+	return api.UserRecordsDTO(records), err
+}
+
+func (a *usersAdapter) Sessions(ctx context.Context, id int64) ([]api.SessionDTO, error) {
+	items, err := a.sessions.ListActive(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]api.SessionDTO, 0, len(items))
+	for _, item := range items {
+		out = append(out, api.SessionDTO(item))
+	}
+	return out, nil
+}
+
+func (a *usersAdapter) RevokeSessions(ctx context.Context, id int64) error {
+	return a.sessions.DeleteAll(ctx, id)
+}
+
+// Delete removes a user that never bought anything. Upstream keys go first, so
+// a key cannot outlive its owner and keep spending; the upstream user is only
+// disabled, never deleted (deleting a vm2api user hands its VMs back to the
+// platform pool).
+func (a *usersAdapter) Delete(ctx context.Context, id int64) error {
+	u, err := a.users.GetByID(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return api.Err(err, 404, "user_not_found", "用户不存在")
+	}
+	if err != nil {
+		return err
+	}
+	records, err := a.users.Records(ctx, id)
+	if err != nil {
+		return err
+	}
+	if records.Any() {
+		return userHasRecords(records)
+	}
+	rows, err := a.db.QueryContext(ctx, `SELECT vm2api_key_id FROM api_keys WHERE user_id = ? AND status <> 'deleted' AND vm2api_key_id <> ''`, id)
+	if err != nil {
+		return fmt.Errorf("list keys to delete: %w", err)
+	}
+	var keys []string
+	for rows.Next() {
+		var keyID string
+		if err := rows.Scan(&keyID); err != nil {
+			rows.Close()
+			return err
+		}
+		keys = append(keys, keyID)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if a.client != nil {
+		for _, keyID := range keys {
+			if err := a.client.DeleteKey(ctx, keyID); err != nil && !vm2api.IsStatus(err, 404) {
+				return fmt.Errorf("delete vm2api key %s: %w", keyID, err)
+			}
+		}
+		if u.VM2APIUserID != "" {
+			if err := a.client.SetUserEnabled(ctx, u.VM2APIUserID, false); err != nil && !vm2api.IsStatus(err, 404) {
+				return fmt.Errorf("disable vm2api user: %w", err)
+			}
+		}
+	}
+	err = a.users.Delete(ctx, id)
+	if errors.Is(err, store.ErrUserHasRecords) {
+		// An order arrived between the check and the delete.
+		latest, _ := a.users.Records(ctx, id)
+		return userHasRecords(latest)
+	}
+	return err
+}
+
+func userHasRecords(records store.UserRecords) error {
+	return &api.UserError{Status: http.StatusConflict, Code: "user_has_records", Message: fmt.Sprintf("该用户有 %d 笔订单、%d 个订阅、%d 个账号资源，不能删除，请改为停用", records.Orders, records.Subscriptions, records.Resources)}
 }
 
 func (a *usersAdapter) AdminDetail(ctx context.Context, id int64) (api.AdminUserDTO, error) {
@@ -147,9 +252,7 @@ func (a *usersAdapter) AdminDetail(ctx context.Context, id int64) (api.AdminUser
 	if err != nil {
 		return api.AdminUserDTO{}, err
 	}
-	dto := api.AdminUserDTO{UserDTO: toUserDTO(u), VM2APIUserID: u.VM2APIUserID}
-	a.fillEntitlement(ctx, u.ID, &dto)
-	return dto, nil
+	return a.toAdminDTO(ctx, u), nil
 }
 
 // fillEntitlement attaches the concurrency and seat counters the admin console

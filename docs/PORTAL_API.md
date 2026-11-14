@@ -230,9 +230,20 @@ utilization 为 0–100；窗口缺失为 `null`。
 | POST | `/api/admin/orders/{order_no}/mark-paid` | `{trade_no?}` 人工确认收款 → 履约 |
 | POST | `/api/admin/orders/{order_no}/cancel` | pending 取消 |
 | POST | `/api/admin/orders/{order_no}/refulfill` | `fulfill_failed` 重试 |
-| GET | `/api/admin/users?q&page` | `User` + `{concurrency_total, hosted_used, hosted_total, rental_used, rental_total, vm2api_user_id}` |
-| GET | `/api/admin/users/{id}` | `{user, subscriptions, accounts, keys, orders}` |
-| PATCH | `/api/admin/users/{id}` | `{status?, role?}`；停用同步停用 vm2api 用户与密钥 |
+| GET | `/api/admin/users?q&role&status&page` | `User` + `{concurrency_total, hosted_used, hosted_total, rental_used, rental_total, vm2api_user_id, note, last_login_at, last_login_ip, active_sessions}`。`q` 匹配邮箱或备注，`#12`/`12` 按用户 ID 精确匹配；`role`=`user|admin`，`status`=`active|disabled` |
+| POST | `/api/admin/users` | `{email, password?, role?, note?}` 新增用户，返回 201 `{user, password?}`。不传 `password` 时自动生成 16 位密码，只在本次响应里返回一次；邮箱已占用 409 `email_taken` |
+| GET | `/api/admin/users/{id}` | `{user, subscriptions, accounts, keys, orders, sessions:[{created_at, expires_at, ip, user_agent}], records:{orders, subscriptions, resources}}` |
+| PATCH | `/api/admin/users/{id}` | `{email?, status?, role?, note?}` 至少一项。停用时同步停用 vm2api 用户及其密钥，重新启用时一并恢复。改邮箱后用户须用新邮箱登录 |
+| DELETE | `/api/admin/users/{id}` | 删除用户及其 API 密钥（先删 vm2api 上的密钥，vm2api 用户只停用不删除）。有订单、订阅或账号资源的用户返回 409 `user_has_records`，只能停用 |
+| POST | `/api/admin/users/{id}/password` | `{password?}` 重置密码，并让该用户所有设备的登录失效。不传 `password` 时自动生成，返回 `{password}`（只显示一次） |
+| POST | `/api/admin/users/{id}/sessions/revoke` | `{}` 强制下线：让该用户所有设备的登录失效，API 密钥不受影响 |
+| PATCH/DELETE | `/api/admin/users/{id}/keys/{key_id}` | 管理员停用、启用（`{status}`）或删除该用户的某个 API 密钥，例如密钥泄露时使用 |
+
+
+以上用户管理接口都会写入审计日志（`user.create`、`user.update`、`user.reset_password`、`user.revoke_sessions`、`user.delete`、`user.key_update`、`user.key_delete`），记录内容不含密码。管理员不能对自己执行停用、取消管理员身份、重置密码、强制下线或删除操作（409 `self_lockout`），也不能停用、降级或删除最后一个管理员（409 `last_admin`）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
 | POST | `/api/admin/users/{id}/grant` | `{kind, quantity, duration_days, note}` 赠送订阅（生成 provider=`grant` 的已履约订单） |
 | PATCH | `/api/admin/subscriptions/{id}` | `{expires_at?, status?:"cancelled"}` |
 | GET | `/api/admin/rental-pool` | `{items:[{vm_id, tier, status:"available|leased|maintenance", leased_to_user_id, leased_to_email, note, selfcheck:Selfcheck|null, vm:{label, email_masked, cred_status, schedule_state, tier, five_hour, seven_day}}]}` |

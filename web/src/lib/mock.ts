@@ -608,6 +608,7 @@ async function authRequest(path: string, method: string, input: Input): Promise<
   }
   if (user.status === 'disabled') fail(403, 'user_disabled', '该用户已停用。')
   loginAttempts.delete(email); setSession(user.id)
+  userProfiles.set(user.id, { ...profileOf(user.id), last_login_at: new Date().toISOString(), last_login_ip: '127.0.0.1' }); mockSessions.set(user.id, (mockSessions.get(user.id) ?? 0) + 1)
   return ok({ user })
 }
 
@@ -627,9 +628,13 @@ function productInput(input: Input, existing?: Product): Product {
 function adminAccount(entry: Owned<Account>): Account {
   return { ...entry.value, user_email: emailOf(entry.userId), vm_id: accountVMs.get(entry.value.id) ?? '', last_error: entry.value.status_reason ?? '' }
 }
+// Admin-only profile fields the demo keeps beside User.
+const userProfiles = new Map<number, { note: string; last_login_at: string; last_login_ip: string }>()
+const mockSessions = new Map<number, number>() // user id -> signed-in devices
+function profileOf(id: number) { return userProfiles.get(id) ?? { note: '', last_login_at: '', last_login_ip: '' } }
 function adminUser(user: User): AdminUser {
   const summary = overview(user.id)
-  return { ...user, concurrency_total: user.status === 'active' ? summary.concurrency.total : 0, hosted_used: summary.hosted_seats.used, hosted_total: summary.hosted_seats.total, rental_used: summary.rental_accounts.used, rental_total: summary.rental_accounts.total, vm2api_user_id: `demo-user-${user.id}` }
+  return { ...user, ...profileOf(user.id), active_sessions: mockSessions.get(user.id) ?? (user.id === sessionUserId ? 1 : 0), concurrency_total: user.status === 'active' ? summary.concurrency.total : 0, hosted_used: summary.hosted_seats.used, hosted_total: summary.hosted_seats.total, rental_used: summary.rental_accounts.used, rental_total: summary.rental_accounts.total, vm2api_user_id: `demo-user-${user.id}` }
 }
 function dashboard(): AdminDashboard {
   const paidOrders = orders.filter(item => ['paid', 'fulfilled', 'fulfill_failed'].includes(item.value.status) && item.value.provider !== 'grant')
@@ -983,6 +988,94 @@ function userRequest(path: string, method: string, query: URLSearchParams, input
   return undefined
 }
 
+// Admin user management that needs hashing (create, reset) or touches several
+// collections; mirrors internal/api/admin_users.go.
+function mockPassword(): string {
+  const alphabet = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  return Array.from(crypto.getRandomValues(new Uint32Array(16)), (n) => alphabet[n % alphabet.length]).join('')
+}
+function mockNote(input: Input): string {
+  const note = typeof input.note === 'string' ? input.note.trim() : ''
+  if (note.length > 500) fail(422, 'invalid_note', '备注最多 500 个字')
+  return note
+}
+function mockRecords(id: number) {
+  return { orders: myValues(orders, id).length, subscriptions: myValues(subscriptions, id).length, resources: myValues(accounts, id).length }
+}
+async function adminUserRequest(path: string, method: string, query: URLSearchParams, input: Input): Promise<Response | undefined> {
+  const parts = path.split('/').filter(Boolean)
+  if (parts[0] !== 'admin' || parts[1] !== 'users') return undefined
+  const actor = currentUser()
+  if (actor.role !== 'admin') fail(403, 'forbidden', '需要管理员权限')
+  if (parts.length === 2 && method === 'GET') {
+    const q = (query.get('q') ?? '').trim().toLowerCase()
+    const role = query.get('role') ?? ''
+    const status = query.get('status') ?? ''
+    const id = Number(q.replace(/^#/, ''))
+    return ok(paginate(users.filter(user => (!q || user.email.includes(q) || profileOf(user.id).note.toLowerCase().includes(q) || (Number.isSafeInteger(id) && id === user.id)) && (!role || user.role === role) && (!status || user.status === status)).sort((a, b) => b.id - a.id).map(adminUser), query))
+  }
+  if (parts.length === 2 && method === 'POST') {
+    const email = emailValue(input)
+    const role = input.role === undefined || input.role === '' ? 'user' : oneOf(input.role, ['admin', 'user'], 'invalid_role')
+    const note = mockNote(input)
+    const given = typeof input.password === 'string' ? input.password : ''
+    if (given && (given.length < 8 || given.length > 128)) fail(422, 'invalid_password', '密码长度须为 8–128')
+    if (users.some(item => item.email === email)) fail(409, 'email_taken', '该邮箱已注册')
+    const password = given || mockPassword()
+    const user = addUser(email, await passwordDigest(password)); user.role = role
+    userProfiles.set(user.id, { note, last_login_at: '', last_login_ip: '' })
+    return ok({ user: adminUser(user), ...(given ? {} : { password }) }, 201)
+  }
+  const user = users.find(item => item.id === positiveId(parts[2])) ?? fail(404, 'user_not_found', '用户不存在')
+  const self = user.id === actor.id
+  const lastAdmin = user.role === 'admin' && user.status === 'active' && users.filter(item => item.role === 'admin' && item.status === 'active').length <= 1
+  if (parts.length === 3 && method === 'GET') {
+    return ok({ user: adminUser(user), subscriptions: myValues(subscriptions, user.id).map(subscriptionView), accounts: myValues(accounts, user.id), keys: myValues(keys, user.id), orders: myValues(orders, user.id), sessions: Array.from({ length: mockSessions.get(user.id) ?? (self ? 1 : 0) }, () => ({ created_at: profileOf(user.id).last_login_at || new Date().toISOString(), expires_at: new Date(Date.now() + 7 * DAY).toISOString(), ip: '127.0.0.1', user_agent: navigator.userAgent })), records: mockRecords(user.id) })
+  }
+  if (parts.length === 3 && method === 'PATCH') {
+    if (['email', 'status', 'role', 'note'].every(key => input[key] === undefined)) fail(422, 'invalid_body', '请至少修改一项')
+    const status = input.status === undefined ? user.status : oneOf(input.status, ['active', 'disabled'], 'invalid_status')
+    const role = input.role === undefined ? user.role : oneOf(input.role, ['admin', 'user'], 'invalid_role')
+    const email = input.email === undefined ? user.email : emailValue(input)
+    const note = input.note === undefined ? profileOf(user.id).note : mockNote(input)
+    if (self && (status !== user.status || role !== user.role)) fail(409, 'self_lockout', '不能停用自己或取消自己的管理员身份，请让其他管理员操作')
+    if (lastAdmin && (status === 'disabled' || role === 'user')) fail(409, 'last_admin', '不能停用、降级或删除最后一个管理员')
+    if (email !== user.email && users.some(item => item.email === email)) fail(409, 'email_taken', '该邮箱已被其他用户使用')
+    user.email = email; user.role = role; user.status = status
+    userProfiles.set(user.id, { ...profileOf(user.id), note })
+    if (status === 'disabled') mockSessions.set(user.id, 0)
+    return ok({ user: adminUser(user) })
+  }
+  if (parts.length === 3 && method === 'DELETE') {
+    if (self) fail(409, 'self_lockout', '不能删除自己的账号')
+    if (lastAdmin) fail(409, 'last_admin', '不能停用、降级或删除最后一个管理员')
+    const records = mockRecords(user.id)
+    if (records.orders || records.subscriptions || records.resources) fail(409, 'user_has_records', `该用户有 ${records.orders} 笔订单、${records.subscriptions} 个订阅、${records.resources} 个账号资源，不能删除，请改为停用`)
+    users.splice(users.indexOf(user), 1); passwords.delete(user.id); userProfiles.delete(user.id); mockSessions.delete(user.id)
+    for (let index = keys.length - 1; index >= 0; index--) if (keys[index].userId === user.id) keys.splice(index, 1)
+    return ok()
+  }
+  if (parts[3] === 'password' && method === 'POST') {
+    if (self) fail(409, 'self_lockout', '修改自己的密码请在「账户安全」页操作')
+    const given = typeof input.password === 'string' ? input.password : ''
+    if (given && (given.length < 8 || given.length > 128)) fail(422, 'invalid_password', '密码长度须为 8–128')
+    const password = given || mockPassword()
+    passwords.set(user.id, await passwordDigest(password)); mockSessions.set(user.id, 0)
+    return ok(given ? {} : { password })
+  }
+  if (parts[3] === 'sessions' && parts[4] === 'revoke' && method === 'POST') {
+    if (self) fail(409, 'self_lockout', '不能在这里让自己下线，请使用「退出登录」')
+    mockSessions.set(user.id, 0)
+    return ok()
+  }
+  if (parts[3] === 'keys' && parts[4]) {
+    const entry = keys.find(item => item.userId === user.id && item.value.id === positiveId(parts[4])) ?? fail(404, 'key_not_found', '密钥不存在')
+    if (method === 'DELETE') { keys.splice(keys.indexOf(entry), 1); return ok() }
+    if (method === 'PATCH') { entry.value.status = oneOf(input.status, ['active', 'disabled'], 'invalid_status'); return ok({ key: entry.value }) }
+  }
+  return undefined
+}
+
 export async function mockRequest(path: string, method: string, body?: unknown): Promise<Response> {
   try {
     await seedPasswords
@@ -1002,7 +1095,7 @@ export async function mockRequest(path: string, method: string, body?: unknown):
     const user = currentUser()
     if (normalized.startsWith('/admin/')) {
       if (user.role !== 'admin') fail(403, 'forbidden', '仅管理员可以访问此接口。')
-      return adminRequest(normalized, verb, url.searchParams, input) ?? fail(404, 'not_found', '此管理接口尚未实现。')
+      return (await adminUserRequest(normalized, verb, url.searchParams, input)) ?? adminRequest(normalized, verb, url.searchParams, input) ?? fail(404, 'not_found', '此管理接口尚未实现。')
     }
     return userRequest(normalized, verb, url.searchParams, input, user) ?? fail(404, 'not_found', '此演示接口不存在。')
   } catch (error: unknown) {

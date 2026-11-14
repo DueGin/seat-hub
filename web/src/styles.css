@@ -231,6 +231,21 @@ legend { padding: 0 8px; color: var(--text-2); }
 .release-head .text-link { margin-left: auto; }
 .release-notes { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.85; color: var(--text-2); max-height: 320px; overflow-y: auto; }
 .confirm-list { margin: 0; padding-left: 18px; list-style: disc; display: flex; flex-direction: column; gap: 8px; font-size: 13px; line-height: 1.7; color: var(--text-2); }
+.segmented-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.credential-box { display: grid; gap: 10px; margin: 0; padding: 14px 16px; border-radius: 8px; background: var(--sunken); border: 1px solid var(--border); }
+.credential-box > div { display: flex; align-items: baseline; gap: 14px; }
+.credential-box dt { width: 64px; flex-shrink: 0; font-size: 12px; color: var(--muted); }
+.credential-box dd { margin: 0; font-size: 15px; color: var(--text-strong); overflow-wrap: anywhere; user-select: all; }
+.user-note-cell { max-width: 220px; margin-top: 4px; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drawer:has(.user-head) { width: min(820px, 100vw); }
+.user-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.user-head > div:nth-child(2) { flex: 1; min-width: 0; }
+.user-head h2 { font-size: 18px; overflow-wrap: anywhere; }
+.user-head .user-avatar { width: 42px; height: 42px; font-size: 16px; }
+.user-note { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.8; color: var(--text-2); padding: 10px 13px; border-left: 3px solid var(--accent-border); background: var(--accent-softer); border-radius: 0 6px 6px 0; }
+.user-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 0; border-top: 1px solid var(--border-subtle); border-bottom: 1px solid var(--border-subtle); }
+.detail-heading { font-size: 13px; margin-bottom: 10px; }
+.drawer .section-heading { margin-bottom: 10px; }
 .theme-toggle { display: inline-flex; align-items: center; gap: 2px; padding: 3px; border: 1px solid var(--border); border-radius: 999px; background: var(--sunken); }
 .theme-toggle button { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 0; border-radius: 999px; background: transparent; color: var(--faint); transition: background .15s, color .15s; }
 .theme-toggle button:hover { color: var(--text); }

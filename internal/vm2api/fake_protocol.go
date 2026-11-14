@@ -60,3 +60,19 @@ func (fake *Fake) RecordProtocolCall(call ProtocolCall) (int, bool) {
 	fake.logs = append(fake.logs, fakeLog{ownerID: key.userID, row: fakeCloneLog(row)})
 	return status, true
 }
+
+// KeyState reports whether a key exists upstream and is active (test hook).
+func (fake *Fake) KeyState(keyID string) (exists, active bool) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	key, ok := fake.keys[keyID]
+	return ok, ok && key.active
+}
+
+// UserEnabled reports whether an upstream user exists and is enabled (test hook).
+func (fake *Fake) UserEnabled(userID string) (exists, enabled bool) {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	user, ok := fake.users[userID]
+	return ok, ok && user.Enabled
+}

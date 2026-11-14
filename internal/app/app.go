@@ -86,7 +86,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	prov.svc.SetChecker(selfcheck.NewEngine(vmClient, db.DB))
 	orderSvc.SetFulfiller(prov)
 
-	usersAdv := &usersAdapter{users: users, db: db.DB, client: vmClient}
+	usersAdv := &usersAdapter{users: users, db: db.DB, client: vmClient, sessions: sessions}
 	usersAdv.entitle = func(ctx context.Context, userID int64) (api.AdminUserDTO, error) {
 		ent, err := prov.prov.Entitlements(ctx, userID)
 		if err != nil {

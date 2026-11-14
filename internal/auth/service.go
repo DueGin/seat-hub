@@ -71,6 +71,8 @@ func (s *Service) Login(ctx context.Context, email, password, ip, ua string) (Lo
 	if err := s.Sessions.Create(ctx, s.Box.MAC(token), u.ID, time.Now().Add(SessionTTL), ip, ua); err != nil {
 		return LoginResult{}, err
 	}
+	// Best effort: the admin console shows it, signing in does not depend on it.
+	_ = s.Users.RecordLogin(ctx, u.ID, ip)
 	return LoginResult{User: u, Token: token}, nil
 }
 

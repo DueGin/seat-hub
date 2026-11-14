@@ -139,16 +139,6 @@ func (s *Server) handleAdminRefulfill(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, map[string]any{})
 }
 
-func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
-	page, size := adminPageParams(r)
-	items, total, err := s.Deps.Users.AdminList(r.Context(), r.URL.Query().Get("q"), page, size)
-	if err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	writeOK(w, adminPageEnvelope(items, total, page, size))
-}
-
 func (s *Server) handleAdminUserDetail(w http.ResponseWriter, r *http.Request) {
 	id, ok := adminRequestID(w, r)
 	if !ok {
@@ -192,71 +182,21 @@ func (s *Server) handleAdminUserDetail(w http.ResponseWriter, r *http.Request) {
 	if keys == nil {
 		keys = []KeyDTO{}
 	}
-	writeOK(w, map[string]any{
-		"user": user, "subscriptions": subscriptionItems(subscriptions),
-		"accounts": accounts, "keys": keys, "orders": orders,
-	})
-}
-
-func (s *Server) handleAdminPatchUser(w http.ResponseWriter, r *http.Request) {
-	id, ok := adminRequestID(w, r)
-	if !ok {
-		return
-	}
-	var body struct {
-		Status *string `json:"status"`
-		Role   *string `json:"role"`
-	}
-	if err := readJSON(r, &body); err != nil {
-		s.fail(w, r, err)
-		return
-	}
-	if body.Status != nil && *body.Status != "active" && *body.Status != "disabled" {
-		writeErr(w, http.StatusUnprocessableEntity, "invalid_status", "status 只能是 active 或 disabled")
-		return
-	}
-	if body.Role != nil && *body.Role != "user" && *body.Role != "admin" {
-		writeErr(w, http.StatusUnprocessableEntity, "invalid_role", "role 只能是 user 或 admin")
-		return
-	}
-	if body.Status == nil && body.Role == nil {
-		writeErr(w, http.StatusUnprocessableEntity, "invalid_body", "请提供 status 或 role")
-		return
-	}
-	adminUserPatchMu.Lock()
-	defer adminUserPatchMu.Unlock()
-	user, err := s.Deps.Users.ByID(r.Context(), id)
+	sessions, err := s.Deps.Users.Sessions(r.Context(), id)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	removingAdmin := body.Status != nil && *body.Status == "disabled" || body.Role != nil && *body.Role == "user"
-	if user.Role == "admin" && user.Status == "active" && removingAdmin {
-		admins, err := s.Deps.Users.CountAdmins(r.Context())
-		if err != nil {
-			s.fail(w, r, err)
-			return
-		}
-		if admins <= 1 {
-			writeErr(w, http.StatusConflict, "last_admin", "不能停用或降级最后一个管理员")
-			return
-		}
+	records, err := s.Deps.Users.Records(r.Context(), id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
 	}
-	if body.Status != nil && *body.Status != user.Status {
-		if err := s.Deps.Users.SetStatus(r.Context(), id, *body.Status); err != nil {
-			s.fail(w, r, err)
-			return
-		}
-		user.Status = *body.Status
-	}
-	if body.Role != nil && *body.Role != user.Role {
-		if err := s.Deps.Users.SetRole(r.Context(), id, *body.Role); err != nil {
-			s.fail(w, r, err)
-			return
-		}
-		user.Role = *body.Role
-	}
-	writeOK(w, map[string]any{"user": user})
+	writeOK(w, map[string]any{
+		"user": user, "subscriptions": subscriptionItems(subscriptions),
+		"accounts": accounts, "keys": keys, "orders": orders,
+		"sessions": sessions, "records": records,
+	})
 }
 
 func (s *Server) handleAdminGrant(w http.ResponseWriter, r *http.Request) {
