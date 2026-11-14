@@ -126,15 +126,22 @@ func TestProvisionEntitlementsAndConcurrency(t *testing.T) {
 	if entitlements.Concurrency.Total != 16 || entitlements.HostedSeats.Used != 2 || entitlements.AccountsActive != 2 {
 		t.Fatalf("entitlements = %+v", entitlements)
 	}
-	var owner string
-	if err := service.db.QueryRow(`SELECT vm2api_user_id FROM users WHERE id=?`, userID).Scan(&owner); err != nil {
+	owner, err := service.ServiceUser(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "main", UserID: owner})
+	scope, _, err := service.KeyScopeFor(ctx, userID, ScopeAll, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "main", UserID: owner, Scope: scope})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.db.Exec(`INSERT INTO api_keys(user_id,name,key_hash,prefix,vm2api_key_id,vm2api_secret_enc,status,created_at,updated_at) VALUES (?,'main','hash','prefix',?,'encrypted','active',?,?)`, userID, key.ID, timestamp(now), timestamp(now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.db.Exec(`UPDATE api_keys SET upstream_owner=? WHERE vm2api_key_id=?`, owner, key.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := service.SyncConcurrency(ctx, userID); err != nil {
@@ -410,7 +417,7 @@ func TestProvisionConcurrentHostedSeat(t *testing.T) {
 	}
 }
 
-func TestProvisionConcurrentUpstreamUser(t *testing.T) {
+func TestProvisionConcurrentServiceUser(t *testing.T) {
 	service, fake, userID := provisionFixture(t)
 	if _, err := service.db.Exec(`UPDATE users SET vm2api_user_id=NULL WHERE id=?`, userID); err != nil {
 		t.Fatal(err)
@@ -422,7 +429,7 @@ func TestProvisionConcurrentUpstreamUser(t *testing.T) {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			owner, err := service.EnsureUpstreamUser(context.Background(), userID)
+			owner, err := service.ServiceUser(context.Background())
 			results <- owner
 			failures <- err
 		}()
@@ -443,7 +450,11 @@ func TestProvisionConcurrentUpstreamUser(t *testing.T) {
 		t.Fatalf("owners=%v", owners)
 	}
 	for owner := range owners {
-		if _, err := fake.CreateKey(context.Background(), vm2api.CreateKeyInput{Name: "check", UserID: owner}); err != nil {
+		scope, _, err := service.KeyScopeFor(context.Background(), userID, ScopeAll, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fake.CreateKey(context.Background(), vm2api.CreateKeyInput{Name: "check", UserID: owner, Scope: scope}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -782,11 +793,15 @@ func TestProvisionAuthLinkRequiresOwnerAndProxy(t *testing.T) {
 func TestProvisionSyncConcurrencyNeverWritesZero(t *testing.T) {
 	service, fake, userID := provisionFixture(t)
 	ctx := context.Background()
-	var owner string
-	if err := service.db.QueryRow(`SELECT vm2api_user_id FROM users WHERE id=?`, userID).Scan(&owner); err != nil {
+	owner, err := service.ServiceUser(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "zero", UserID: owner})
+	scope, _, err := service.KeyScopeFor(ctx, userID, ScopeAll, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "zero", UserID: owner, Scope: scope})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -795,6 +810,9 @@ func TestProvisionSyncConcurrencyNeverWritesZero(t *testing.T) {
 	}
 	// No subscription at all: effective concurrency is 0, which must reach the
 	// upstream key as 1 (0 means unlimited to vm2api).
+	if _, err := service.db.Exec(`UPDATE api_keys SET upstream_owner=? WHERE vm2api_key_id=?`, owner, key.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := service.SyncConcurrency(ctx, userID); err != nil {
 		t.Fatal(err)
 	}
@@ -835,16 +853,23 @@ func TestProvisionSweepIsolatesUserFailures(t *testing.T) {
 	if _, err := service.db.Exec(`INSERT INTO settings(key,value,updated_at) VALUES ('site',?,?)`, settings, timestamp(now)); err != nil {
 		t.Fatal(err)
 	}
-	for index, userID := range []int64{first, second} {
-		owner, err := fake.CreateUser(ctx, fmt.Sprintf("tenant%d", index), "password")
+	for _, userID := range []int64{first, second} {
+		owner, err := service.ServiceUser(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "k", UserID: owner.ID})
+		scope, _, err := service.KeyScopeFor(ctx, userID, ScopeAll, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "k", UserID: owner, Scope: scope})
 		if err != nil {
 			t.Fatal(err)
 		}
 		if _, err := service.db.Exec(`INSERT INTO api_keys(user_id,name,key_hash,prefix,vm2api_key_id,vm2api_secret_enc,status,created_at,updated_at) VALUES (?,'k',?,'prefix',?,'enc','active',?,?)`, userID, fmt.Sprintf("hash%d", userID), key.ID, timestamp(now), timestamp(now)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := service.db.Exec(`UPDATE api_keys SET upstream_owner=? WHERE vm2api_key_id=?`, owner, key.ID); err != nil {
 			t.Fatal(err)
 		}
 		subscription := addSubscription(t, service, userID, "hosted_seat", 1, now.Add(-time.Minute))

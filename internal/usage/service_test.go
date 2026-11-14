@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DueGin/seat-hub/internal/store"
 	"github.com/DueGin/seat-hub/internal/store/migrations"
 	"github.com/DueGin/seat-hub/internal/vm2api"
 	_ "modernc.org/sqlite"
@@ -26,6 +27,30 @@ type fixture struct {
 	now     time.Time
 }
 
+type logsErrorClient struct {
+	vm2api.Client
+	err error
+}
+
+func (client logsErrorClient) UserRequestLogs(context.Context, string, vm2api.LogQuery) (vm2api.LogPage, error) {
+	return vm2api.LogPage{}, client.err
+}
+
+type recordedLogQuery struct {
+	userID string
+	query  vm2api.LogQuery
+}
+
+type recordingLogsClient struct {
+	vm2api.Client
+	queries []recordedLogQuery
+}
+
+func (client *recordingLogsClient) UserRequestLogs(ctx context.Context, userID string, query vm2api.LogQuery) (vm2api.LogPage, error) {
+	client.queries = append(client.queries, recordedLogQuery{userID: userID, query: query})
+	return client.Client.UserRequestLogs(ctx, userID, query)
+}
+
 func setup(t *testing.T) *fixture {
 	t.Helper()
 	database, err := sql.Open("sqlite", ":memory:")
@@ -34,12 +59,14 @@ func setup(t *testing.T) *fixture {
 	}
 	database.SetMaxOpenConns(1)
 	t.Cleanup(func() { database.Close() })
-	schema, err := migrations.FS.ReadFile("001_init.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.Exec(string(schema)); err != nil {
-		t.Fatal(err)
+	for _, name := range []string{"001_init.sql", "004_key_scope.sql"} {
+		schema, err := migrations.FS.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := database.Exec(string(schema)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	result := &fixture{db: database, client: vm2api.NewFake(), now: time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)}
 	result.service = New(database, result.client)
@@ -49,7 +76,11 @@ func setup(t *testing.T) *fixture {
 		if err != nil {
 			t.Fatal(err)
 		}
-		key, err := result.client.CreateKey(context.Background(), vm2api.CreateKeyInput{UserID: owner.ID, Name: "internal-key"})
+		pool, err := result.client.CreatePool(context.Background(), fmt.Sprintf("legacy-pool-%d", index), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, err := result.client.CreateKey(context.Background(), vm2api.CreateKeyInput{UserID: owner.ID, Name: "internal-key", Scope: vm2api.KeyScope{PoolID: pool.ID}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -67,6 +98,33 @@ func setup(t *testing.T) *fixture {
 		})
 	}
 	return result
+}
+
+func (fixture *fixture) shareServiceOwner(t *testing.T) {
+	t.Helper()
+	identity, err := fixture.client.CreateUser(context.Background(), "seat-hub-service", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveServiceIdentity(context.Background(), fixture.db, store.ServiceIdentity{UserID: identity.ID, Username: identity.Username}); err != nil {
+		t.Fatal(err)
+	}
+	for index := range fixture.owners {
+		pool, err := fixture.client.CreatePool(context.Background(), fmt.Sprintf("service-pool-%d", index), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, err := fixture.client.CreateKey(context.Background(), vm2api.CreateKeyInput{UserID: identity.ID, Name: "service-key", Scope: vm2api.KeyScope{PoolID: pool.ID}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixture.owners[index], fixture.keys[index] = identity.ID, key.ID
+		fixture.exec(t, `UPDATE users SET vm2api_user_id = NULL WHERE id = ?`, index+1)
+		fixture.exec(t, `UPDATE api_keys SET vm2api_key_id = ?, upstream_owner = ? WHERE id = ?`, key.ID, identity.ID, index+11)
+		if err := fixture.client.SetVMOwner(context.Background(), fmt.Sprintf("internal-vm-%d", index), &identity.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func (fixture *fixture) exec(t *testing.T, query string, args ...any) {
@@ -262,7 +320,7 @@ func TestOverviewUsesUTCDayAndNullOnFailure(t *testing.T) {
 	if err != nil || result.UsageToday == nil || result.UsageToday.Requests != 1 || result.UsageToday.Tokens != 12 || result.UsageToday.CostUSD != 0.25 {
 		t.Fatalf("overview=%+v, err=%v", result, err)
 	}
-	fixture.exec(t, `UPDATE users SET vm2api_user_id = 'missing-owner' WHERE id = 1`)
+	fixture.service.client = logsErrorClient{Client: fixture.client, err: vm2api.ErrUnavailable}
 	result, err = fixture.service.Overview(context.Background(), 1)
 	if err != nil || result.UsageToday != nil {
 		t.Fatalf("unavailable overview=%+v, err=%v", result, err)
@@ -272,8 +330,9 @@ func TestOverviewUsesUTCDayAndNullOnFailure(t *testing.T) {
 		t.Fatalf("json=%s, err=%v", encoded, err)
 	}
 	fixture.exec(t, `UPDATE users SET vm2api_user_id = NULL WHERE id = 1`)
-	if result, err = fixture.service.Overview(context.Background(), 1); err != nil || result.UsageToday != nil {
-		t.Fatalf("unlinked overview=%+v, err=%v", result, err)
+	fixture.service.client = fixture.client
+	if result, err = fixture.service.Overview(context.Background(), 1); err != nil || result.UsageToday == nil || result.UsageToday.Requests != 1 {
+		t.Fatalf("migrated overview=%+v, err=%v", result, err)
 	}
 	if _, err := fixture.service.Overview(context.Background(), 999); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown user=%v", err)
@@ -310,7 +369,7 @@ func TestSummaryScopesMapsAndPreservesUpstreamCosts(t *testing.T) {
 			t.Fatalf("invalid range=%v", err)
 		}
 	}
-	fixture.exec(t, `UPDATE users SET vm2api_user_id = 'missing-owner' WHERE id = 1`)
+	fixture.service.client = logsErrorClient{Client: fixture.client, err: &vm2api.Error{Status: 404}}
 	if _, err := fixture.service.Summary(ctx, 1, fixture.now.Add(-time.Hour), fixture.now); !vm2api.IsStatus(err, 404) {
 		t.Fatalf("unwrapped upstream error=%v", err)
 	}
@@ -393,7 +452,7 @@ func TestLogsRejectForeignKeysAndInvalidQueries(t *testing.T) {
 	if page, err := fixture.service.Logs(ctx, 1, LogQuery{KeyID: 11}); err != nil || page.Total != 1 {
 		t.Fatalf("historical key=%+v, err=%v", page, err)
 	}
-	fixture.exec(t, `UPDATE users SET vm2api_user_id = 'missing-owner' WHERE id = 1`)
+	fixture.service.client = logsErrorClient{Client: fixture.client, err: &vm2api.Error{Status: 404}}
 	if _, err := fixture.service.Logs(ctx, 1, LogQuery{}); !vm2api.IsStatus(err, 404) {
 		t.Fatalf("unwrapped upstream error=%v", err)
 	}
@@ -404,16 +463,11 @@ func TestUnknownMappingsNeverUseOtherTenantNames(t *testing.T) {
 	fixture.log(t, 0, vm2api.LogRow{KeyID: fixture.keys[1], VMID: "internal-vm-1", InputTokens: 3})
 	fixture.log(t, 0, vm2api.LogRow{KeyID: "removed-internal-key", VMID: "removed-internal-vm", InputTokens: 5})
 	page, err := fixture.service.Logs(context.Background(), 1, LogQuery{})
-	if err != nil || page.Total != 2 || len(page.Items) != 2 {
+	if err != nil || page.Total != 0 || len(page.Items) != 0 {
 		t.Fatalf("logs=%+v, err=%v", page, err)
 	}
-	for _, row := range page.Items {
-		if row.KeyID != nil || row.KeyName != nil || row.AccountID != nil || row.AccountLabel != nil {
-			t.Fatalf("unknown mapping=%+v", row)
-		}
-	}
 	result, err := fixture.service.Summary(context.Background(), 1, fixture.now.Add(-24*time.Hour), fixture.now)
-	if err != nil || result.Totals.Requests != 2 || len(result.ByKey) != 0 || len(result.ByAccount) != 0 {
+	if err != nil || result.Totals.Requests != 0 || len(result.ByKey) != 0 || len(result.ByAccount) != 0 {
 		t.Fatalf("summary=%+v, err=%v", result, err)
 	}
 	assertRedacted(t, result, fixture.keys[1], "internal-vm-1", "removed-internal-key", "removed-internal-vm", "密钥2", "账号2")
@@ -485,9 +539,17 @@ func TestCacheDeepCopiesNestedEstimatesAndBreakdowns(t *testing.T) {
 	}
 }
 
-func TestUnlinkedUserReturnsEmptyCollections(t *testing.T) {
+func TestUserWithNoKeysReturnsZerosAndEmptyCollections(t *testing.T) {
 	fixture := setup(t)
+	fixture.shareServiceOwner(t)
+	fixture.log(t, 0, vm2api.LogRow{InputTokens: 999, CostUSD: 999})
+	fixture.exec(t, `DELETE FROM api_keys WHERE user_id = 1`)
 	fixture.exec(t, `UPDATE users SET vm2api_user_id = NULL WHERE id = 1`)
+	fixture.service.client = logsErrorClient{Client: fixture.client, err: vm2api.ErrUnavailable}
+	overview, err := fixture.service.Overview(context.Background(), 1)
+	if err != nil || overview.UsageToday == nil || *overview.UsageToday != (Spend{}) {
+		t.Fatalf("overview=%+v, err=%v", overview, err)
+	}
 	result, err := fixture.service.Summary(context.Background(), 1, fixture.now.Add(-time.Hour), fixture.now)
 	if err != nil || result.Daily == nil || result.ByModel == nil || result.ByKey == nil || result.ByAccount == nil || result.Totals.Requests != 0 {
 		t.Fatalf("summary=%+v, err=%v", result, err)
@@ -498,6 +560,10 @@ func TestUnlinkedUserReturnsEmptyCollections(t *testing.T) {
 	}
 	if _, err := fixture.service.Logs(context.Background(), 1, LogQuery{KeyID: 12}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unlinked user foreign key: %v", err)
+	}
+	account, err := fixture.service.AccountUsage(context.Background(), 1, 21)
+	if err != nil || account == nil || account.Today == nil || *account.Today != (Spend{}) || account.Window5h == nil || *account.Window5h != (Spend{}) || account.Window7d == nil || *account.Window7d != (Spend{}) || len(account.Daily) != 0 || len(account.ByModel) != 0 {
+		t.Fatalf("account=%+v, err=%v", account, err)
 	}
 }
 
@@ -567,5 +633,196 @@ func TestLogsAccountFilterKeepsToItsLease(t *testing.T) {
 	page, err := fixture.service.Logs(ctx, 1, LogQuery{AccountID: 23, From: from, Until: fixture.now.Add(-2 * time.Hour)})
 	if err != nil || page.Total != 0 || page.Items == nil {
 		t.Fatalf("out of lease=%+v, err=%v", page, err)
+	}
+}
+
+func TestSharedServiceUsageIsIsolatedByCurrentAndPreviousKeys(t *testing.T) {
+	fixture := setup(t)
+	previous := fixture.keys[0]
+	fixture.log(t, 0, vm2api.LogRow{RequestID: "before-migration", InputTokens: 1, OutputTokens: 2, CacheReadTokens: 3, CacheCreationTokens: 4, CostUSD: 0.125})
+	fixture.shareServiceOwner(t)
+	fixture.exec(t, `UPDATE api_keys SET status = 'deleted', previous_vm2api_key_ids = ? WHERE id = 11`, store.EncodeStrings([]string{previous, previous, fixture.keys[0]}))
+	if err := fixture.client.DeleteKey(context.Background(), previous); err != nil {
+		t.Fatal(err)
+	}
+	latency := int64(30)
+	fixture.log(t, 0, vm2api.LogRow{RequestID: "after-migration", InputTokens: 5, OutputTokens: 6, CacheReadTokens: 7, CacheCreationTokens: 8, CostUSD: 0.25, FirstTokenMS: &latency})
+	fixture.log(t, 1, vm2api.LogRow{RequestID: "other-user", InputTokens: 999, CostUSD: 999, StatusCode: 500})
+	ctx := context.Background()
+	for _, testcase := range []struct {
+		userID, requests, tokens int64
+		cost                     float64
+	}{{1, 2, 36, 0.375}, {2, 1, 999, 999}} {
+		overview, err := fixture.service.Overview(ctx, testcase.userID)
+		if err != nil || overview.UsageToday == nil || overview.UsageToday.Requests != testcase.requests || overview.UsageToday.Tokens != testcase.tokens || overview.UsageToday.CostUSD != testcase.cost {
+			t.Fatalf("user %d overview=%+v, err=%v", testcase.userID, overview, err)
+		}
+		summary, err := fixture.service.Summary(ctx, testcase.userID, fixture.now.Add(-24*time.Hour), fixture.now)
+		if err != nil || summary.Totals.Requests != testcase.requests || summary.Totals.Tokens != testcase.tokens || summary.Totals.CostUSD != testcase.cost || len(summary.ByKey) != 1 || summary.ByKey[0].Requests != testcase.requests {
+			t.Fatalf("user %d summary=%+v, err=%v", testcase.userID, summary, err)
+		}
+		if testcase.userID == 1 {
+			if summary.Totals.InputTokens != 6 || summary.Totals.OutputTokens != 8 || summary.Totals.CacheReadTokens != 10 || summary.Totals.CacheCreationTokens != 12 || summary.ByKey[0].KeyID != 11 || summary.Stats.SuccessRate != 1 || summary.Stats.AvgTTFTMS != 30 {
+				t.Fatalf("detailed totals=%+v", summary)
+			}
+			page, err := fixture.service.Logs(ctx, 1, LogQuery{KeyID: 11})
+			if err != nil || page.Total != 2 || len(page.Items) != 2 {
+				t.Fatalf("historical logs=%+v, err=%v", page, err)
+			}
+			for _, row := range page.Items {
+				if row.KeyID == nil || *row.KeyID != 11 {
+					t.Fatalf("historical mapping=%+v", row)
+				}
+			}
+			assertRedacted(t, page, "other-user", previous, fixture.keys[0], fixture.keys[1])
+		}
+	}
+}
+
+func TestSharedServiceLogsMergeAcrossKeysAndPages(t *testing.T) {
+	fixture := setup(t)
+	fixture.shareServiceOwner(t)
+	pool, err := fixture.client.CreatePool(context.Background(), "extra-pool", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherKey, err := fixture.client.CreateKey(context.Background(), vm2api.CreateKeyInput{UserID: fixture.owners[0], Name: "second-key", Scope: vm2api.KeyScope{PoolID: pool.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.exec(t, `INSERT INTO api_keys (id, user_id, name, key_hash, prefix, vm2api_key_id, vm2api_secret_enc, status, created_at, updated_at)
+		VALUES (13, 1, '副密钥', 'hash-extra', 'sk-pt-extra', ?, 'secret-ciphertext', 'disabled', ?, ?)`, otherKey.ID, fixture.stamp(-time.Hour), fixture.stamp(0))
+	client := &recordingLogsClient{Client: fixture.client}
+	fixture.service.client = client
+	for index := range 220 {
+		keyID := fixture.keys[0]
+		if index%2 == 1 {
+			keyID = otherKey.ID
+		}
+		fixture.log(t, 0, vm2api.LogRow{RequestID: fmt.Sprintf("merged-%03d", index), KeyID: keyID, CreatedAt: fixture.now.Add(-time.Duration(index+1) * time.Minute)})
+		fixture.log(t, 1, vm2api.LogRow{RequestID: fmt.Sprintf("foreign-%03d", index), CreatedAt: fixture.now.Add(-time.Duration(index+1) * time.Minute)})
+	}
+	for _, pageNumber := range []int{1, 2, 3, 4} {
+		client.queries = nil
+		page, err := fixture.service.Logs(context.Background(), 1, LogQuery{Page: pageNumber, PageSize: 100})
+		wantCount := min(100, max(0, 220-(pageNumber-1)*100))
+		if err != nil || page.Total != 220 || len(page.Items) != wantCount {
+			t.Fatalf("page %d=%+v, err=%v", pageNumber, page, err)
+		}
+		for index, row := range page.Items {
+			if want := fmt.Sprintf("merged-%03d", (pageNumber-1)*100+index); row.RequestID != want {
+				t.Fatalf("page %d item %d=%s, want %s", pageNumber, index, row.RequestID, want)
+			}
+		}
+		requested := make(map[string]int)
+		for _, call := range client.queries {
+			requested[call.query.KeyID] += call.query.PageSize
+			if call.userID != "" || call.query.KeyID != fixture.keys[0] && call.query.KeyID != otherKey.ID || call.query.PageSize != 100 || call.query.Page > pageNumber {
+				t.Fatalf("unscoped or excessive query=%+v", call)
+			}
+		}
+		for keyID, count := range requested {
+			if count > pageNumber*100 {
+				t.Fatalf("page %d requested %d rows for key %s", pageNumber, count, keyID)
+			}
+		}
+	}
+	client.queries = nil
+	if _, err := fixture.service.Logs(context.Background(), 1, LogQuery{Page: 101, PageSize: 100}); !errors.Is(err, ErrInvalidPagination) {
+		t.Fatalf("unbounded merged page: %v", err)
+	}
+	if len(client.queries) != 0 {
+		t.Fatalf("deep page queried upstream: %+v", client.queries)
+	}
+	page, err := fixture.service.Logs(context.Background(), 1, LogQuery{KeyID: 11, Page: 101, PageSize: 100})
+	if err != nil || page.Total != 110 || len(page.Items) != 0 {
+		t.Fatalf("single-key deep page=%+v, err=%v", page, err)
+	}
+	if len(client.queries) != 1 || client.queries[0].userID != "" || client.queries[0].query.KeyID != fixture.keys[0] || client.queries[0].query.Page != 101 || client.queries[0].query.PageSize != 100 {
+		t.Fatalf("single-key page not passed through: %+v", client.queries)
+	}
+	fixture.log(t, 0, vm2api.LogRow{RequestID: "filtered-first", Model: "claude-opus", StatusCode: 503, CreatedAt: fixture.now.Add(-30 * time.Second)})
+	fixture.log(t, 0, vm2api.LogRow{RequestID: "filtered-second", KeyID: otherKey.ID, Model: "claude-opus", StatusCode: 503, CreatedAt: fixture.now.Add(-time.Minute)})
+	fixture.log(t, 1, vm2api.LogRow{RequestID: "filtered-foreign", VMID: "internal-vm-0", Model: "claude-opus", StatusCode: 503})
+	page, err = fixture.service.Logs(context.Background(), 1, LogQuery{AccountID: 21, Model: "claude-opus", Status: "error", Page: 2, PageSize: 1})
+	if err != nil || page.Total != 2 || len(page.Items) != 1 || page.Items[0].RequestID != "filtered-second" || page.Items[0].KeyID == nil || *page.Items[0].KeyID != 13 {
+		t.Fatalf("filtered merge=%+v, err=%v", page, err)
+	}
+}
+
+func TestSummaryStatsUseOnlyOwnedKeyLogSamples(t *testing.T) {
+	fixture := setup(t)
+	fixture.shareServiceOwner(t)
+	for index := range 20 {
+		latency := int64(index * 10)
+		status := 200
+		if index%4 == 0 {
+			status = 503
+		}
+		fixture.log(t, 0, vm2api.LogRow{FirstTokenMS: &latency, StatusCode: status})
+	}
+	fixture.log(t, 0, vm2api.LogRow{})
+	foreignLatency := int64(9999)
+	fixture.log(t, 1, vm2api.LogRow{StatusCode: 500, FirstTokenMS: &foreignLatency})
+	summary, err := fixture.service.Summary(context.Background(), 1, fixture.now.Add(-24*time.Hour), fixture.now)
+	if err != nil || summary.Stats.ErrorCount != 5 || summary.Stats.SuccessRate != float64(16)/21 || summary.Stats.AvgTTFTMS != 95 || summary.Stats.P95TTFTMS != 180 {
+		t.Fatalf("stats=%+v, err=%v", summary.Stats, err)
+	}
+}
+
+func TestAccountUsageWithServiceOwnerDropsOtherUsersKeys(t *testing.T) {
+	fixture := setup(t)
+	previous := fixture.keys[0]
+	fixture.log(t, 0, vm2api.LogRow{CreatedAt: fixture.now.Add(-30 * time.Minute), InputTokens: 2, CostUSD: 0.125})
+	fixture.shareServiceOwner(t)
+	fixture.exec(t, `UPDATE api_keys SET previous_vm2api_key_ids = ? WHERE id = 11`, store.EncodeStrings([]string{previous}))
+	fixture.exec(t, `UPDATE resources SET kind = 'rental', created_at = ? WHERE id = 21`, fixture.stamp(-2*time.Hour))
+	fixture.log(t, 0, vm2api.LogRow{InputTokens: 3, CostUSD: 0.25})
+	fixture.log(t, 1, vm2api.LogRow{VMID: "internal-vm-0", Model: "foreign-model", InputTokens: 999, CostUSD: 999})
+	fixture.log(t, 0, vm2api.LogRow{CreatedAt: fixture.now.Add(-3 * time.Hour), InputTokens: 888, CostUSD: 888})
+	client := &recordingLogsClient{Client: fixture.client}
+	fixture.service.client = client
+	result, err := fixture.service.AccountUsage(context.Background(), 1, 21)
+	if err != nil || result == nil || result.Today == nil || result.Today.Requests != 2 || result.Today.Tokens != 5 || result.Today.CostUSD != 0.375 || len(result.ByModel) != 1 {
+		t.Fatalf("account=%+v, err=%v", result, err)
+	}
+	assertRedacted(t, result, "foreign-model")
+	for _, call := range client.queries {
+		if call.userID != "" || call.query.VMID != "internal-vm-0" || call.query.KeyID != "" || !call.query.From.Equal(fixture.now.Add(-2*time.Hour)) {
+			t.Fatalf("account history not scoped to VM and lease: %+v", call)
+		}
+	}
+	page, err := fixture.service.Logs(context.Background(), 1, LogQuery{AccountID: 21})
+	if err != nil || page.Total != 2 || len(page.Items) != 2 {
+		t.Fatalf("account logs=%+v, err=%v", page, err)
+	}
+}
+
+func TestSummaryWithKeysButNoRequestsKeepsEmptySuccessRate(t *testing.T) {
+	fixture := setup(t)
+	result, err := fixture.service.Summary(context.Background(), 1, fixture.now.Add(-24*time.Hour), fixture.now)
+	if err != nil || result.Totals != (Spend{}) || result.Stats != (Stats{SuccessRate: 1}) || len(result.ByKey) != 0 {
+		t.Fatalf("empty summary=%+v, err=%v", result, err)
+	}
+}
+
+func TestAccountUsageAcceptsLegacyOwnerWhileServiceIdentityExists(t *testing.T) {
+	fixture := setup(t)
+	identity, err := fixture.client.CreateUser(context.Background(), "seat-hub-service", "password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SaveServiceIdentity(context.Background(), fixture.db, store.ServiceIdentity{UserID: identity.ID, Username: identity.Username}); err != nil {
+		t.Fatal(err)
+	}
+	fixture.log(t, 0, vm2api.LogRow{InputTokens: 3, CostUSD: 0.125})
+	result, err := fixture.service.AccountUsage(context.Background(), 1, 21)
+	if err != nil || result == nil || result.Today == nil || result.Today.Requests != 1 || result.Today.Tokens != 3 {
+		t.Fatalf("legacy account=%+v, err=%v", result, err)
+	}
+	fixture.exec(t, `UPDATE users SET vm2api_user_id = NULL WHERE id = 1`)
+	result, err = fixture.service.AccountUsage(context.Background(), 1, 21)
+	if err != nil || result != nil {
+		t.Fatalf("migrated user accepted stale legacy owner=%+v, err=%v", result, err)
 	}
 }

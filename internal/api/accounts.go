@@ -213,7 +213,8 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name string `json:"name"`
+		Name  string         `json:"name"`
+		Scope *KeyScopeInput `json:"scope"`
 	}
 	if err := readJSON(r, &body); err != nil {
 		s.fail(w, r, err)
@@ -227,12 +228,16 @@ func (s *Server) handleCreateKey(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnprocessableEntity, "invalid_name", "名称最多 40 个字符")
 		return
 	}
-	k, secret, err := s.Deps.Keys.Create(r.Context(), u.ID, name)
+	input := KeyInput{Name: name}
+	if body.Scope != nil {
+		input.Scope = *body.Scope
+	}
+	k, secret, err := s.Deps.Keys.Create(r.Context(), u.ID, input)
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	s.Deps.Audit.Write(r.Context(), u.ID, "key.create", k.Prefix, map[string]any{"name": name})
+	s.Deps.Audit.Write(r.Context(), u.ID, "key.create", k.Prefix, map[string]any{"name": name, "scope": k.Scope})
 	writeCreated(w, map[string]any{"key": k, "secret": secret})
 }
 
@@ -243,32 +248,29 @@ func (s *Server) handlePatchKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name   *string `json:"name"`
-		Status *string `json:"status"`
+		Name   *string        `json:"name"`
+		Status *string        `json:"status"`
+		Scope  *KeyScopeInput `json:"scope"`
 	}
 	if err := readJSON(r, &body); err != nil {
 		s.fail(w, r, err)
 		return
 	}
-	name, status := "", ""
-	if body.Name != nil {
-		name = *body.Name
-		if len([]rune(name)) > 40 {
-			writeErr(w, http.StatusUnprocessableEntity, "invalid_name", "名称最多 40 个字符")
-			return
-		}
+	if body.Name != nil && len([]rune(*body.Name)) > 40 {
+		writeErr(w, http.StatusUnprocessableEntity, "invalid_name", "名称最多 40 个字符")
+		return
 	}
-	if body.Status != nil {
-		status = *body.Status
-		if status != "active" && status != "disabled" {
-			writeErr(w, http.StatusUnprocessableEntity, "invalid_status", "状态只能是 active 或 disabled")
-			return
-		}
+	if body.Status != nil && *body.Status != "active" && *body.Status != "disabled" {
+		writeErr(w, http.StatusUnprocessableEntity, "invalid_status", "状态只能是 active 或 disabled")
+		return
 	}
-	k, err := s.Deps.Keys.Update(r.Context(), u.ID, pathID(r), name, status)
+	k, err := s.Deps.Keys.Update(r.Context(), u.ID, pathID(r), KeyPatch{Name: body.Name, Status: body.Status, Scope: body.Scope})
 	if err != nil {
 		s.fail(w, r, err)
 		return
+	}
+	if body.Scope != nil {
+		s.Deps.Audit.Write(r.Context(), u.ID, "key.scope", k.Prefix, map[string]any{"scope": k.Scope})
 	}
 	writeOK(w, map[string]any{"key": k})
 }

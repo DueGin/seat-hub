@@ -4,8 +4,9 @@ import type {
   ModelUsage, Onboarding, Order, Overview, Page, Payment, PoolCandidate,
   PoolItem, Product, ProductKind, PublicConfig, Settings, Spend, Subscription,
   UsageLog, UsageSummary, User, NormalizedSettings, Selfcheck, SelfcheckCheck,
-  SelfcheckReport,
+  SelfcheckReport, KeyScope,
 } from './types'
+import { hasUsableKeyScope } from './key-scope.ts'
 
 type Owned<T> = { userId: number; value: T }
 type Input = Record<string, unknown>
@@ -115,10 +116,10 @@ const accounts: Owned<Account>[] = [
   { userId: 2, value: { id: 5, kind: 'hosted', label: '个人工作账号', email_masked: 'use***@***.com', status: 'active', status_reason: null, tier: 'pro', created_at: iso(-5 * DAY), expires_at: null, usage: accountUsage(0), selfcheck: selfcheck('pass') } },
 ]
 const keys: Owned<ApiKey>[] = [
-  { userId: 1, value: { id: 1, name: '开发环境', prefix: 'sk-pt-Demo', status: 'active', created_at: iso(-25 * DAY), last_used_at: iso(-120_000) } },
-  { userId: 1, value: { id: 2, name: '自动化工作流', prefix: 'sk-pt-Flow', status: 'active', created_at: iso(-12 * DAY), last_used_at: iso(-1_800_000) } },
-  { userId: 1, value: { id: 3, name: '已停用的测试密钥', prefix: 'sk-pt-Test', status: 'disabled', created_at: iso(-30 * DAY), last_used_at: iso(-10 * DAY) } },
-  { userId: 2, value: { id: 4, name: '默认', prefix: 'sk-pt-User', status: 'active', created_at: iso(-5 * DAY), last_used_at: iso(-3_600_000) } },
+  { userId: 1, value: { id: 1, name: '开发环境', prefix: 'sk-pt-Demo', status: 'active', created_at: iso(-25 * DAY), last_used_at: iso(-120_000), scope: { mode: 'all', accounts: [], usable: true } } },
+  { userId: 1, value: { id: 2, name: '自动化工作流', prefix: 'sk-pt-Flow', status: 'active', created_at: iso(-12 * DAY), last_used_at: iso(-1_800_000), scope: { mode: 'selected', accounts: [1, 4], usable: true } } },
+  { userId: 1, value: { id: 3, name: '已停用的测试密钥', prefix: 'sk-pt-Test', status: 'disabled', created_at: iso(-30 * DAY), last_used_at: iso(-10 * DAY), scope: { mode: 'selected', accounts: [3], usable: false } } },
+  { userId: 2, value: { id: 4, name: '默认', prefix: 'sk-pt-User', status: 'active', created_at: iso(-5 * DAY), last_used_at: iso(-3_600_000), scope: { mode: 'all', accounts: [], usable: true } } },
 ]
 const orders: Owned<Order>[] = []
 const orderTerms = new Map<string, { unitQuantity: number; durationDays: number }>()
@@ -230,6 +231,20 @@ function findOwned<T extends { id: number }>(items: Owned<T>[], id: number, user
 }
 function emailOf(userId: number) { return users.find(user => user.id === userId)?.email ?? '' }
 function myValues<T>(items: Owned<T>[], userId: number): T[] { return items.filter(item => item.userId === userId).map(item => item.value) }
+function keyScope(value: unknown, userId: number): KeyScope {
+  if (value === undefined) return { mode: 'all', accounts: [], usable: true }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail(422, 'key_scope_invalid', '所选账号无效')
+  const input = value as Input
+  if (input.mode !== 'all' && input.mode !== 'selected') fail(422, 'key_scope_invalid', '所选账号无效')
+  if (input.mode === 'all') return { mode: 'all', accounts: [], usable: true }
+  if (!Array.isArray(input.accounts) || !input.accounts.every((id: unknown): id is number => typeof id === 'number' && Number.isSafeInteger(id) && id > 0)) fail(422, 'key_scope_invalid', '所选账号无效')
+  const ownedAccounts = myValues(accounts, userId)
+  const ids = [...new Set(input.accounts)]
+  if (ids.some(id => !ownedAccounts.some(account => account.id === id && account.status !== 'released'))) fail(422, 'key_scope_invalid', '所选账号无效')
+  const scope: KeyScope = { mode: 'selected', accounts: ids, usable: true }
+  if (!hasUsableKeyScope(scope, ownedAccounts)) fail(422, 'key_scope_empty', '所选账号当前都不可用，请至少选择一个可用账号')
+  return scope
+}
 function paginate<T>(items: T[], query: URLSearchParams): Page<T> {
   const pageValue = Number(query.get('page') ?? 1)
   const sizeValue = Number(query.get('page_size') ?? 20)
@@ -345,6 +360,7 @@ function refreshState() {
       onboardings.delete(account.id)
     }
   }
+  for (const entry of keys) entry.value.scope.usable = hasUsableKeyScope(entry.value.scope, myValues(accounts, entry.userId))
 }
 
 function tokenCount(log: UsageLog) { return log.input_tokens + log.output_tokens + log.cache_read_tokens + log.cache_creation_tokens }
@@ -634,7 +650,7 @@ const mockSessions = new Map<number, number>() // user id -> signed-in devices
 function profileOf(id: number) { return userProfiles.get(id) ?? { note: '', last_login_at: '', last_login_ip: '' } }
 function adminUser(user: User): AdminUser {
   const summary = overview(user.id)
-  return { ...user, ...profileOf(user.id), active_sessions: mockSessions.get(user.id) ?? (user.id === sessionUserId ? 1 : 0), concurrency_total: user.status === 'active' ? summary.concurrency.total : 0, hosted_used: summary.hosted_seats.used, hosted_total: summary.hosted_seats.total, rental_used: summary.rental_accounts.used, rental_total: summary.rental_accounts.total, vm2api_user_id: `demo-user-${user.id}` }
+  return { ...user, ...profileOf(user.id), active_sessions: mockSessions.get(user.id) ?? (user.id === sessionUserId ? 1 : 0), concurrency_total: user.status === 'active' ? summary.concurrency.total : 0, hosted_used: summary.hosted_seats.used, hosted_total: summary.hosted_seats.total, rental_used: summary.rental_accounts.used, rental_total: summary.rental_accounts.total, vm2api_user_id: null, vm2api_pool_id: myValues(keys, user.id).length || myValues(accounts, user.id).length ? `demo-account-${user.id}` : '' }
 }
 function dashboard(): AdminDashboard {
   const paidOrders = orders.filter(item => ['paid', 'fulfilled', 'fulfill_failed'].includes(item.value.status) && item.value.provider !== 'grant')
@@ -955,9 +971,10 @@ function userRequest(path: string, method: string, query: URLSearchParams, input
   if (path === '/keys' && method === 'POST') {
     if (myValues(keys, user.id).length >= 20) fail(422, 'key_limit', '最多只能创建 20 个密钥。')
     const name = limitedText(input, 'name', '默认') || '默认'
+    const scope = keyScope(input.scope, user.id)
     const bytes = crypto.getRandomValues(new Uint8Array(32))
     const secret = `sk-pt-${[...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')}`
-    const key: ApiKey = { id: nextId(), name, prefix: secret.slice(0, 12), status: 'active', created_at: new Date().toISOString(), last_used_at: null }
+    const key: ApiKey = { id: nextId(), name, prefix: secret.slice(0, 12), status: 'active', created_at: new Date().toISOString(), last_used_at: null, scope }
     keys.unshift({ userId: user.id, value: key })
     return ok({ key, secret }, 201)
   }
@@ -967,7 +984,8 @@ function userRequest(path: string, method: string, query: URLSearchParams, input
     if (method === 'DELETE') { keys.splice(keys.indexOf(entry), 1); return ok() }
     const name = input.name === undefined ? entry.value.name : limitedText(input, 'name', '')
     const status = input.status === undefined ? entry.value.status : oneOf(input.status, ['active', 'disabled'], 'invalid_status')
-    entry.value.name = name || '默认'; entry.value.status = status
+    const scope = input.scope === undefined ? entry.value.scope : keyScope(input.scope, user.id)
+    entry.value.name = name || '默认'; entry.value.status = status; entry.value.scope = scope
     return ok({ key: entry.value })
   }
   if (path === '/orders' && method === 'GET') return ok(paginate(myValues(orders, user.id).sort((a, b) => b.created_at.localeCompare(a.created_at)), query))

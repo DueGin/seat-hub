@@ -266,12 +266,42 @@ type BootstrapDTO struct {
 }
 
 type KeyDTO struct {
-	ID         int64   `json:"id"`
-	Name       string  `json:"name"`
-	Prefix     string  `json:"prefix"`
-	Status     string  `json:"status"`
-	CreatedAt  string  `json:"created_at"`
-	LastUsedAt *string `json:"last_used_at"`
+	ID         int64       `json:"id"`
+	Name       string      `json:"name"`
+	Prefix     string      `json:"prefix"`
+	Status     string      `json:"status"`
+	CreatedAt  string      `json:"created_at"`
+	LastUsedAt *string     `json:"last_used_at"`
+	Scope      KeyScopeDTO `json:"scope"`
+}
+
+// KeyScopeDTO is which of the user's accounts a key may call
+// (docs/KEY_SCOPE.md).
+type KeyScopeDTO struct {
+	Mode     string  `json:"mode"`     // all | selected
+	Accounts []int64 `json:"accounts"` // resource ids; [] when mode is all
+	// Usable is false when mode is selected and none of the selected accounts
+	// is currently available; such a key is rejected with key_no_accounts.
+	Usable bool `json:"usable"`
+}
+
+// KeyScopeInput is the requested scope. Mode "" means all.
+type KeyScopeInput struct {
+	Mode     string  `json:"mode"`
+	Accounts []int64 `json:"accounts"`
+}
+
+// KeyInput creates a key. The zero Scope means all accounts.
+type KeyInput struct {
+	Name  string
+	Scope KeyScopeInput
+}
+
+// KeyPatch changes a key; nil fields are left alone.
+type KeyPatch struct {
+	Name   *string
+	Status *string // active | disabled
+	Scope  *KeyScopeInput
 }
 
 type OverviewDTO struct {
@@ -383,7 +413,8 @@ type AdminUserDTO struct {
 	HostedTotal      int    `json:"hosted_total"`
 	RentalUsed       int    `json:"rental_used"`
 	RentalTotal      int    `json:"rental_total"`
-	VM2APIUserID     string `json:"vm2api_user_id"`
+	VM2APIUserID     string `json:"vm2api_user_id"` // legacy per-user vm2api user; "" once migrated
+	VM2APIPoolID     string `json:"vm2api_pool_id"` // the user's vm2api account pool
 	BaseURL          string `json:"-"`
 	Note             string `json:"note"`
 	LastLoginAt      string `json:"last_login_at"`
@@ -561,8 +592,8 @@ type UsageLogRowDTO struct {
 
 type KeyService interface {
 	List(ctx context.Context, userID int64) ([]KeyDTO, error)
-	Create(ctx context.Context, userID int64, name string) (KeyDTO, string, error)
-	Update(ctx context.Context, userID, id int64, name, status string) (KeyDTO, error)
+	Create(ctx context.Context, userID int64, in KeyInput) (KeyDTO, string, error)
+	Update(ctx context.Context, userID, id int64, in KeyPatch) (KeyDTO, error)
 	Delete(ctx context.Context, userID, id int64) error
 }
 

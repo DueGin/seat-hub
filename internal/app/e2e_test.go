@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ type harness struct {
 	client *http.Client
 
 	// What the last /v1 request actually handed to the upstream.
+	upstreamMu   *sync.Mutex
 	upstreamAuth string
 	upstreamBody string
 }
@@ -41,15 +43,33 @@ func newHarness(t *testing.T) *harness {
 		FiveHour: &vm2api.Window{Status: "ok"},
 		SevenDay: &vm2api.Window{Status: "ok"},
 	})
-	h := &harness{t: t, fake: fake}
+	h := &harness{t: t, fake: fake, upstreamMu: &sync.Mutex{}}
 	// The upstream serves the panel API from the fake and records /v1 traffic so
 	// the test can prove the gateway swapped credentials and forwarded the body.
 	panel := fake.Handler("master")
 	upstream := http.NewServeMux()
 	upstream.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) {
-		h.upstreamAuth = r.Header.Get("Authorization")
 		b, _ := io.ReadAll(r.Body)
+		h.upstreamMu.Lock()
+		h.upstreamAuth = r.Header.Get("Authorization")
 		h.upstreamBody = string(b)
+		h.upstreamMu.Unlock()
+		var call vm2api.ProtocolCall
+		var payload struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(b, &payload)
+		call.Secret = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		call.Model, call.InputTokens, call.OutputTokens = payload.Model, 10, 5
+		status, known := fake.RecordProtocolCall(call)
+		if !known {
+			status = http.StatusUnauthorized
+		}
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":{"message":"upstream scope denied"}}`))
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"type":"message","id":"msg_1"}`))
 	})
@@ -209,7 +229,7 @@ func TestEndToEndPurchaseAndProxy(t *testing.T) {
 		t.Fatalf("concurrency total = %d, want 6", overview.Concurrency.Total)
 	}
 
-	// A gateway key maps to a vm2api key owned by the portal user.
+	// A gateway key maps to a scoped vm2api key owned by the service user.
 	var keyResp struct {
 		Key struct {
 			Prefix string `json:"prefix"`
@@ -242,24 +262,23 @@ func TestEndToEndPurchaseAndProxy(t *testing.T) {
 	if err := h.app.DB.QueryRow(`SELECT id FROM users WHERE email='buyer@example.com'`).Scan(&userID); err != nil {
 		t.Fatal(err)
 	}
-	owner, err := h.app.DB.Query(`SELECT vm2api_user_id FROM users WHERE id=?`, userID)
-	if err != nil {
-		t.Fatal(err)
+	identity, err := store.LoadServiceIdentity(context.Background(), h.app.DB.DB)
+	if err != nil || identity.UserID == "" {
+		t.Fatalf("service identity missing: %+v, %v", identity, err)
 	}
-	if !owner.Next() {
-		t.Fatal("vm2api user not provisioned")
-	}
-	var upstream string
-	_ = owner.Scan(&upstream)
-	owner.Close()
-	if upstream == "" {
-		t.Fatal("expected a vm2api user after key creation")
-	}
+	upstream := identity.UserID
 	if _, err := h.app.DB.Exec(`INSERT INTO resources (user_id,kind,vm_id,label,status,created_at,updated_at)
 		VALUES (?,?,?,?,'active',?,?)`, userID, "rental", "vm-1", "池内账号", store.Now(), store.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.fake.SetVMOwner(context.Background(), "vm-1", &upstream); err != nil {
+		t.Fatal(err)
+	}
+	var poolID string
+	if err := h.app.DB.QueryRow(`SELECT vm2api_pool_id FROM users WHERE id=?`, userID).Scan(&poolID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.fake.SetPoolMembers(context.Background(), poolID, []string{"vm-1"}); err != nil {
 		t.Fatal(err)
 	}
 	// The resolver caches principals for a few seconds; a real deployment sees
@@ -278,6 +297,8 @@ func TestEndToEndPurchaseAndProxy(t *testing.T) {
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("gateway -> %d %s", resp2.StatusCode, body2)
 	}
+	h.upstreamMu.Lock()
+	defer h.upstreamMu.Unlock()
 	if !strings.HasPrefix(h.upstreamAuth, "Bearer sk-") || strings.HasPrefix(h.upstreamAuth, "Bearer sk-pt-") {
 		t.Fatalf("upstream auth = %q, want the vm2api key", h.upstreamAuth)
 	}

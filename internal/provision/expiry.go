@@ -213,7 +213,7 @@ func (service *Service) resumeResource(ctx context.Context, account Account) err
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit resource resumption: %w", err)
 	}
-	return nil
+	return service.syncScopeAfterAdd(ctx, account.UserID)
 }
 
 func (service *Service) DeleteHosted(ctx context.Context, userID, resourceID int64) error {
@@ -228,11 +228,6 @@ func (service *Service) DeleteHosted(ctx context.Context, userID, resourceID int
 	}
 	if account.Status == "released" {
 		return nil
-	}
-	if account.VMID != "" {
-		if err := service.client.SetSchedulable(ctx, account.VMID, false); err != nil && !vm2api.IsStatus(err, 404) {
-			return fmt.Errorf("disable deleted hosted resource: %w", err)
-		}
 	}
 	tx, err := service.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -253,6 +248,14 @@ func (service *Service) DeleteHosted(ctx context.Context, userID, resourceID int
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit hosted removal: %w", err)
+	}
+	if account.VMID != "" {
+		if err := service.client.SetSchedulable(ctx, account.VMID, false); err != nil && !vm2api.IsStatus(err, 404) {
+			return service.releaseError(ctx, resourceID, fmt.Errorf("disable deleted hosted resource: %w", err))
+		}
+	}
+	if err := service.SyncUserScope(ctx, userID); err != nil {
+		return service.releaseError(ctx, resourceID, err)
 	}
 	return nil
 }
@@ -330,6 +333,11 @@ func (service *Service) ReleaseResource(ctx context.Context, resourceID int64) e
 		if err := service.client.SetSchedulable(ctx, account.VMID, false); err != nil && !vm2api.IsStatus(err, 404) {
 			return service.releaseError(ctx, account.ID, fmt.Errorf("disable resource scheduling: %w", err))
 		}
+	}
+	if err := service.SyncUserScope(ctx, account.UserID); err != nil {
+		return service.releaseError(ctx, account.ID, fmt.Errorf("remove resource scope: %w", err))
+	}
+	if account.VMID != "" {
 		var releaseErr error
 		if account.Kind == "hosted" {
 			releaseErr = service.client.DeleteVM(ctx, account.VMID)

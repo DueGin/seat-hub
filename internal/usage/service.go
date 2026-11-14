@@ -1,46 +1,40 @@
 package usage
 
 import (
+	"container/heap"
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
+	"github.com/DueGin/seat-hub/internal/store"
 	"github.com/DueGin/seat-hub/internal/vm2api"
 )
 
-func (service *Service) owner(ctx context.Context, userID int64) (string, error) {
-	var owner sql.NullString
-	err := service.db.QueryRowContext(ctx, `SELECT vm2api_user_id FROM users WHERE id = ?`, userID).Scan(&owner)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", ErrNotFound
-	}
-	if err != nil {
-		return "", fmt.Errorf("read user: %w", err)
-	}
-	return owner.String, nil
-}
-
 func (service *Service) Overview(ctx context.Context, userID int64) (Overview, error) {
-	owner, err := service.owner(ctx, userID)
+	keys, err := service.keyMappings(ctx, userID)
 	if err != nil {
 		return Overview{}, err
 	}
-	if owner == "" || service.client == nil {
+	spend := &Spend{}
+	if len(keys) == 0 {
+		return Overview{UsageToday: spend}, nil
+	}
+	if service.client == nil {
 		return Overview{}, nil
 	}
 	until := service.now().UTC()
 	from := time.Date(until.Year(), until.Month(), until.Day(), 0, 0, 0, 0, time.UTC)
-	billing, err := service.client.UserBilling(ctx, owner, from, until)
+	err = service.scanKeyLogs(ctx, keys, from, until, func(row vm2api.LogRow) { addSpend(spend, row) })
 	if err != nil {
 		if ctx.Err() != nil {
 			return Overview{}, fmt.Errorf("fetch today's usage: %w", ctx.Err())
 		}
 		return Overview{}, nil
 	}
-	return Overview{UsageToday: &billing.Totals}, nil
+	return Overview{UsageToday: spend}, nil
 }
 
 type keyMapping struct {
@@ -60,29 +54,46 @@ type mappings struct {
 	accounts map[string][]accountMapping
 }
 
-func (service *Service) mappings(ctx context.Context, userID int64) (mappings, error) {
-	result := mappings{keys: make(map[string]keyMapping), accounts: make(map[string][]accountMapping)}
-	rows, err := service.db.QueryContext(ctx, `SELECT id, name, vm2api_key_id FROM api_keys WHERE user_id = ?`, userID)
-	if err != nil {
-		return result, fmt.Errorf("read key mappings: %w", err)
+func (service *Service) keyMappings(ctx context.Context, userID int64) (map[string]keyMapping, error) {
+	var exists bool
+	if err := service.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)`, userID).Scan(&exists); err != nil {
+		return nil, fmt.Errorf("read user: %w", err)
 	}
+	if !exists {
+		return nil, ErrNotFound
+	}
+	result := make(map[string]keyMapping)
+	rows, err := service.db.QueryContext(ctx, `SELECT id, name, vm2api_key_id, previous_vm2api_key_ids FROM api_keys WHERE user_id = ? ORDER BY id`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("read key mappings: %w", err)
+	}
+	defer rows.Close()
 	for rows.Next() {
 		var key keyMapping
-		var upstreamID string
-		if err := rows.Scan(&key.id, &key.name, &upstreamID); err != nil {
-			rows.Close()
-			return result, fmt.Errorf("scan key mapping: %w", err)
+		var upstreamID, previous string
+		if err := rows.Scan(&key.id, &key.name, &upstreamID, &previous); err != nil {
+			return nil, fmt.Errorf("scan key mapping: %w", err)
 		}
-		result.keys[upstreamID] = key
+		for _, id := range append(store.DecodeStrings(previous), upstreamID) {
+			if id != "" {
+				result[id] = key
+			}
+		}
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
-		return result, fmt.Errorf("read key mappings: %w", err)
+		return nil, fmt.Errorf("read key mappings: %w", err)
 	}
-	if err := rows.Close(); err != nil {
-		return result, fmt.Errorf("close key mappings: %w", err)
+	return result, nil
+}
+
+func (service *Service) mappings(ctx context.Context, userID int64) (mappings, error) {
+	result := mappings{accounts: make(map[string][]accountMapping)}
+	var err error
+	result.keys, err = service.keyMappings(ctx, userID)
+	if err != nil {
+		return result, err
 	}
-	rows, err = service.db.QueryContext(ctx, `SELECT id, label, vm_id, created_at, released_at
+	rows, err := service.db.QueryContext(ctx, `SELECT id, label, vm_id, created_at, released_at
 		FROM resources WHERE user_id = ? AND vm_id IS NOT NULL ORDER BY id`, userID)
 	if err != nil {
 		return result, fmt.Errorf("read account mappings: %w", err)
@@ -161,130 +172,117 @@ func (service *Service) Summary(ctx context.Context, userID int64, from, until t
 	if from.IsZero() || until.IsZero() || !until.After(from) {
 		return Summary{}, ErrInvalidRange
 	}
-	owner, err := service.owner(ctx, userID)
-	if err != nil {
-		return Summary{}, err
-	}
-	result := emptySummary(from, until)
-	if owner == "" {
-		return result, nil
-	}
-	if service.client == nil {
-		return Summary{}, fmt.Errorf("fetch billing: %w", vm2api.ErrUnavailable)
-	}
 	mapping, err := service.mappings(ctx, userID)
 	if err != nil {
 		return Summary{}, err
 	}
-	billing, err := service.client.UserBilling(ctx, owner, from, until)
+	result := emptySummary(from, until)
+	if len(mapping.keys) == 0 {
+		return result, nil
+	}
+	result.Stats.SuccessRate = 1
+	if service.client == nil {
+		return Summary{}, fmt.Errorf("fetch usage: %w", vm2api.ErrUnavailable)
+	}
+	daily := make(map[string]DailyUsage)
+	models := make(map[string]ModelUsage)
+	keys := make(map[int64]KeyUsage)
+	accounts := make(map[int64]AccountSpend)
+	latencies := make([]int64, 0)
+	// Billing's per-key DTO omits token categories. Use the same scoped log
+	// scan for totals and breakdowns so input/output/cache counts stay intact.
+	err = service.scanKeyLogs(ctx, mapping.keys, from, until, func(row vm2api.LogRow) {
+		addSpend(&result.Totals, row)
+		tokens := logTokens(row)
+		date := row.CreatedAt.UTC().Format("2006-01-02")
+		day := daily[date]
+		day.Date, day.Requests, day.Tokens, day.CostUSD = date, day.Requests+1, day.Tokens+tokens, day.CostUSD+row.CostUSD
+		daily[date] = day
+		model := models[row.Model]
+		model.Model, model.Requests, model.Tokens, model.CostUSD = row.Model, model.Requests+1, model.Tokens+tokens, model.CostUSD+row.CostUSD
+		models[row.Model] = model
+		key := mapping.keys[row.KeyID]
+		spend := keys[key.id]
+		spend.KeyID, spend.KeyName = key.id, key.name
+		spend.Requests, spend.Tokens, spend.CostUSD = spend.Requests+1, spend.Tokens+tokens, spend.CostUSD+row.CostUSD
+		keys[key.id] = spend
+		if account, ok := mapping.account(row.VMID, row.CreatedAt, row.CreatedAt.Add(time.Nanosecond)); ok {
+			spend := accounts[account.id]
+			spend.AccountID, spend.Label = account.id, account.label
+			spend.Requests, spend.Tokens, spend.CostUSD = spend.Requests+1, spend.Tokens+tokens, spend.CostUSD+row.CostUSD
+			accounts[account.id] = spend
+		}
+		if row.StatusCode < 200 || row.StatusCode >= 400 {
+			result.Stats.ErrorCount++
+		}
+		if row.FirstTokenMS != nil {
+			latencies = append(latencies, *row.FirstTokenMS)
+			result.Stats.AvgTTFTMS += float64(*row.FirstTokenMS)
+		}
+	})
 	if err != nil {
-		return Summary{}, fmt.Errorf("fetch billing: %w", err)
+		return Summary{}, err
 	}
-	stats, err := service.client.UserRequestStats(ctx, owner, from, until)
-	if err != nil {
-		return Summary{}, fmt.Errorf("fetch request stats: %w", err)
+	for _, day := range daily {
+		result.Daily = append(result.Daily, day)
 	}
-	result.Totals = billing.Totals
-	result.Daily = append(result.Daily, billing.Daily...)
-	result.ByModel = append(result.ByModel, billing.ByModel...)
-	resolveAccountHistory := false
-	for _, row := range billing.ByVM {
-		if _, ok := mapping.account(row.VMID, from, until); !ok && len(mapping.accounts[row.VMID]) > 1 {
-			resolveAccountHistory = true
-		}
+	for _, model := range models {
+		result.ByModel = append(result.ByModel, model)
 	}
-	var breakdown requestBreakdown
-	if billing.Totals.Requests > 0 && (len(billing.Daily) == 0 || len(billing.ByModel) == 0 || resolveAccountHistory) {
-		breakdown, err = service.breakdown(ctx, owner, from, until, mapping)
-		if err != nil {
-			return Summary{}, err
-		}
-		if len(billing.Daily) == 0 {
-			result.Daily = breakdown.daily
-		}
-		if len(billing.ByModel) == 0 {
-			result.ByModel = breakdown.byModel
-		}
+	for _, key := range keys {
+		result.ByKey = append(result.ByKey, key)
 	}
-	for _, row := range billing.ByKey {
-		if key, ok := mapping.keys[row.KeyID]; ok {
-			result.ByKey = append(result.ByKey, KeyUsage{
-				KeyID: key.id, KeyName: key.name, Requests: row.Requests, Tokens: row.Tokens, CostUSD: row.CostUSD,
-			})
-		}
+	for _, account := range accounts {
+		result.ByAccount = append(result.ByAccount, account)
 	}
-	for _, row := range billing.ByVM {
-		if account, ok := mapping.account(row.VMID, from, until); ok {
-			result.ByAccount = append(result.ByAccount, AccountSpend{
-				AccountID: account.id, Label: account.label, Requests: row.Requests, Tokens: row.Tokens, CostUSD: row.CostUSD,
-			})
-		}
-	}
-	if resolveAccountHistory {
-		result.ByAccount = breakdown.byAccount
-	}
+	sort.Slice(result.Daily, func(left, right int) bool { return result.Daily[left].Date < result.Daily[right].Date })
+	sort.Slice(result.ByModel, func(left, right int) bool { return result.ByModel[left].Model < result.ByModel[right].Model })
 	sort.Slice(result.ByKey, func(left, right int) bool { return result.ByKey[left].KeyID < result.ByKey[right].KeyID })
 	sort.Slice(result.ByAccount, func(left, right int) bool {
 		return result.ByAccount[left].AccountID < result.ByAccount[right].AccountID
 	})
-	result.Stats = Stats{
-		SuccessRate: stats.SuccessRate, AvgTTFTMS: stats.AvgTTFTMS, P95TTFTMS: stats.P95TTFTMS, ErrorCount: stats.ErrorCount,
+	if result.Totals.Requests > 0 {
+		result.Stats.SuccessRate = float64(result.Totals.Requests-result.Stats.ErrorCount) / float64(result.Totals.Requests)
+	}
+	if len(latencies) > 0 {
+		sort.Slice(latencies, func(left, right int) bool { return latencies[left] < latencies[right] })
+		result.Stats.AvgTTFTMS /= float64(len(latencies))
+		result.Stats.P95TTFTMS = float64(latencies[int(math.Ceil(float64(len(latencies))*0.95))-1])
 	}
 	return result, nil
 }
 
-type requestBreakdown struct {
-	daily     []DailyUsage
-	byModel   []ModelUsage
-	byAccount []AccountSpend
+func sortedKeyIDs(keys map[string]keyMapping, portalKeyID int64) []string {
+	ids := make([]string, 0, len(keys))
+	for upstreamID, key := range keys {
+		if portalKeyID == 0 || key.id == portalKeyID {
+			ids = append(ids, upstreamID)
+		}
+	}
+	sort.Strings(ids)
+	return ids
 }
 
-func (service *Service) breakdown(ctx context.Context, owner string, from, until time.Time, mapping mappings) (requestBreakdown, error) {
-	daily := make(map[string]DailyUsage)
-	models := make(map[string]ModelUsage)
-	accounts := make(map[int64]AccountSpend)
-	for page := 1; ; page++ {
-		result, err := service.client.UserRequestLogs(ctx, owner, vm2api.LogQuery{
-			From: from, Until: until, Page: page, PageSize: 100,
-		})
-		if err != nil {
-			return requestBreakdown{}, fmt.Errorf("fetch usage breakdown: %w", err)
-		}
-		for _, row := range result.Items {
-			tokens := logTokens(row)
-			date := row.CreatedAt.UTC().Format("2006-01-02")
-			day := daily[date]
-			day.Date, day.Requests, day.Tokens, day.CostUSD = date, day.Requests+1, day.Tokens+tokens, day.CostUSD+row.CostUSD
-			daily[date] = day
-			model := models[row.Model]
-			model.Model, model.Requests, model.Tokens, model.CostUSD = row.Model, model.Requests+1, model.Tokens+tokens, model.CostUSD+row.CostUSD
-			models[row.Model] = model
-			if account, ok := mapping.account(row.VMID, row.CreatedAt, row.CreatedAt.Add(time.Nanosecond)); ok {
-				spend := accounts[account.id]
-				spend.AccountID, spend.Label = account.id, account.label
-				spend.Requests, spend.Tokens, spend.CostUSD = spend.Requests+1, spend.Tokens+tokens, spend.CostUSD+row.CostUSD
-				accounts[account.id] = spend
+func (service *Service) scanKeyLogs(ctx context.Context, keys map[string]keyMapping, from, until time.Time, visit func(vm2api.LogRow)) error {
+	for _, keyID := range sortedKeyIDs(keys, 0) {
+		for page := 1; ; page++ {
+			result, err := service.client.UserRequestLogs(ctx, "", vm2api.LogQuery{
+				KeyID: keyID, From: from, Until: until, Page: page, PageSize: 100,
+			})
+			if err != nil {
+				return fmt.Errorf("fetch usage logs: %w", err)
+			}
+			for _, row := range result.Items {
+				if row.KeyID == keyID && !row.CreatedAt.Before(from) && !row.CreatedAt.After(until) {
+					visit(row)
+				}
+			}
+			if len(result.Items) == 0 || int64(page)*100 >= result.Total {
+				break
 			}
 		}
-		if len(result.Items) == 0 || int64(page)*100 >= result.Total {
-			break
-		}
 	}
-	days := make([]DailyUsage, 0, len(daily))
-	for _, day := range daily {
-		days = append(days, day)
-	}
-	byModel := make([]ModelUsage, 0, len(models))
-	for _, model := range models {
-		byModel = append(byModel, model)
-	}
-	byAccount := make([]AccountSpend, 0, len(accounts))
-	for _, account := range accounts {
-		byAccount = append(byAccount, account)
-	}
-	sort.Slice(days, func(left, right int) bool { return days[left].Date < days[right].Date })
-	sort.Slice(byModel, func(left, right int) bool { return byModel[left].Model < byModel[right].Model })
-	return requestBreakdown{daily: days, byModel: byModel, byAccount: byAccount}, nil
+	return nil
 }
 
 func (service *Service) Logs(ctx context.Context, userID int64, query LogQuery) (LogPage, error) {
@@ -315,26 +313,16 @@ func (service *Service) Logs(ctx context.Context, userID int64, query LogQuery) 
 	if !query.Until.After(query.From) {
 		return LogPage{}, ErrInvalidRange
 	}
-	owner, err := service.owner(ctx, userID)
-	if err != nil {
-		return LogPage{}, err
-	}
 	mapping, err := service.mappings(ctx, userID)
 	if err != nil {
 		return LogPage{}, err
 	}
-	var upstreamKeyID string
-	if query.KeyID != 0 {
-		found := false
-		for upstreamID, key := range mapping.keys {
-			if key.id == query.KeyID {
-				upstreamKeyID, found = upstreamID, true
-				break
-			}
-		}
-		if !found {
-			return LogPage{}, ErrNotFound
-		}
+	keyIDs := sortedKeyIDs(mapping.keys, query.KeyID)
+	if query.KeyID != 0 && len(keyIDs) == 0 {
+		return LogPage{}, ErrNotFound
+	}
+	if len(keyIDs) > 1 && query.Page > maxMergedLogRows/query.PageSize {
+		return LogPage{}, ErrInvalidPagination
 	}
 	result := LogPage{Items: []LogRow{}, Page: query.Page, PageSize: query.PageSize}
 	var upstreamVMID string
@@ -363,21 +351,25 @@ func (service *Service) Logs(ctx context.Context, userID int64, query LogQuery) 
 		}
 		upstreamVMID = vmID
 	}
-	if owner == "" {
+	if len(keyIDs) == 0 {
 		return result, nil
 	}
 	if service.client == nil {
 		return LogPage{}, fmt.Errorf("fetch request logs: %w", vm2api.ErrUnavailable)
 	}
-	page, err := service.client.UserRequestLogs(ctx, owner, vm2api.LogQuery{
+	page, err := service.keyLogPage(ctx, keyIDs, vm2api.LogQuery{
 		From: query.From, Until: query.Until, Page: query.Page, PageSize: query.PageSize,
-		Model: query.Model, KeyID: upstreamKeyID, VMID: upstreamVMID, Status: query.Status,
+		Model: query.Model, VMID: upstreamVMID, Status: query.Status,
 	})
 	if err != nil {
 		return LogPage{}, fmt.Errorf("fetch request logs: %w", err)
 	}
 	result.Total = page.Total
 	for _, row := range page.Items {
+		key, ok := mapping.keys[row.KeyID]
+		if !ok {
+			continue
+		}
 		item := LogRow{
 			RequestID: row.RequestID, CreatedAt: row.CreatedAt.UTC(), Model: row.Model,
 			Stream: row.Stream, StatusCode: row.StatusCode, ErrorLabel: errorLabel(row.StatusCode),
@@ -385,13 +377,94 @@ func (service *Service) Logs(ctx context.Context, userID int64, query LogQuery) 
 			CacheReadTokens: row.CacheReadTokens, CacheCreationTokens: row.CacheCreationTokens,
 			CostUSD: row.CostUSD, DurationMS: row.DurationMS, FirstTokenMS: clonePointer(row.FirstTokenMS),
 		}
-		if key, ok := mapping.keys[row.KeyID]; ok {
-			item.KeyID, item.KeyName = &key.id, &key.name
-		}
+		item.KeyID, item.KeyName = &key.id, &key.name
 		if account, ok := mapping.account(row.VMID, row.CreatedAt, row.CreatedAt.Add(time.Nanosecond)); ok {
 			item.AccountID, item.AccountLabel = &account.id, &account.label
 		}
 		result.Items = append(result.Items, item)
+	}
+	return result, nil
+}
+
+// Multi-key pagination is limited to the first 10,000 rows, bounding each
+// key's prefix scan to page*page_size rows. Single-key pages pass through.
+const maxMergedLogRows = 10_000
+
+type keyLogCursor struct {
+	keyID string
+	items []vm2api.LogRow
+	index int
+	page  int
+	total int64
+}
+
+type keyLogHeap []*keyLogCursor
+
+func (items keyLogHeap) Len() int { return len(items) }
+func (items keyLogHeap) Less(left, right int) bool {
+	l, r := items[left], items[right]
+	lTime, rTime := l.items[l.index].CreatedAt, r.items[r.index].CreatedAt
+	if lTime.Equal(rTime) {
+		return l.keyID < r.keyID
+	}
+	return lTime.After(rTime)
+}
+func (items keyLogHeap) Swap(left, right int) { items[left], items[right] = items[right], items[left] }
+func (items *keyLogHeap) Push(value any)      { *items = append(*items, value.(*keyLogCursor)) }
+func (items *keyLogHeap) Pop() any {
+	last := len(*items) - 1
+	value := (*items)[last]
+	(*items)[last] = nil
+	*items = (*items)[:last]
+	return value
+}
+
+func (service *Service) keyLogPage(ctx context.Context, keyIDs []string, query vm2api.LogQuery) (vm2api.LogPage, error) {
+	if len(keyIDs) == 1 {
+		query.KeyID = keyIDs[0]
+		return service.client.UserRequestLogs(ctx, "", query)
+	}
+	result := vm2api.LogPage{Items: []vm2api.LogRow{}, Page: query.Page, PageSize: query.PageSize}
+	maxPage := query.Page
+	query.Page = 1
+	cursors := make(keyLogHeap, 0, len(keyIDs))
+	for _, keyID := range keyIDs {
+		query.KeyID = keyID
+		page, err := service.client.UserRequestLogs(ctx, "", query)
+		if err != nil {
+			return vm2api.LogPage{}, err
+		}
+		result.Total += page.Total
+		if len(page.Items) > 0 {
+			cursors = append(cursors, &keyLogCursor{keyID: keyID, items: page.Items, page: 1, total: page.Total})
+		}
+	}
+	heap.Init(&cursors)
+	skip, limit := (maxPage-1)*query.PageSize, maxPage*query.PageSize
+	for index := 0; index < limit && cursors.Len() > 0; index++ {
+		cursor := heap.Pop(&cursors).(*keyLogCursor)
+		if index >= skip {
+			result.Items = append(result.Items, cursor.items[cursor.index])
+		}
+		if index+1 == limit {
+			break
+		}
+		cursor.index++
+		if cursor.index == len(cursor.items) {
+			if cursor.page >= maxPage || int64(cursor.page)*int64(query.PageSize) >= cursor.total {
+				continue
+			}
+			cursor.page++
+			query.KeyID, query.Page = cursor.keyID, cursor.page
+			page, err := service.client.UserRequestLogs(ctx, "", query)
+			if err != nil {
+				return vm2api.LogPage{}, err
+			}
+			cursor.items, cursor.index = page.Items, 0
+		}
+		if cursor.index < len(cursor.items) {
+			heap.Push(&cursors, cursor)
+		}
 	}
 	return result, nil
 }

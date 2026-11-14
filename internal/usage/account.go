@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/DueGin/seat-hub/internal/store"
 	"github.com/DueGin/seat-hub/internal/vm2api"
 )
 
@@ -24,9 +25,9 @@ type Service struct {
 }
 
 type cacheKey struct {
-	userID, resourceID int64
-	vmID, ownerID      string
-	createdAt          time.Time
+	userID, resourceID           int64
+	vmID, ownerID, legacyOwnerID string
+	createdAt, releasedAt        time.Time
 }
 
 type cacheEntry struct {
@@ -43,26 +44,42 @@ func New(db *sql.DB, client vm2api.Client) *Service {
 
 func (service *Service) AccountUsage(ctx context.Context, userID, resourceID int64) (*AccountUsage, error) {
 	var label, status, created string
-	var vmID, ownerID sql.NullString
-	err := service.db.QueryRowContext(ctx, `SELECT r.label, r.status, r.vm_id, u.vm2api_user_id, r.created_at
+	var vmID, ownerID, released sql.NullString
+	err := service.db.QueryRowContext(ctx, `SELECT r.label, r.status, r.vm_id, u.vm2api_user_id, r.created_at, r.released_at
 		FROM resources r JOIN users u ON u.id = r.user_id
-		WHERE r.id = ? AND r.user_id = ?`, resourceID, userID).Scan(&label, &status, &vmID, &ownerID, &created)
+		WHERE r.id = ? AND r.user_id = ?`, resourceID, userID).Scan(&label, &status, &vmID, &ownerID, &created, &released)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read account: %w", err)
 	}
-	if status != "active" && status != "needs_reauth" && status != "suspended" || vmID.String == "" || ownerID.String == "" || service.client == nil {
+	if status != "active" && status != "needs_reauth" && status != "suspended" || vmID.String == "" || service.client == nil {
+		return nil, nil
+	}
+	identity, err := store.LoadServiceIdentity(ctx, service.db)
+	if err != nil {
+		return nil, fmt.Errorf("load service identity: %w", err)
+	}
+	if identity.UserID == "" && ownerID.String == "" {
 		return nil, nil
 	}
 	createdAt, err := time.Parse(time.RFC3339, created)
 	if err != nil {
 		return nil, fmt.Errorf("parse account creation time: %w", err)
 	}
-	result, err := service.cachedAccountUsage(ctx, cacheKey{
-		userID: userID, resourceID: resourceID, vmID: vmID.String, ownerID: ownerID.String, createdAt: createdAt.UTC(),
-	})
+	key := cacheKey{
+		userID: userID, resourceID: resourceID, vmID: vmID.String,
+		ownerID: identity.UserID, legacyOwnerID: ownerID.String, createdAt: createdAt.UTC(),
+	}
+	if released.Valid {
+		key.releasedAt, err = time.Parse(time.RFC3339, released.String)
+		if err != nil {
+			return nil, fmt.Errorf("parse account release time: %w", err)
+		}
+		key.releasedAt = key.releasedAt.UTC()
+	}
+	result, err := service.cachedAccountUsage(ctx, key)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("fetch account usage: %w", ctx.Err())
@@ -98,7 +115,8 @@ func (service *Service) cachedAccountUsage(ctx context.Context, key cacheKey) (*
 
 		upstream, err := service.client.GetAccountUsage(ctx, key.vmID)
 		var result *AccountUsage
-		if err == nil && upstream.VM.ID == key.vmID && upstream.VM.OwnerUserID == key.ownerID {
+		owner := upstream.VM.OwnerUserID
+		if err == nil && upstream.VM.ID == key.vmID && owner != "" && (owner == key.ownerID || owner == key.legacyOwnerID) {
 			result = redactAccountUsage(upstream)
 			err = service.scopeAccountSpend(ctx, key, result)
 		}
@@ -126,7 +144,14 @@ func (service *Service) cachedAccountUsage(ctx context.Context, key cacheKey) (*
 }
 
 func (service *Service) scopeAccountSpend(ctx context.Context, key cacheKey, result *AccountUsage) error {
+	keys, err := service.keyMappings(ctx, key.userID)
+	if err != nil {
+		return fmt.Errorf("read account keys: %w", err)
+	}
 	until := service.now().UTC()
+	if !key.releasedAt.IsZero() && until.After(key.releasedAt) {
+		until = key.releasedAt
+	}
 	from := until.AddDate(0, 0, -30)
 	if key.createdAt.After(from) {
 		from = key.createdAt
@@ -137,16 +162,17 @@ func (service *Service) scopeAccountSpend(ctx context.Context, key cacheKey, res
 	today, window5h, window7d := &Spend{}, &Spend{}, &Spend{}
 	daily := make(map[string]DailyUsage)
 	models := make(map[string]ModelUsage)
-	if !from.After(until) {
+	if len(keys) > 0 && !from.After(until) {
 		for page := 1; ; page++ {
-			logs, err := service.client.UserRequestLogs(ctx, key.ownerID, vm2api.LogQuery{
-				From: from, Until: until, Page: page, PageSize: 100,
+			logs, err := service.client.UserRequestLogs(ctx, "", vm2api.LogQuery{
+				VMID: key.vmID, From: from, Until: until, Page: page, PageSize: 100,
 			})
 			if err != nil {
 				return fmt.Errorf("fetch account history: %w", err)
 			}
 			for _, row := range logs.Items {
-				if row.VMID != key.vmID || row.CreatedAt.Before(from) || row.CreatedAt.After(until) {
+				_, owned := keys[row.KeyID]
+				if !owned || row.VMID != key.vmID || row.CreatedAt.Before(from) || row.CreatedAt.After(until) {
 					continue
 				}
 				if !row.CreatedAt.Before(dayStart) {

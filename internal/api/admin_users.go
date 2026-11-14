@@ -384,7 +384,7 @@ func (s *Server) handleAdminUserKey(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnprocessableEntity, "invalid_status", "status 只能是 active 或 disabled")
 		return
 	}
-	key, err := s.Deps.Keys.Update(r.Context(), id, keyID, "", body.Status)
+	key, err := s.Deps.Keys.Update(r.Context(), id, keyID, KeyPatch{Status: &body.Status})
 	if err != nil {
 		s.fail(w, r, err)
 		return

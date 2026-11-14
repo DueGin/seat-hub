@@ -510,7 +510,7 @@ func TestAdminJobsPaginationAndRetry(t *testing.T) {
 func TestAdminGrantAndDeferredEntitlementSync(t *testing.T) {
 	service, _ := adminFixture(t)
 	ctx := context.Background()
-	key, _, err := service.Create(ctx, 2, "赠送同步")
+	key, _, err := service.Create(ctx, 2, keyInput("赠送同步"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,7 +5,9 @@ import { KeyRound, Plus, RefreshCw } from 'lucide-react'
 import { toast } from 'sonner'
 import { api, isMock, safeExternalUrl } from '@/lib/api'
 import { date, dateTime, number, usd } from '@/lib/format'
-import type { ApiKey, DailyUsage, ModelUsage, PublicConfig } from '@/lib/types'
+import type { Account, ApiKey, DailyUsage, KeyScopeInput, ModelUsage, PublicConfig } from '@/lib/types'
+import { hasUsableKeyScope, toKeyScopeInput } from '@/lib/key-scope'
+import { KeyScopePicker, KeyScopeSummary } from '@/components/ui/key-scope'
 import {
   Badge, Button, Card, CopyButton, EmptyState, Field, FieldInput, Modal,
   Notice, PageHeader, QueryState, StatCard,
@@ -56,12 +58,16 @@ export function KeysPage() {
   const queryClient = useQueryClient()
   const [createOpen, setCreateOpen] = useState(false)
   const [name, setName] = useState('')
+  const [createScope, setCreateScope] = useState<KeyScopeInput>({ mode: 'all', accounts: [] })
+  const [scopeKey, setScopeKey] = useState<ApiKey | null>(null)
+  const [editScope, setEditScope] = useState<KeyScopeInput>({ mode: 'all', accounts: [] })
   const [created, setCreated] = useState<{ name: string; secret: string } | null>(null)
   const [action, setAction] = useState<KeyAction | null>(null)
   const [statsKey, setStatsKey] = useState<ApiKey | null>(null)
   const [tab, setTab] = useState<ExampleTab>('curl')
 
   const keysQuery = useQuery({ queryKey: ['keys'], queryFn: () => api.get<{ items: ApiKey[] }>('/keys') })
+  const accountsQuery = useQuery({ queryKey: ['accounts', 'key-scope'], queryFn: () => api.get<{ items: Account[] }>('/accounts?include_released=1'), refetchInterval: 30_000 })
   const configQuery = useQuery({ queryKey: ['public-config'], queryFn: () => api.get<PublicConfig>('/public/config') })
   const statsQuery = useQuery({
     queryKey: ['key-stats', statsKey?.id],
@@ -73,8 +79,8 @@ export function KeysPage() {
   })
 
   const createKey = useMutation({
-    mutationFn: async (keyName: string) => {
-      const result = await api.post<{ key: ApiKey; secret: string }>('/keys', { name: keyName })
+    mutationFn: async (input: { name: string; scope: KeyScopeInput }) => {
+      const result = await api.post<{ key: ApiKey; secret: string }>('/keys', input)
       setCreated({ name: result.key.name, secret: result.secret })
       return result.key
     },
@@ -83,6 +89,14 @@ export function KeysPage() {
       setName('')
       void queryClient.invalidateQueries({ queryKey: ['keys'] })
       void queryClient.invalidateQueries({ queryKey: ['overview'] })
+    },
+  })
+  const changeScope = useMutation({
+    mutationFn: ({ key, scope }: { key: ApiKey; scope: KeyScopeInput }) => api.patch<{ key: ApiKey }>(`/keys/${key.id}`, { scope }),
+    onSuccess: () => {
+      setScopeKey(null)
+      toast.success('可调用的账号已更新')
+      void queryClient.invalidateQueries({ queryKey: ['keys'] })
     },
   })
   const changeKey = useMutation({
@@ -100,6 +114,9 @@ export function KeysPage() {
   })
 
   const keys = keysQuery.data?.items ?? []
+  const accounts = accountsQuery.data?.items ?? []
+  const createScopeValid = createScope.mode === 'all' || (accountsQuery.isSuccess && hasUsableKeyScope(createScope, accounts))
+  const editScopeValid = editScope.mode === 'all' || (accountsQuery.isSuccess && hasUsableKeyScope(editScope, accounts))
   const keyLimitReached = keys.length >= 20
   const baseUrl = (safeExternalUrl(configQuery.data?.base_url) ?? window.location.origin).replace(/\/+$/, '')
   const examples = connectionExamples(baseUrl)
@@ -114,12 +131,24 @@ export function KeysPage() {
   function openCreate() {
     createKey.reset()
     setName('')
+    setCreateScope({ mode: 'all', accounts: [] })
     setCreateOpen(true)
   }
 
   function submitCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (name.trim() && !createKey.isPending) createKey.mutate(name.trim())
+    if (name.trim() && createScopeValid && !createKey.isPending && !keyLimitReached) createKey.mutate({ name: name.trim(), scope: toKeyScopeInput(createScope, accounts) })
+  }
+
+  function openScope(key: ApiKey) {
+    changeScope.reset()
+    setEditScope({ mode: key.scope.mode, accounts: [...key.scope.accounts] })
+    setScopeKey(key)
+    void accountsQuery.refetch()
+  }
+
+  function scopePicker(value: KeyScopeInput, onChange: (scope: KeyScopeInput) => void, disabled: boolean) {
+    return <KeyScopePicker value={value} onChange={onChange} accounts={accounts} disabled={disabled} loading={accountsQuery.isPending} error={accountsQuery.isError ? accountsQuery.error.message : null} onRetry={() => { void accountsQuery.refetch() }} />
   }
 
   function openAction(next: KeyAction) {
@@ -138,12 +167,13 @@ export function KeysPage() {
       <div className="section-heading"><div><h2>我的密钥</h2><p className="muted">明文仅在创建时显示一次，请妥善保管。</p></div><Button variant="ghost" aria-label="刷新密钥列表" disabled={keysQuery.isFetching} onClick={() => { void keysQuery.refetch() }}><RefreshCw size={16} /></Button></div>
       <QueryState query={keysQuery}>
         {!keys.length ? <EmptyState title="还没有 API 密钥" description="创建你的第一个密钥，即可在客户端中使用模型服务。" action={<Button onClick={openCreate}><KeyRound size={16} />创建密钥</Button>} /> : <div className="table-wrap"><table className="data-table">
-          <thead><tr><th>名称 / 前缀</th><th>状态</th><th>创建时间</th><th>最近使用</th><th>操作</th></tr></thead>
+          <thead><tr><th>名称 / 前缀</th><th>状态</th><th>可调用的账号</th><th>创建时间</th><th>最近使用</th><th>操作</th></tr></thead>
           <tbody>{keys.map((key) => <tr key={key.id}>
             <td><strong>{key.name}</strong><div className="mono muted">{key.prefix}…</div></td>
             <td><Badge status={key.status}>{key.status === 'active' ? '已启用' : '已停用'}</Badge></td>
+            <td><KeyScopeSummary scope={key.scope} accounts={accounts} /></td>
             <td>{dateTime(key.created_at)}</td><td>{key.last_used_at ? dateTime(key.last_used_at) : '尚未使用'}</td>
-            <td><div className="row"><Button variant="ghost" onClick={() => setStatsKey(key)}>用量</Button><Button variant="secondary" disabled={changeKey.isPending} onClick={() => openAction({ type: 'toggle', key })}>{key.status === 'active' ? '停用' : '启用'}</Button><Button variant="danger" disabled={changeKey.isPending} onClick={() => openAction({ type: 'delete', key })}>删除</Button></div></td>
+            <td><div className="row"><Button variant="ghost" onClick={() => setStatsKey(key)}>用量</Button><Button variant="ghost" disabled={changeScope.isPending} onClick={() => openScope(key)}>账号范围</Button><Button variant="secondary" disabled={changeKey.isPending} onClick={() => openAction({ type: 'toggle', key })}>{key.status === 'active' ? '停用' : '启用'}</Button><Button variant="danger" disabled={changeKey.isPending} onClick={() => openAction({ type: 'delete', key })}>删除</Button></div></td>
           </tr>)}</tbody>
         </table></div>}
       </QueryState>
@@ -160,16 +190,32 @@ export function KeysPage() {
         <pre className="code-block"><code>{examples[tab]}</code></pre>
         <div className="row"><CopyButton value={examples[tab]} label="复制示例" /></div>
       </div>
-      <p className="muted">密钥继承你的可用资源与并发额度；请避免在浏览器前端代码或公开仓库中暴露密钥。</p>
+      <p className="muted">密钥仅调用所选范围内的账号，共享你的并发额度；请避免在浏览器前端代码或公开仓库中暴露密钥。</p>
     </Card>
 
-    <Modal open={createOpen} title="创建 API 密钥" onClose={() => { if (!createKey.isPending) setCreateOpen(false) }}>
-      <form className="stack" onSubmit={submitCreate}>
+    <Modal open={createOpen} title="创建 API 密钥" onClose={() => { if (!createKey.isPending) setCreateOpen(false) }} footer={<>
+      {createKey.isError && <p role="alert">{createKey.error.message}</p>}
+      <Button type="button" variant="secondary" disabled={createKey.isPending} onClick={() => setCreateOpen(false)}>取消</Button><Button type="submit" form="create-key" disabled={!name.trim() || !createScopeValid || createKey.isPending || keyLimitReached}>{createKey.isPending ? '正在创建…' : '创建密钥'}</Button>
+    </>}>
+      <form id="create-key" className="stack" onSubmit={submitCreate}>
         <Field label="密钥名称" hint="用应用名称区分不同密钥，例如：开发环境、Claude Code。"><FieldInput autoFocus required value={name} onChange={(event) => setName(event.target.value)} placeholder="为这个密钥命名" disabled={createKey.isPending} /></Field>
+        {scopePicker(createScope, (scope) => { createKey.reset(); setCreateScope(scope) }, createKey.isPending)}
         <Notice>创建后会展示一次完整密钥。关闭窗口后无法再次查看，请及时复制并安全保存。</Notice>
-        {createKey.isError && <p role="alert">{createKey.error.message}</p>}
-        <div className="toolbar"><Button type="button" variant="secondary" disabled={createKey.isPending} onClick={() => setCreateOpen(false)}>取消</Button><Button type="submit" disabled={!name.trim() || createKey.isPending || keyLimitReached}>{createKey.isPending ? '正在创建…' : '创建密钥'}</Button></div>
       </form>
+    </Modal>
+
+    <Modal open={scopeKey !== null} title="修改账号范围" onClose={() => { if (!changeScope.isPending) setScopeKey(null) }} footer={<>
+      {changeScope.isError && <p role="alert">{changeScope.error.message}</p>}
+      <Button type="button" variant="secondary" disabled={changeScope.isPending} onClick={() => setScopeKey(null)}>取消</Button><Button type="submit" form="edit-key-scope" disabled={!editScopeValid || changeScope.isPending}>{changeScope.isPending ? '正在保存…' : '保存范围'}</Button>
+    </>}>
+      {scopeKey && <form id="edit-key-scope" className="stack" onSubmit={(event) => {
+        event.preventDefault()
+        if (editScopeValid && !changeScope.isPending) changeScope.mutate({ key: scopeKey, scope: toKeyScopeInput(editScope, accounts) })
+      }}>
+        <p>为「{scopeKey.name}」选择可调用的账号。</p>
+        {scopePicker(editScope, (scope) => { changeScope.reset(); setEditScope(scope) }, changeScope.isPending)}
+        <Notice>保存后对新请求生效，应用中使用的密钥不变。</Notice>
+      </form>}
     </Modal>
 
     <Modal open={created !== null} title="密钥已创建，请立即保存" onClose={() => setCreated(null)}>
@@ -183,7 +229,7 @@ export function KeysPage() {
     <Modal open={action !== null} title={action?.type === 'delete' ? '删除密钥' : action?.key.status === 'active' ? '停用密钥' : '启用密钥'} onClose={() => { if (!changeKey.isPending) setAction(null) }}>
       {action && <div className="stack">
         <p>确认{action.type === 'delete' ? '删除' : action.key.status === 'active' ? '停用' : '启用'}「{action.key.name}」（<span className="mono">{action.key.prefix}…</span>）？</p>
-        <Notice>{action.type === 'delete' ? '删除后此密钥将失效且无法恢复，使用它的应用需要更新配置。' : action.key.status === 'active' ? '停用后，使用此密钥的新请求将被拒绝。之后可以重新启用。' : '启用后，应用可再次使用此密钥发起请求。'}</Notice>
+        <Notice>{action.type === 'delete' ? '删除后此密钥将失效且无法恢复，使用它的应用需要更新配置。' : action.key.status === 'active' ? '停用后，使用此密钥的新请求将被拒绝。之后可以重新启用。' : !action.key.scope.usable ? '此密钥当前无可用账号，启用后仍无法调用。请先修改账号范围。' : '启用后，应用可再次使用此密钥发起请求。'}</Notice>
         {changeKey.isError && <p role="alert">{changeKey.error.message}</p>}
         <div className="toolbar"><Button variant="secondary" disabled={changeKey.isPending} onClick={() => setAction(null)}>取消</Button><Button variant={action.type === 'delete' ? 'danger' : 'primary'} disabled={changeKey.isPending} onClick={() => changeKey.mutate(action)}>{changeKey.isPending ? '正在处理…' : '确认操作'}</Button></div>
       </div>}

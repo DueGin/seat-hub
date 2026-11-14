@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { KeyRound, LogOut, Pencil, Plus, ShieldCheck, ShieldOff, Trash2, UserCheck, UserX } from 'lucide-react'
 import { Badge, Button, Card, CopyButton, Drawer, EmptyState, Field, FieldInput, Modal, Notice, PageHeader, QueryState } from '@/components/ui'
+import { KeyScopeSummary } from '@/components/ui/key-scope'
 import { api } from '@/lib/api'
 import { useSession } from '@/lib/session'
 import { dateTime, kindLabel, money, number } from '@/lib/format'
@@ -184,7 +185,7 @@ function confirmDescription(action: Confirm) {
     case 'status': return action.user.status === 'active' ? `停用 ${action.user.email} 后，用户立即无法登录和调用 API，所有 API 密钥会同步停用。可随时重新启用。` : `恢复 ${action.user.email} 的登录和 API 访问，之前停用的密钥会自动恢复。`
     case 'revoke': return `${action.user.email} 在所有设备上的登录都会失效，需要重新登录。API 密钥不受影响。`
     case 'delete': return `将永久删除 ${action.user.email} 及其 API 密钥，邮箱可被重新注册。此操作不可撤销。`
-    case 'key-status': return `${action.key.status === 'active' ? '停用后该密钥的请求会立即被拒绝。' : '启用后该密钥可以重新调用。'}（${action.key.name} · ${action.key.prefix}…）`
+    case 'key-status': return `${action.key.status === 'active' ? '停用后该密钥的请求会立即被拒绝。' : !action.key.scope.usable ? '此密钥当前无可用账号，启用后仍需用户重新选择账号。' : '启用后该密钥可以重新调用。'}（${action.key.name} · ${action.key.prefix}…）`
     case 'key-delete': return `删除后该密钥立即失效且无法恢复。（${action.key.name} · ${action.key.prefix}…）`
   }
 }
@@ -225,7 +226,8 @@ function UserDetails({ user, onClose, onEdit }: { user: AdminUser; onClose: () =
           <div><dt>最近登录</dt><dd>{current.last_login_at ? `${dateTime(current.last_login_at)}` : '从未登录'}{current.last_login_ip && <span className="mono muted"> · {current.last_login_ip}</span>}</dd></div>
           <div><dt>在线设备</dt><dd>{current.active_sessions} 台</dd></div>
           <div><dt>并发</dt><dd className="mono">{number(current.concurrency_total)}</dd></div>
-          <div><dt>上游账号</dt><dd className="mono">{current.vm2api_user_id || '尚未创建'}</dd></div>
+          {current.vm2api_user_id && <div><dt>旧上游账号（待迁移）</dt><dd className="mono">{current.vm2api_user_id}</dd></div>}
+          <div><dt>上游账号池</dt><dd className="mono">{current.vm2api_pool_id || '未创建'}</dd></div>
         </dl>
         <div className="user-actions">
           <Button variant="secondary" onClick={() => onEdit(current)}><Pencil size={14} />编辑资料</Button>
@@ -241,7 +243,7 @@ function UserDetails({ user, onClose, onEdit }: { user: AdminUser; onClose: () =
 
         <section><h3 className="detail-heading">账号资源</h3>{data.accounts?.length ? <div className="table-wrap"><table className="data-table"><thead><tr><th>账号</th><th>类型</th><th>状态</th><th>到期</th></tr></thead><tbody>{data.accounts.map((item) => <tr key={item.id}><td>{item.label || `资源 #${item.id}`}<p className="muted">{item.email_masked || '尚无账号信息'}</p></td><td>{kindLabel[item.kind]}</td><td><Badge status={item.status} /></td><td>{dateTime(item.expires_at)}</td></tr>)}</tbody></table></div> : <p className="muted">暂无资源。</p>}</section>
 
-        <section><h3 className="detail-heading">API 密钥</h3>{data.keys?.length ? <div className="table-wrap"><table className="data-table"><thead><tr><th>名称 / 前缀</th><th>状态</th><th>最后使用</th><th /></tr></thead><tbody>{data.keys.map((key) => <tr key={key.id}><td>{key.name}<p className="mono muted">{key.prefix}…</p></td><td><Badge status={key.status === 'active' ? 'active' : 'disabled'}>{key.status === 'active' ? '已启用' : '已停用'}</Badge></td><td>{dateTime(key.last_used_at)}</td><td><div className="row"><Button variant="ghost" onClick={() => open({ type: 'key-status', user: current, key })}>{key.status === 'active' ? <><ShieldOff size={13} />停用</> : <><ShieldCheck size={13} />启用</>}</Button><Button variant="ghost" onClick={() => open({ type: 'key-delete', user: current, key })}><Trash2 size={13} />删除</Button></div></td></tr>)}</tbody></table></div> : <p className="muted">暂无 API 密钥。</p>}</section>
+        <section><h3 className="detail-heading">API 密钥</h3>{data.keys?.length ? <div className="table-wrap"><table className="data-table"><thead><tr><th>名称 / 前缀</th><th>状态</th><th>可调用的账号</th><th>最后使用</th><th /></tr></thead><tbody>{data.keys.map((key) => <tr key={key.id}><td>{key.name}<p className="mono muted">{key.prefix}…</p></td><td><Badge status={key.status === 'active' ? 'active' : 'disabled'}>{key.status === 'active' ? '已启用' : '已停用'}</Badge></td><td><KeyScopeSummary scope={key.scope} accounts={data.accounts} /></td><td>{dateTime(key.last_used_at)}</td><td><div className="row"><Button variant="ghost" onClick={() => open({ type: 'key-status', user: current, key })}>{key.status === 'active' ? <><ShieldOff size={13} />停用</> : <><ShieldCheck size={13} />启用</>}</Button><Button variant="ghost" onClick={() => open({ type: 'key-delete', user: current, key })}><Trash2 size={13} />删除</Button></div></td></tr>)}</tbody></table></div> : <p className="muted">暂无 API 密钥。</p>}</section>
 
         <section><h3 className="detail-heading">登录设备</h3>{data.sessions?.length ? <div className="table-wrap"><table className="data-table"><thead><tr><th>设备</th><th>IP</th><th>登录时间</th><th>到期</th></tr></thead><tbody>{data.sessions.map((item, index) => <tr key={`${item.created_at}-${index}`}><td title={item.user_agent}>{device(item.user_agent)}</td><td className="mono">{item.ip || '—'}</td><td>{dateTime(item.created_at)}</td><td>{dateTime(item.expires_at)}</td></tr>)}</tbody></table></div> : <p className="muted">当前没有登录中的设备。</p>}</section>
 

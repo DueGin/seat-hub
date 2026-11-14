@@ -26,10 +26,24 @@ type Client interface {
 	SetUserEnabled(ctx context.Context, userID string, enabled bool) error
 
 	// API keys owned by a vm2api user. Secret is only returned by CreateKey.
+	// Every portal key carries an explicit KeyScope (docs/KEY_SCOPE.md):
+	// CreateKey rejects a zero scope instead of sending group_type=all.
 	CreateKey(ctx context.Context, in CreateKeyInput) (Key, error)
 	UpdateKey(ctx context.Context, keyID string, in UpdateKeyInput) error
 	DeleteKey(ctx context.Context, keyID string) error
 	KeyStats(ctx context.Context, keyID string) (UsageBreakdown, error)
+	// GetKey reads one key's live state (404 → IsStatus(err, 404)).
+	GetKey(ctx context.Context, keyID string) (KeyInfo, error)
+	// ListKeys lists keys owned by userID ("" = every key vm2api has).
+	ListKeys(ctx context.Context, userID string) ([]KeyInfo, error)
+
+	// Account pools (vm2api vm-pools). A VM belongs to at most one pool; a
+	// pool referenced by a key cannot be deleted. SetPoolMembers replaces the
+	// member list and also (re-)enables the pool.
+	ListPools(ctx context.Context) ([]Pool, error)
+	CreatePool(ctx context.Context, name string, vmIDs []string) (Pool, error)
+	SetPoolMembers(ctx context.Context, poolID string, vmIDs []string) (Pool, error)
+	DeletePool(ctx context.Context, poolID string) error
 
 	// VMs.
 	ListVMs(ctx context.Context, f VMFilter) ([]VM, error)
@@ -57,7 +71,8 @@ type Client interface {
 	ExchangeCode(ctx context.Context, vmID, sessionID, code string) error
 	BootstrapStatus(ctx context.Context, vmID string) (Bootstrap, error)
 
-	// Usage and logs, scoped to one vm2api user.
+	// Usage and logs, scoped to one vm2api user; userID "" drops the user
+	// filter (master view), which callers combine with LogQuery.KeyID.
 	UserBilling(ctx context.Context, userID string, from, until time.Time) (UserBilling, error)
 	UserRequestLogs(ctx context.Context, userID string, q LogQuery) (LogPage, error)
 	UserRequestStats(ctx context.Context, userID string, from, until time.Time) (RequestStats, error)
@@ -79,12 +94,66 @@ type CreateKeyInput struct {
 	Name           string
 	UserID         string
 	MaxConcurrency int // 0..128, clamped by the implementation
+	Scope          KeyScope
 }
 
 type UpdateKeyInput struct {
 	Name           *string
 	Active         *bool
 	MaxConcurrency *int
+	Scope          *KeyScope // nil = leave the scope alone
+}
+
+// KeyScope limits which VMs a key may schedule onto (docs/KEY_SCOPE.md).
+// Exactly one field is set:
+//
+//   - PoolID: vm_pool_id + group_type=anthropic; the pool's live members.
+//   - AllowedVMs: group_type=anthropic + allowed_vms (non-empty), vm_pool_id
+//     cleared.
+//
+// The zero value is invalid and must never reach vm2api: it would mean
+// group_type=all, i.e. every VM the key's owner can see.
+type KeyScope struct {
+	PoolID     string   `json:"pool_id,omitempty"`
+	AllowedVMs []string `json:"allowed_vms,omitempty"`
+}
+
+// Valid reports whether exactly one of PoolID / AllowedVMs is set.
+func (scope KeyScope) Valid() bool {
+	return (scope.PoolID != "") != (len(scope.AllowedVMs) > 0)
+}
+
+// KeyInfo is a key's live upstream state, used by reconciliation.
+type KeyInfo struct {
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	UserID         string   `json:"user_id"`
+	Active         bool     `json:"active"` // status == "active"
+	MaxConcurrency int      `json:"max_concurrency"`
+	GroupType      string   `json:"group_type"` // all | anthropic | openai
+	PoolID         string   `json:"vm_pool_id"`
+	AllowedVMs     []string `json:"allowed_vms"`
+}
+
+// Scope returns the key's scope in KeyScope form; ok is false when the key
+// is not limited the way the portal limits keys (group_type=all, or a
+// non-anthropic group).
+func (info KeyInfo) Scope() (scope KeyScope, ok bool) {
+	if info.PoolID != "" {
+		return KeyScope{PoolID: info.PoolID}, info.GroupType == "anthropic" || info.GroupType == "all"
+	}
+	if info.GroupType != "anthropic" || len(info.AllowedVMs) == 0 {
+		return KeyScope{}, false
+	}
+	return KeyScope{AllowedVMs: append([]string(nil), info.AllowedVMs...)}, true
+}
+
+// Pool is a vm2api account pool.
+type Pool struct {
+	ID      string   `json:"id"` // pool_xxxxxxxx
+	Name    string   `json:"name"`
+	Enabled bool     `json:"enabled"`
+	VMIDs   []string `json:"vm_ids"`
 }
 
 type Key struct {

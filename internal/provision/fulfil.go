@@ -68,14 +68,14 @@ func (service *Service) allocateRental(ctx context.Context, subscriptionID int64
 	if !expiry.After(service.now()) {
 		return nil
 	}
+	owner, err := service.ServiceUser(ctx)
+	if err != nil {
+		return err
+	}
 	// Lease first, then talk to vm2api: the upstream calls must not run inside
 	// the write transaction, and a failed claim leaves nothing half-created.
 	vmIDs, err := service.claimRental(ctx, userID, subscriptionID, quantity)
 	if err != nil || len(vmIDs) == 0 {
-		return err
-	}
-	owner, err := service.upstreamUser(ctx, userID)
-	if err != nil {
 		return err
 	}
 	for _, vmID := range vmIDs {
@@ -87,7 +87,7 @@ func (service *Service) allocateRental(ctx context.Context, subscriptionID int64
 		}
 		service.syncAccountIdentity(ctx, vmID)
 	}
-	return nil
+	return service.syncScopeAfterAdd(ctx, userID)
 }
 
 // syncAccountIdentity copies the signed-in account's masked email and plan
@@ -209,7 +209,7 @@ func (service *Service) fulfilOrder(ctx context.Context, orderID int64) (fulfilE
 	}
 	var owner string
 	if kind == "rental_account" {
-		owner, err = service.upstreamUser(ctx, userID)
+		owner, err = service.ServiceUser(ctx)
 		if err != nil {
 			return err
 		}
@@ -270,14 +270,7 @@ func (service *Service) fulfilOrder(ctx context.Context, orderID int64) (fulfilE
 			_ = tx.Rollback()
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 			defer cancel()
-			for _, vmID := range assigned {
-				if cleanupErr := service.client.SetVMOwner(cleanupCtx, vmID, nil); cleanupErr != nil {
-					fulfilErr = errors.Join(fulfilErr, fmt.Errorf("undo rental owner assignment: %w", cleanupErr))
-					if _, saveErr := service.db.ExecContext(cleanupCtx, `UPDATE rental_pool SET status='maintenance',note=?,updated_at=? WHERE vm_id=?`, cleanupErr.Error(), timestamp(service.now()), vmID); saveErr != nil {
-						fulfilErr = errors.Join(fulfilErr, fmt.Errorf("quarantine rental vm: %w", saveErr))
-					}
-				}
-			}
+			fulfilErr = errors.Join(fulfilErr, service.undoRentalAssignments(cleanupCtx, userID, assigned))
 		}
 	}()
 	if kind == "rental_account" {
@@ -309,5 +302,60 @@ func (service *Service) fulfilOrder(ctx context.Context, orderID int64) (fulfilE
 		return fmt.Errorf("commit fulfilment: %w", err)
 	}
 	committed = true
-	return nil
+	return service.syncScopeAfterAdd(ctx, userID)
+}
+
+// A rolled-back allocation has no resource rows left. Re-create releasing
+// tombstones before scope removal so interrupted compensation has a retryable
+// release job and the stock cannot be sold while a stale allowlist exists.
+func (service *Service) undoRentalAssignments(ctx context.Context, userID int64, vmIDs []string) error {
+	var failures []error
+	for _, vmID := range vmIDs {
+		var resourceID int64
+		now := timestamp(service.now())
+		err := service.db.QueryRowContext(ctx, `INSERT INTO resources(user_id,kind,vm_id,status,release_after,created_at,updated_at) VALUES (?,'rental',?,'releasing',?,?,?) RETURNING id`, userID, vmID, now, now, now).Scan(&resourceID)
+		if err != nil {
+			failures = append(failures, service.quarantineRental(ctx, vmID, fmt.Errorf("record rental compensation: %w", err)))
+			continue
+		}
+		if _, err := service.db.ExecContext(ctx, `UPDATE rental_pool SET status='maintenance',leased_resource_id=?,updated_at=? WHERE vm_id=?`, resourceID, now, vmID); err != nil {
+			failures = append(failures, fmt.Errorf("park compensating rental: %w", err))
+			continue
+		}
+		_, queueErr := service.engine.Enqueue(ctx, "release_resource", jobPayload{ResourceID: resourceID}, fmt.Sprintf("release_resource:%d", resourceID), service.now(), 8)
+		if queueErr != nil {
+			failures = append(failures, fmt.Errorf("queue rental compensation: %w", queueErr))
+		}
+		cleanupErr := service.client.SetSchedulable(ctx, vmID, false)
+		if cleanupErr == nil {
+			cleanupErr = service.SyncUserScope(ctx, userID)
+		}
+		if cleanupErr == nil {
+			cleanupErr = service.client.SetVMOwner(ctx, vmID, nil)
+		}
+		if cleanupErr != nil {
+			failures = append(failures, service.releaseError(ctx, resourceID, fmt.Errorf("undo rental owner assignment: %w", cleanupErr)))
+			continue
+		}
+		tx, err := service.db.BeginTx(ctx, nil)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("begin rental compensation: %w", err))
+			continue
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE rental_pool SET status='available',leased_resource_id=NULL,updated_at=? WHERE vm_id=? AND leased_resource_id=?`, now, vmID, resourceID)
+		if err == nil {
+			_, err = tx.ExecContext(ctx, `DELETE FROM resources WHERE id=?`, resourceID)
+		}
+		if err == nil {
+			_, err = tx.ExecContext(ctx, `UPDATE jobs SET status='succeeded',updated_at=? WHERE dedupe_key=? AND status='pending'`, now, fmt.Sprintf("release_resource:%d", resourceID))
+		}
+		if err == nil {
+			err = tx.Commit()
+		}
+		_ = tx.Rollback()
+		if err != nil {
+			failures = append(failures, fmt.Errorf("finish rental compensation: %w", err))
+		}
+	}
+	return errors.Join(failures...)
 }

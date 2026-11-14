@@ -3,6 +3,7 @@ package provision_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +20,14 @@ func TestContractHostedProvisioning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, err := client.CreateKey(ctx, vm2api.CreateKeyInput{Name: "托管密钥", UserID: user.ID, MaxConcurrency: 10})
+	if _, err := client.CreateKey(ctx, vm2api.CreateKeyInput{Name: "无范围", UserID: user.ID}); !errors.Is(err, vm2api.ErrInvalidScope) {
+		t.Fatalf("zero scope accepted: %v", err)
+	}
+	keyPool, err := client.CreatePool(ctx, "contract", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := client.CreateKey(ctx, vm2api.CreateKeyInput{Name: "托管密钥", UserID: user.ID, MaxConcurrency: 10, Scope: vm2api.KeyScope{PoolID: keyPool.ID}})
 	if err != nil || key.ID == "" || !strings.HasPrefix(key.Secret, "sk-vm-") {
 		t.Fatalf("create key = %+v, %v", key, err)
 	}

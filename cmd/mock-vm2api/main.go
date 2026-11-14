@@ -71,7 +71,7 @@ func devProtocol(masterKey string, fake *vm2api.Fake) http.Handler {
 		}
 		// Accept the master key and any portal-issued vm2api key; the real
 		// service validates the latter against its own key store.
-		if key != masterKey && !strings.HasPrefix(key, "sk-vm-") {
+		if key != masterKey && !fake.ProtocolKeyActive(key) {
 			writeProtocolError(w, http.StatusUnauthorized, "authentication_error", "invalid api key (mock)")
 			return
 		}
@@ -90,10 +90,9 @@ func devProtocol(masterKey string, fake *vm2api.Fake) http.Handler {
 		if request.Model == "" {
 			request.Model = "claude-sonnet-5"
 		}
-		// Portal-issued keys are logged against one of their owner's slots,
-		// so the portal's usage and records pages have real rows locally.
+		// Use the fake's live ownership/scope check for dispatch and logging.
 		if key != masterKey {
-			status, known := fake.RecordProtocolCall(vm2api.ProtocolCall{
+			status, code, known := fake.RecordProtocolCallWithCode(vm2api.ProtocolCall{
 				Secret: key, Model: request.Model, Stream: request.Stream,
 				InputTokens: int64(max(1, len(body)/4)), OutputTokens: 12,
 				DurationMS: max(1, time.Since(started).Milliseconds()) + 420,
@@ -103,7 +102,11 @@ func devProtocol(masterKey string, fake *vm2api.Fake) http.Handler {
 				return
 			}
 			if status != http.StatusOK {
-				writeProtocolError(w, status, "overloaded_error", "no account available for this key (mock)")
+				kind := "overloaded_error"
+				if status == http.StatusForbidden {
+					kind = "permission_error"
+				}
+				writeProtocolErrorCode(w, status, kind, code, "此密钥暂无可用账号")
 				return
 			}
 		}
@@ -118,8 +121,16 @@ func devProtocol(masterKey string, fake *vm2api.Fake) http.Handler {
 }
 
 func writeProtocolError(w http.ResponseWriter, status int, kind, message string) {
+	writeProtocolErrorCode(w, status, kind, "", message)
+}
+
+func writeProtocolErrorCode(w http.ResponseWriter, status int, kind, code, message string) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	body, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]string{"type": kind, "message": message}})
+	errBody := map[string]string{"type": kind, "message": message}
+	if code != "" {
+		errBody["code"] = code
+	}
+	body, _ := json.Marshal(map[string]any{"type": "error", "error": errBody})
 	_, _ = w.Write(body)
 }

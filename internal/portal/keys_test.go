@@ -2,10 +2,10 @@ package portal
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -139,7 +139,7 @@ func TestKeyCreateEncryptionAndEntitlements(t *testing.T) {
 	for _, item := range []struct{ kind, status string }{{"hosted", "active"}, {"rental", "active"}, {"hosted", "suspended"}} {
 		keySQL(t, service.db, `INSERT INTO resources(user_id,kind,status,created_at,updated_at) VALUES (1,?,?,?,?)`, item.kind, item.status, store.FmtTime(service.now()), store.FmtTime(service.now()))
 	}
-	item, plaintext, err := service.Create(ctx, 1, "我的密钥")
+	item, plaintext, err := service.Create(ctx, 1, keyInput("我的密钥"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,17 +149,18 @@ func TestKeyCreateEncryptionAndEntitlements(t *testing.T) {
 	if len(client.creates) != 1 || client.creates[0].MaxConcurrency != 14 || client.creates[0].Name != item.Name {
 		t.Fatalf("upstream create = %+v", client.creates)
 	}
-	var upstreamID, username, passwordEnc, keyHash, keyEnc string
+	var keyHash, keyEnc string
 	var synced int
-	if err := service.db.QueryRow(`SELECT vm2api_user_id,vm2api_username,vm2api_password_enc FROM users WHERE id=1`).Scan(&upstreamID, &username, &passwordEnc); err != nil {
-		t.Fatal(err)
+	identity, err := store.LoadServiceIdentity(ctx, service.db.DB)
+	if err != nil || identity.UserID != client.creates[0].UserID || identity.Username == "" {
+		t.Fatalf("service identity = %+v, err %v", identity, err)
 	}
-	if username != "portal_1" || upstreamID != client.creates[0].UserID || passwordEnc == client.password {
-		t.Fatalf("unexpected upstream user: %q %q", upstreamID, username)
+	var legacyUser string
+	if err := service.db.QueryRow(`SELECT COALESCE(vm2api_user_id,'') FROM users WHERE id=1`).Scan(&legacyUser); err != nil || legacyUser != "" {
+		t.Fatalf("portal user acquired upstream identity: %q, %v", legacyUser, err)
 	}
-	password, err := service.box.Open(passwordEnc)
-	if err != nil || password != client.password || len(password) < 32 {
-		t.Fatalf("invalid stored password: %v", err)
+	if item.Scope.Mode != "all" || item.Scope.Accounts == nil || !item.Scope.Usable || client.creates[0].Scope.PoolID == "" {
+		t.Fatalf("unrestricted key: %+v, %+v", item, client.creates[0])
 	}
 	if err := service.db.QueryRow(`SELECT key_hash,vm2api_secret_enc,synced_concurrency FROM api_keys WHERE id=?`, item.ID).Scan(&keyHash, &keyEnc, &synced); err != nil {
 		t.Fatal(err)
@@ -168,7 +169,7 @@ func TestKeyCreateEncryptionAndEntitlements(t *testing.T) {
 	if err != nil || upstreamSecret != client.keys[0].Secret || keyHash != service.box.MAC(plaintext) || keyHash == plaintext || synced != 14 {
 		t.Fatalf("invalid stored key: %v, concurrency %d", err, synced)
 	}
-	second, secondPlaintext, err := service.Create(ctx, 1, "")
+	second, secondPlaintext, err := service.Create(ctx, 1, keyInput(""))
 	if err != nil || second.Name != "默认" || secondPlaintext == plaintext || client.users != 1 {
 		t.Fatalf("second key = %+v, users %d, err %v", second, client.users, err)
 	}
@@ -185,22 +186,22 @@ func TestKeyCreateEncryptionAndEntitlements(t *testing.T) {
 func TestKeyUpdateDeleteAndOwnership(t *testing.T) {
 	service, client := keyFixture(t)
 	ctx := context.Background()
-	item, _, err := service.Create(ctx, 1, "original")
+	item, _, err := service.Create(ctx, 1, keyInput("original"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.Update(ctx, 2, item.ID, "stolen", "disabled")
+	_, err = service.Update(ctx, 2, item.ID, keyPatch("stolen", "disabled"))
 	keyError(t, err, 404, "key_not_found")
 	keyError(t, service.Delete(ctx, 2, item.ID), 404, "key_not_found")
 	if len(client.updates) != 0 || len(client.deletes) != 0 {
 		t.Fatal("ownership failure touched upstream key")
 	}
-	updated, err := service.Update(ctx, 1, item.ID, "renamed", "disabled")
+	updated, err := service.Update(ctx, 1, item.ID, keyPatch("renamed", "disabled"))
 	if err != nil || updated.Name != "renamed" || updated.Status != "disabled" {
 		t.Fatalf("update = %+v, err %v", updated, err)
 	}
 	keySQL(t, service.db, `INSERT INTO settings(key,value,updated_at) VALUES ('site','{"base_concurrency":9}',?)`, store.FmtTime(service.now()))
-	updated, err = service.Update(ctx, 1, item.ID, "", "active")
+	updated, err = service.Update(ctx, 1, item.ID, keyPatch("", "active"))
 	if err != nil || updated.Name != "renamed" || updated.Status != "active" {
 		t.Fatalf("enable = %+v, err %v", updated, err)
 	}
@@ -231,7 +232,7 @@ func TestKeyUpdateDeleteAndOwnership(t *testing.T) {
 	if err != nil || len(items) != 0 {
 		t.Fatalf("deleted key listed: %+v, %v", items, err)
 	}
-	_, err = service.Update(ctx, 1, item.ID, "", "active")
+	_, err = service.Update(ctx, 1, item.ID, keyPatch("", "active"))
 	keyError(t, err, 404, "key_not_found")
 }
 
@@ -240,7 +241,7 @@ func TestKeyActiveLimitAndReenable(t *testing.T) {
 	ctx := context.Background()
 	var first api.KeyDTO
 	for index := range 20 {
-		item, _, err := service.Create(ctx, 1, fmt.Sprintf("key-%d", index))
+		item, _, err := service.Create(ctx, 1, keyInput(fmt.Sprintf("key-%d", index)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -248,42 +249,42 @@ func TestKeyActiveLimitAndReenable(t *testing.T) {
 			first = item
 		}
 	}
-	_, _, err := service.Create(ctx, 1, "excess")
+	_, _, err := service.Create(ctx, 1, keyInput("excess"))
 	keyError(t, err, 422, "key_limit")
 	if len(client.creates) != 20 {
 		t.Fatalf("limit reached upstream: %d", len(client.creates))
 	}
-	if _, err := service.Update(ctx, 1, first.ID, "", "disabled"); err != nil {
+	if _, err := service.Update(ctx, 1, first.ID, keyPatch("", "disabled")); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := service.Create(ctx, 1, "replacement"); err != nil {
+	if _, _, err := service.Create(ctx, 1, keyInput("replacement")); err != nil {
 		t.Fatal(err)
 	}
-	_, err = service.Update(ctx, 1, first.ID, "", "active")
+	_, err = service.Update(ctx, 1, first.ID, keyPatch("", "active"))
 	keyError(t, err, 422, "key_limit")
 }
 
 func TestKeyValidationAndUpstreamFailures(t *testing.T) {
 	service, client := keyFixture(t)
 	ctx := context.Background()
-	_, _, err := service.Create(ctx, 999, "missing")
+	_, _, err := service.Create(ctx, 999, keyInput("missing"))
 	keyError(t, err, 404, "user_not_found")
-	_, _, err = service.Create(ctx, 1, strings.Repeat("名", 41))
+	_, _, err = service.Create(ctx, 1, keyInput(strings.Repeat("名", 41)))
 	keyError(t, err, 422, "invalid_name")
-	_, err = service.Update(ctx, 1, 1, "", "deleted")
+	_, err = service.Update(ctx, 1, 1, keyPatch("", "deleted"))
 	keyError(t, err, 422, "invalid_status")
 	client.createErr = vm2api.ErrUnavailable
-	_, _, err = service.Create(ctx, 1, "outage")
+	_, _, err = service.Create(ctx, 1, keyInput("outage"))
 	if !errors.Is(err, vm2api.ErrUnavailable) {
 		t.Fatalf("create outage = %v", err)
 	}
 	client.createErr = nil
-	item, _, err := service.Create(ctx, 1, "original")
+	item, _, err := service.Create(ctx, 1, keyInput("original"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	client.updateErr = vm2api.ErrUnavailable
-	_, err = service.Update(ctx, 1, item.ID, "changed", "disabled")
+	_, err = service.Update(ctx, 1, item.ID, keyPatch("changed", "disabled"))
 	if !errors.Is(err, vm2api.ErrUnavailable) {
 		t.Fatalf("update outage = %v", err)
 	}
@@ -304,7 +305,7 @@ func TestKeyCreateCompensatesFailedInsert(t *testing.T) {
 			} else {
 				keySQL(t, service.db, `CREATE TRIGGER reject_keys BEFORE INSERT ON api_keys BEGIN SELECT RAISE(ABORT,'insert rejected'); END`)
 			}
-			_, _, err := service.Create(ctx, 1, "test")
+			_, _, err := service.Create(ctx, 1, keyInput("test"))
 			if err == nil || len(client.keys) != 1 || len(client.deletes) != 1 {
 				t.Fatalf("create err = %v, keys=%d deletes=%d", err, len(client.keys), len(client.deletes))
 			}
@@ -320,15 +321,15 @@ func TestKeyPersistsUpstreamUserWhenRequestCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	client.afterUser = cancel
-	_, _, err := service.Create(ctx, 1, "cancelled")
+	_, _, err := service.Create(ctx, 1, keyInput("cancelled"))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("create error = %v", err)
 	}
-	var owner, encrypted string
-	if err := service.db.QueryRow(`SELECT vm2api_user_id,vm2api_password_enc FROM users WHERE id=1`).Scan(&owner, &encrypted); err != nil || owner == "" || encrypted == "" {
-		t.Fatalf("upstream user not saved: %v", err)
+	identity, err := store.LoadServiceIdentity(context.Background(), service.db.DB)
+	if err != nil || identity.UserID == "" {
+		t.Fatalf("service identity not saved: %+v, %v", identity, err)
 	}
-	if _, _, err := service.Create(context.Background(), 1, "retry"); err != nil {
+	if _, _, err := service.Create(context.Background(), 1, keyInput("retry")); err != nil {
 		t.Fatal(err)
 	}
 	if client.users != 1 {
@@ -345,7 +346,7 @@ func TestKeyConcurrentCreateLimit(t *testing.T) {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			_, _, err := service.Create(ctx, 1, "parallel")
+			_, _, err := service.Create(ctx, 1, keyInput("parallel"))
 			results <- err
 		}()
 	}
@@ -370,12 +371,12 @@ func TestKeyConcurrentCreateLimit(t *testing.T) {
 func TestKeyUpdateCompensatesFailedSave(t *testing.T) {
 	service, client := keyFixture(t)
 	ctx := context.Background()
-	item, _, err := service.Create(ctx, 1, "original")
+	item, _, err := service.Create(ctx, 1, keyInput("original"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	keySQL(t, service.db, `CREATE TRIGGER reject_key_update BEFORE UPDATE ON api_keys BEGIN SELECT RAISE(ABORT,'update rejected'); END`)
-	_, err = service.Update(ctx, 1, item.ID, "renamed", "disabled")
+	_, err = service.Update(ctx, 1, item.ID, keyPatch("renamed", "disabled"))
 	if err == nil || len(client.updates) != 2 {
 		t.Fatalf("update error = %v, upstream calls %d", err, len(client.updates))
 	}
@@ -389,18 +390,18 @@ func TestKeyConcurrentServicesRespectLimit(t *testing.T) {
 	service, client := keyFixture(t)
 	ctx := context.Background()
 	for range 19 {
-		if _, _, err := service.Create(ctx, 1, "existing"); err != nil {
+		if _, _, err := service.Create(ctx, 1, keyInput("existing")); err != nil {
 			t.Fatal(err)
 		}
 	}
-	other := New(service.db, client, service.box)
+	other := New(service.db, client, service.box, service.provisioning)
 	var workers sync.WaitGroup
 	results := make(chan error, 2)
 	for _, current := range []*Service{service, other} {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			_, _, err := current.Create(ctx, 1, "concurrent")
+			_, _, err := current.Create(ctx, 1, keyInput("concurrent"))
 			results <- err
 		}()
 	}
@@ -430,14 +431,176 @@ func TestKeyUsesSharedProvisioner(t *testing.T) {
 	shared := provision.New(service.db.DB, client)
 	shared.Now = service.now
 	custom := New(service.db, client, service.box, shared)
-	if custom.provisioning != shared || shared.EnsureUser == nil {
+	if custom.provisioning != shared || shared.Box != service.box {
 		t.Fatal("shared provisioner not reused")
 	}
-	if _, _, err := custom.Create(context.Background(), 1, "shared"); err != nil {
+	if _, _, err := custom.Create(context.Background(), 1, keyInput("shared")); err != nil {
 		t.Fatal(err)
 	}
-	var encrypted sql.NullString
-	if err := service.db.QueryRow(`SELECT vm2api_password_enc FROM users WHERE id=1`).Scan(&encrypted); err != nil || !encrypted.Valid || encrypted.String == "" {
-		t.Fatalf("shared user password not encrypted: %v", err)
+	identity, err := store.LoadServiceIdentity(context.Background(), service.db.DB)
+	if err != nil || identity.UserID == "" {
+		t.Fatalf("shared provisioner service identity missing: %+v, %v", identity, err)
 	}
+}
+
+func keyInput(name string) api.KeyInput { return api.KeyInput{Name: name} }
+
+func keyAccount(t *testing.T, service *Service, client *keyClient, userID int64, vmID, status string) int64 {
+	t.Helper()
+	client.AddVM(vm2api.VM{ID: vmID, Platform: "anthropic", ScheduleState: "on"})
+	var id int64
+	if err := service.db.QueryRow(`INSERT INTO resources(user_id,kind,vm_id,status,created_at,updated_at)
+		VALUES (?,'rental',?,?,?,?) RETURNING id`, userID, vmID, status, store.Now(), store.Now()).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func TestKeySelectedScopeLifecycle(t *testing.T) {
+	service, client := keyFixture(t)
+	ctx := context.Background()
+	first := keyAccount(t, service, client, 1, "vm-a", "active")
+	second := keyAccount(t, service, client, 1, "vm-b", "suspended")
+	keyAccount(t, service, client, 2, "vm-c", "active")
+	input := api.KeyInput{Name: "指定", Scope: api.KeyScopeInput{Mode: "selected", Accounts: []int64{first, first}}}
+	item, _, err := service.Create(ctx, 1, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item.Scope.Mode != "selected" || !item.Scope.Usable || !slices.Equal(item.Scope.Accounts, []int64{first}) ||
+		!slices.Equal(client.creates[0].Scope.AllowedVMs, []string{"vm-a"}) || client.creates[0].Scope.PoolID != "" {
+		t.Fatalf("selected create = %+v, %+v", item.Scope, client.creates[0].Scope)
+	}
+	for _, scope := range []api.KeyScopeInput{{Mode: "all"}, {Mode: "selected", Accounts: []int64{second}}} {
+		item, err = service.Update(ctx, 1, item.ID, api.KeyPatch{Scope: &scope})
+		if err != nil {
+			t.Fatal(err)
+		}
+		upstream, err := client.GetKey(ctx, client.keys[0].ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if scope.Mode == "all" && (upstream.PoolID == "" || len(upstream.AllowedVMs) != 0) ||
+			scope.Mode == "selected" && (upstream.PoolID != "" || !slices.Equal(upstream.AllowedVMs, []string{"vm-b"})) {
+			t.Fatalf("updated scope = %+v", upstream)
+		}
+	}
+	keySQL(t, service.db, `UPDATE resources SET status='releasing' WHERE id=?`, second)
+	items, err := service.List(ctx, 1)
+	if err != nil || len(items) != 1 || items[0].Scope.Usable || items[0].Scope.Accounts == nil {
+		t.Fatalf("unusable selected key = %+v, %v", items, err)
+	}
+	if _, err := service.Update(ctx, 1, item.ID, keyPatch("renamed", "")); err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := client.GetKey(ctx, client.keys[0].ID)
+	if err != nil || upstream.Active || upstream.PoolID == "" || len(upstream.AllowedVMs) != 0 {
+		t.Fatalf("expired selection was not closed: %+v, %v", upstream, err)
+	}
+	keySQL(t, service.db, `UPDATE users SET status='disabled' WHERE id=1`)
+	scope := api.KeyScopeInput{Mode: "selected", Accounts: []int64{first}}
+	if _, err := service.Update(ctx, 1, item.ID, api.KeyPatch{Scope: &scope}); err != nil {
+		t.Fatal(err)
+	}
+	upstream, err = client.GetKey(ctx, client.keys[0].ID)
+	if err != nil || upstream.Active {
+		t.Fatalf("disabled user's key active: %+v, %v", upstream, err)
+	}
+	if _, _, err := service.Create(ctx, 1, keyInput("disabled user")); err != nil {
+		t.Fatal(err)
+	}
+	if _, active := client.KeyState(client.keys[1].ID); active {
+		t.Fatal("created active upstream key for disabled user")
+	}
+}
+
+func TestKeyScopeValidationAndLegacy(t *testing.T) {
+	service, client := keyFixture(t)
+	ctx := context.Background()
+	owned := keyAccount(t, service, client, 1, "vm-a", "active")
+	other := keyAccount(t, service, client, 2, "vm-b", "active")
+	unavailable := keyAccount(t, service, client, 1, "vm-c", "awaiting_auth")
+	for _, test := range []struct {
+		scope api.KeyScopeInput
+		code  string
+	}{
+		{api.KeyScopeInput{Mode: "unknown"}, "key_scope_invalid"},
+		{api.KeyScopeInput{Mode: "selected", Accounts: []int64{other}}, "key_scope_invalid"},
+		{api.KeyScopeInput{Mode: "selected", Accounts: []int64{99999}}, "key_scope_invalid"},
+		{api.KeyScopeInput{Mode: "selected"}, "key_scope_empty"},
+		{api.KeyScopeInput{Mode: "selected", Accounts: []int64{unavailable}}, "key_scope_empty"},
+	} {
+		_, _, err := service.Create(ctx, 1, api.KeyInput{Scope: test.scope})
+		keyError(t, err, 422, test.code)
+	}
+	item, _, err := service.Create(ctx, 1, keyInput("legacy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	keySQL(t, service.db, `UPDATE api_keys SET upstream_owner='' WHERE id=?`, item.ID)
+	scope := api.KeyScopeInput{Mode: "selected", Accounts: []int64{owned}}
+	_, err = service.Update(ctx, 1, item.ID, api.KeyPatch{Scope: &scope})
+	keyError(t, err, 409, "key_migrating")
+	if _, err := service.Update(ctx, 1, item.ID, keyPatch("legacy renamed", "disabled")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Update(ctx, 1, item.ID, keyPatch("", "active")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestKeyScopeUpdateRestoresUpstreamOnSaveFailure(t *testing.T) {
+	service, client := keyFixture(t)
+	ctx := context.Background()
+	first := keyAccount(t, service, client, 1, "vm-original", "active")
+	second := keyAccount(t, service, client, 1, "vm-new", "active")
+	item, _, err := service.Create(ctx, 1, api.KeyInput{Name: "original", Scope: api.KeyScopeInput{Mode: "selected", Accounts: []int64{first}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keySQL(t, service.db, `CREATE TRIGGER reject_scope_update BEFORE UPDATE ON api_keys BEGIN SELECT RAISE(ABORT,'update rejected'); END`)
+	scope := api.KeyScopeInput{Mode: "selected", Accounts: []int64{second}}
+	if _, err := service.Update(ctx, 1, item.ID, api.KeyPatch{Scope: &scope}); err == nil {
+		t.Fatal("scope update succeeded despite failed save")
+	}
+	upstream, err := client.GetKey(ctx, client.keys[0].ID)
+	if err != nil || !upstream.Active || !slices.Equal(upstream.AllowedVMs, []string{"vm-original"}) || upstream.PoolID != "" {
+		t.Fatalf("scope not restored: %+v, %v", upstream, err)
+	}
+	items, err := service.List(ctx, 1)
+	if err != nil || len(items) != 1 || !slices.Equal(items[0].Scope.Accounts, []int64{first}) {
+		t.Fatalf("local scope changed: %+v, %v", items, err)
+	}
+}
+
+func TestKeyCreateClosesSelectionReleasedAfterValidation(t *testing.T) {
+	service, client := keyFixture(t)
+	ctx := context.Background()
+	account := keyAccount(t, service, client, 1, "vm-released", "active")
+	// ServiceUser runs after validation but before KeyScopeFor; simulate a
+	// release becoming visible at that boundary.
+	client.afterUser = func() {
+		keySQL(t, service.db, `UPDATE resources SET status='releasing' WHERE id=?`, account)
+	}
+	item, _, err := service.Create(ctx, 1, api.KeyInput{Scope: api.KeyScopeInput{Mode: "selected", Accounts: []int64{account}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := client.GetKey(ctx, client.keys[0].ID)
+	if err != nil || item.Scope.Usable || upstream.Active || upstream.PoolID == "" || len(upstream.AllowedVMs) != 0 {
+		t.Fatalf("released selection not closed: %+v, %+v, %v", item.Scope, upstream, err)
+	}
+}
+
+// keyPatch builds a patch the way the old (name, status) arguments did: an
+// empty string leaves the field alone.
+func keyPatch(name, status string) api.KeyPatch {
+	var patch api.KeyPatch
+	if name != "" {
+		patch.Name = &name
+	}
+	if status != "" {
+		patch.Status = &status
+	}
+	return patch
 }

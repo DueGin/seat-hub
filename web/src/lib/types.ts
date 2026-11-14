@@ -21,7 +21,9 @@ export interface SelfcheckReport { id: number; vm_id: string; attempt: number; p
 export interface Account { id: number; kind: 'hosted' | 'rental'; label: string; email_masked: string; status: string; status_reason: string | null; tier: string | null; created_at: string; expires_at: string | null; usage: AccountUsage | null; selfcheck: Selfcheck | null; user_email?: string; vm_id?: string; last_error?: string }
 export interface AccountDetail { account: Account; daily: DailyUsage[]; by_model: ModelUsage[] }
 export interface Onboarding { account_id: number; status: string; auth_url: string | null; auth_url_expires_at: string | null; bootstrap: { state: string; message: string } | null; error: { code: string; message: string } | null; can_regenerate: boolean; selfcheck: Selfcheck | null }
-export interface ApiKey { id: number; name: string; prefix: string; status: 'active' | 'disabled'; created_at: string; last_used_at: string | null }
+export interface KeyScopeInput { mode: 'all' | 'selected'; accounts: number[] }
+export interface KeyScope extends KeyScopeInput { usable: boolean }
+export interface ApiKey { id: number; name: string; prefix: string; status: 'active' | 'disabled'; created_at: string; last_used_at: string | null; scope: KeyScope }
 export interface UsageSummary { from: string; until: string; totals: Spend; daily: DailyUsage[]; by_model: ModelUsage[]; by_key: { key_id: number; key_name: string; requests: number; tokens: number; cost_usd: number }[]; by_account: { account_id: number; label: string; requests: number; tokens: number; cost_usd: number }[]; stats: { success_rate: number; avg_ttft_ms: number; p95_ttft_ms: number; error_count: number } }
 export interface UsageLog { request_id: string; created_at: string; model: string; key_id: number; key_name: string; account_id: number; account_label: string; stream: boolean; status_code: number; error_label: string | null; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_creation_tokens: number; cost_usd: number; duration_ms: number; first_token_ms: number | null }
 export interface Page<T> { items: T[]; total: number; page: number; page_size: number }
@@ -41,7 +43,7 @@ export interface NormalizedSettings extends Omit<Settings, 'payment'> {
   payment: { epay: { enabled: boolean; gateway_url: string; pid: string; key: string; types: string[] }; manual: { enabled: boolean; instructions: string } }
 }
 export interface AdminDashboard { users: number; paying_users: number; revenue_cents_30d: number; orders_pending: number; accounts: { hosted_active: number; rental_active: number; failed: number }; rental_pool: { total: number; available: number; leased: number; maintenance: number }; vm2api: { ok: boolean; version: string; latency_ms: number; error: string | null } }
-export interface AdminUser extends User { concurrency_total: number; hosted_used: number; hosted_total: number; rental_used: number; rental_total: number; vm2api_user_id: string | null; note: string; last_login_at: string; last_login_ip: string; active_sessions: number }
+export interface AdminUser extends User { concurrency_total: number; hosted_used: number; hosted_total: number; rental_used: number; rental_total: number; vm2api_user_id: string | null; vm2api_pool_id: string; note: string; last_login_at: string; last_login_ip: string; active_sessions: number }
 export interface UserSession { created_at: string; expires_at: string; ip: string; user_agent: string }
 export interface UserRecords { orders: number; subscriptions: number; resources: number }
 export interface PoolCandidate { vm_id: string; label: string; email_masked: string; cred_status: string; schedule_state: string; tier: string | null }

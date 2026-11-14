@@ -198,17 +198,19 @@ func (engine *Engine) RunOnce(ctx context.Context) (bool, error) {
 	defer cancelJob(nil)
 	expiry := time.AfterFunc(remaining, func() { cancelJob(errJobsLeaseLost) })
 	defer expiry.Stop()
-	renewalCtx, stopRenewal := context.WithCancel(jobCtx)
-	defer stopRenewal()
+	stopRenewal := make(chan struct{})
 	renewalDone := make(chan jobsRenewal, 1)
 	go func() {
-		renewalDone <- engine.maintainLease(renewalCtx, cancelJob, *job, expiry)
+		renewalDone <- engine.maintainLease(jobCtx, stopRenewal, cancelJob, *job, expiry)
 	}()
 	handlerErr := jobCtx.Err()
 	if handlerErr == nil {
 		handlerErr = jobsInvoke(jobCtx, handler, job.Job)
 	}
-	stopRenewal()
+	// Do not cancel an in-flight renewal: SQLite may have committed the new
+	// lease before returning a cancellation error, leaving completion fenced
+	// against an obsolete lease token. Wait for the renewal result instead.
+	close(stopRenewal)
 	renewal := <-renewalDone
 	expiry.Stop()
 	if jobCtx.Err() != nil {
@@ -244,7 +246,7 @@ type jobsRenewal struct {
 	err error
 }
 
-func (engine *Engine) maintainLease(ctx context.Context, cancel context.CancelCauseFunc, job jobsLease, expiry *time.Timer) jobsRenewal {
+func (engine *Engine) maintainLease(ctx context.Context, stop <-chan struct{}, cancel context.CancelCauseFunc, job jobsLease, expiry *time.Timer) jobsRenewal {
 	interval := engine.leaseDuration() / 3
 	if interval <= 0 {
 		interval = time.Nanosecond
@@ -254,6 +256,8 @@ func (engine *Engine) maintainLease(ctx context.Context, cancel context.CancelCa
 	for {
 		select {
 		case <-ctx.Done():
+			return jobsRenewal{job: job}
+		case <-stop:
 			return jobsRenewal{job: job}
 		case <-ticker.C:
 			err := jobsRetryBusy(ctx, func() error { return engine.renew(ctx, &job) })

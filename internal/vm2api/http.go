@@ -135,6 +135,9 @@ func (client *HTTPClient) SetUserEnabled(ctx context.Context, userID string, ena
 }
 
 func (client *HTTPClient) CreateKey(ctx context.Context, input CreateKeyInput) (Key, error) {
+	if !input.Scope.Valid() {
+		return Key{}, ErrInvalidScope
+	}
 	var data struct {
 		Item struct {
 			ID     string `json:"id"`
@@ -142,9 +145,11 @@ func (client *HTTPClient) CreateKey(ctx context.Context, input CreateKeyInput) (
 			Prefix string `json:"key_prefix"`
 		} `json:"item"`
 	}
-	err := client.call(ctx, http.MethodPost, "/api-keys", nil, map[string]any{
+	body := map[string]any{
 		"name": input.Name, "user_id": input.UserID, "max_concurrency": clampConcurrency(input.MaxConcurrency),
-	}, &data)
+	}
+	setKeyScope(body, input.Scope)
+	err := client.call(ctx, http.MethodPost, "/api-keys", nil, body, &data)
 	if err != nil {
 		return Key{}, err
 	}
@@ -160,6 +165,12 @@ func clampConcurrency(value int) int {
 
 func (client *HTTPClient) UpdateKey(ctx context.Context, keyID string, input UpdateKeyInput) error {
 	body := map[string]any{}
+	if input.Scope != nil {
+		if !input.Scope.Valid() {
+			return ErrInvalidScope
+		}
+		setKeyScope(body, *input.Scope)
+	}
 	if input.Name != nil {
 		body["name"] = *input.Name
 	}
@@ -579,7 +590,10 @@ func (client *HTTPClient) BootstrapStatus(ctx context.Context, vmID string) (Boo
 }
 
 func scopedQuery(userID, startKey string, from, until time.Time) url.Values {
-	query := url.Values{"user_id": {userID}}
+	query := url.Values{}
+	if userID != "" {
+		query.Set("user_id", userID)
+	}
 	if !from.IsZero() {
 		query.Set(startKey, from.UTC().Format(time.RFC3339Nano))
 	}

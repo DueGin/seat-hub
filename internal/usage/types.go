@@ -82,10 +82,12 @@ type Stats struct {
 
 type LogQuery struct {
 	From, Until time.Time
-	Page        int
-	PageSize    int
-	Model       string
-	KeyID       int64
+	// Page defaults to 1. Multi-key queries require Page*PageSize <= 10,000;
+	// this also applies to a portal key with multiple historical upstream IDs.
+	Page     int
+	PageSize int
+	Model    string
+	KeyID    int64
 	// AccountID limits the log to one of the user's accounts (0 = all). The
 	// range is clamped to the account's lifetime, so a rental slot that was
 	// leased more than once only shows this lease.
