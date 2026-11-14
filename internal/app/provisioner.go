@@ -11,6 +11,7 @@ import (
 	"github.com/DueGin/seat-hub/internal/api"
 	"github.com/DueGin/seat-hub/internal/order"
 	"github.com/DueGin/seat-hub/internal/portal"
+	"github.com/DueGin/seat-hub/internal/privacy"
 	"github.com/DueGin/seat-hub/internal/provision"
 	"github.com/DueGin/seat-hub/internal/secret"
 	"github.com/DueGin/seat-hub/internal/store"
@@ -283,6 +284,7 @@ func (p *provisioner) adminAccounts(ctx context.Context, kind, status string, us
 			return nil, 0, err
 		}
 		row.Selfcheck = accountSelfcheck(account, site.SelfcheckMaxRebuilds, true)
+		row.EmailMasked = privacy.MaskEmail(row.EmailMasked)
 		if expires != "" {
 			row.ExpiresAt = &expires
 		}

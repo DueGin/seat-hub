@@ -23,6 +23,8 @@
 ```
 `base_url` 为空时前端用 `location.origin`。
 
+**脱敏邮箱**：所有接口里的 `email_masked`（Claude 账号邮箱）都只保留邮箱名的前三个字符和域名的最后一段，例如 `fdsiome@protonmail.com` 显示为 `fds***@***.com`。邮箱名较短时最多显示一半（`abcd@x.io` 显示为 `ab***@***.io`）。门面用户自己的登录邮箱不做脱敏。
+
 ### `GET /api/public/products`
 ```json
 {"items":[Product]}
@@ -103,7 +105,7 @@
 
 `Account`:
 ```json
-{"id":7,"kind":"hosted|rental","label":"主号","email_masked":"ab***@gmail.com",
+{"id":7,"kind":"hosted|rental","label":"主号","email_masked":"abc***@***.com",
  "status":"provisioning|awaiting_auth|bootstrapping|active|needs_reauth|suspended|failed|releasing|released|allocating",
  "status_reason":null,"tier":"pro|max|null","created_at":"…","expires_at":"…|null",
  "usage":AccountUsage|null,"selfcheck":Selfcheck|null}

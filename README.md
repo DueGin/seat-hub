@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.svg" width="72" height="72" alt="seat-hub"></p>
+
 # seat-hub
 
 Claude 账号托管与租赁的门面系统，背后对接 [vm2api](https://github.com/dofastted/vm2api)。

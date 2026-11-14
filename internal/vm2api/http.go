@@ -22,6 +22,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/DueGin/seat-hub/internal/privacy"
 )
 
 type HTTPClient struct {
@@ -386,12 +388,10 @@ func (raw panelVM) mapped() VM {
 	if raw.AccountTier != "" {
 		result.Tier = raw.AccountTier
 	}
-	if result.EmailMasked == "" && raw.Email != "" {
-		local, domain, found := strings.Cut(raw.Email, "@")
-		if found && local != "" {
-			result.EmailMasked = string([]rune(local)[:1]) + "***@" + domain
-		}
+	if result.EmailMasked == "" {
+		result.EmailMasked = raw.Email
 	}
+	result.EmailMasked = privacy.MaskEmail(result.EmailMasked)
 	result.HasCredential = result.HasCredential || raw.HasToken || raw.HasRefresh
 	result.FiveHour = panelWindow(raw.Utilization5h, raw.Reset5h, result.FiveHour)
 	result.SevenDay = panelWindow(raw.Utilization7d, raw.Reset7d, result.SevenDay)

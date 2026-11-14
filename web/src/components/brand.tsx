@@ -1,5 +1,5 @@
-import { Waypoints } from 'lucide-react'
 import { Link } from 'react-router-dom'
+import { LogoMark } from '@/components/logo'
 import { useConfig } from '@/lib/session'
 
 // The wordmark is the operator's site name, never the upstream product: users
@@ -13,5 +13,5 @@ export function useSiteName() {
 
 export function Brand() {
   const name = useSiteName()
-  return <Link to="/" className="brand" aria-label={`${name} 首页`}><span className="brand-mark"><Waypoints size={21} /></span><span className="brand-name">{name}</span></Link>
+  return <Link to="/" className="brand" aria-label={`${name} 首页`}><span className="brand-mark"><LogoMark size={22} /></span><span className="brand-name">{name}</span></Link>
 }

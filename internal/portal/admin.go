@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/DueGin/seat-hub/internal/api"
+	"github.com/DueGin/seat-hub/internal/privacy"
 	"github.com/DueGin/seat-hub/internal/provision"
 	"github.com/DueGin/seat-hub/internal/secret"
 	"github.com/DueGin/seat-hub/internal/store"
@@ -115,7 +116,7 @@ func (service *Service) RentalPool(ctx context.Context) ([]api.RentalPoolRowDTO,
 	for index := range items {
 		if vm, exists := byID[items[index].VMID]; exists {
 			items[index].VM = &api.RentalVMDTO{
-				Label: vm.Label, EmailMasked: vm.EmailMasked, CredStatus: vm.CredStatus,
+				Label: vm.Label, EmailMasked: privacy.MaskEmail(vm.EmailMasked), CredStatus: vm.CredStatus,
 				ScheduleState: vm.ScheduleState, Tier: vm.Tier,
 				FiveHour: adminWindow(vm.FiveHour), SevenDay: adminWindow(vm.SevenDay),
 			}
@@ -154,7 +155,7 @@ func (service *Service) RentalCandidates(ctx context.Context) ([]api.RentalCandi
 	for _, vm := range vms {
 		if adminRentable(vm) && !excluded[vm.ID] {
 			items = append(items, api.RentalCandidateDTO{
-				VMID: vm.ID, Label: vm.Label, EmailMasked: vm.EmailMasked,
+				VMID: vm.ID, Label: vm.Label, EmailMasked: privacy.MaskEmail(vm.EmailMasked),
 				CredStatus: vm.CredStatus, ScheduleState: vm.ScheduleState, Tier: vm.Tier,
 			})
 		}

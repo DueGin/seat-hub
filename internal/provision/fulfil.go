@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/DueGin/seat-hub/internal/privacy"
 )
 
 // FulfilOrder applies a settled order. It is driven by the job engine, but it
@@ -97,6 +99,7 @@ func (service *Service) syncAccountIdentity(ctx context.Context, vmID string) {
 	if err != nil || usage.VM.EmailMasked == "" && usage.VM.Tier == "" {
 		return
 	}
+	usage.VM.EmailMasked = privacy.MaskEmail(usage.VM.EmailMasked)
 	_, _ = service.db.ExecContext(ctx, `UPDATE resources SET
 		email_masked=CASE WHEN ?<>'' THEN ? ELSE email_masked END,
 		tier=CASE WHEN ?<>'' THEN ? ELSE tier END, updated_at=?

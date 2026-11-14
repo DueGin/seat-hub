@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/DueGin/seat-hub/internal/privacy"
 	"github.com/DueGin/seat-hub/internal/store"
 	"github.com/DueGin/seat-hub/internal/vm2api"
 )
@@ -258,7 +259,7 @@ func TestProvisionHostedOAuthLifecycle(t *testing.T) {
 	}
 	// The signed-in account's masked email and plan are copied onto the
 	// resource, so the user no longer sees "waiting for authorization".
-	if account.EmailMasked == "" || account.EmailMasked != usage.VM.EmailMasked || account.Tier != usage.VM.Tier {
+	if account.EmailMasked == "" || account.EmailMasked != privacy.MaskEmail(usage.VM.EmailMasked) || account.Tier != usage.VM.Tier {
 		t.Fatalf("identity not synced: account=%q/%q vm=%q/%q", account.EmailMasked, account.Tier, usage.VM.EmailMasked, usage.VM.Tier)
 	}
 	if usage.VM.ScheduleState != "on" {

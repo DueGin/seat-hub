@@ -108,11 +108,11 @@ function duplicateSelfcheck(): Selfcheck {
   return { ...selfcheck('fail'), checks: [...passingChecks(), { code: 'account_unique', ok: false, message: '该账号已在其它槽位托管', detail: 'account_uuid 与资源 #1 重复', remedy: '请移除此账号，或使用尚未托管的账号。' }] }
 }
 const accounts: Owned<Account>[] = [
-  { userId: 1, value: { id: 1, kind: 'hosted', label: '日常开发主号', email_masked: 'de***@gmail.com', status: 'active', status_reason: null, tier: 'max', created_at: iso(-12 * DAY), expires_at: null, usage: accountUsage(1), selfcheck: selfcheck('pass') } },
-  { userId: 1, value: { id: 2, kind: 'hosted', label: '设计工作室（重建中）', email_masked: 'st***@outlook.com', status: 'needs_reauth', status_reason: '环境自检未通过，正在第 2 次重建。', tier: 'pro', created_at: iso(-10 * DAY), expires_at: null, usage: { ...accountUsage(2), available: false, schedule_state: 'unschedulable', restriction_text: '需要重新授权', five_hour: null, seven_day: null, estimate_5h: null, estimate_7d: null, inflight: 0 }, selfcheck: selfcheck('fail', 2) } },
-  { userId: 1, value: { id: 3, kind: 'hosted', label: '备用号（转人工）', email_masked: 'ba***@gmail.com', status: 'failed', status_reason: '多次自检未通过，已转人工处理。', tier: 'pro', created_at: iso(-8 * DAY), expires_at: null, usage: null, selfcheck: selfcheck('exhausted', 3) } },
-  { userId: 1, value: { id: 4, kind: 'rental', label: 'Max 独享租赁', email_masked: 're***@gmail.com', status: 'active', status_reason: null, tier: 'max', created_at: iso(-24 * DAY), expires_at: iso(6 * DAY), usage: accountUsage(2), selfcheck: selfcheck('pass') } },
-  { userId: 2, value: { id: 5, kind: 'hosted', label: '个人工作账号', email_masked: 'us***@gmail.com', status: 'active', status_reason: null, tier: 'pro', created_at: iso(-5 * DAY), expires_at: null, usage: accountUsage(0), selfcheck: selfcheck('pass') } },
+  { userId: 1, value: { id: 1, kind: 'hosted', label: '日常开发主号', email_masked: 'dev***@***.com', status: 'active', status_reason: null, tier: 'max', created_at: iso(-12 * DAY), expires_at: null, usage: accountUsage(1), selfcheck: selfcheck('pass') } },
+  { userId: 1, value: { id: 2, kind: 'hosted', label: '设计工作室（重建中）', email_masked: 'stu***@***.com', status: 'needs_reauth', status_reason: '环境自检未通过，正在第 2 次重建。', tier: 'pro', created_at: iso(-10 * DAY), expires_at: null, usage: { ...accountUsage(2), available: false, schedule_state: 'unschedulable', restriction_text: '需要重新授权', five_hour: null, seven_day: null, estimate_5h: null, estimate_7d: null, inflight: 0 }, selfcheck: selfcheck('fail', 2) } },
+  { userId: 1, value: { id: 3, kind: 'hosted', label: '备用号（转人工）', email_masked: 'bak***@***.com', status: 'failed', status_reason: '多次自检未通过，已转人工处理。', tier: 'pro', created_at: iso(-8 * DAY), expires_at: null, usage: null, selfcheck: selfcheck('exhausted', 3) } },
+  { userId: 1, value: { id: 4, kind: 'rental', label: 'Max 独享租赁', email_masked: 'ren***@***.com', status: 'active', status_reason: null, tier: 'max', created_at: iso(-24 * DAY), expires_at: iso(6 * DAY), usage: accountUsage(2), selfcheck: selfcheck('pass') } },
+  { userId: 2, value: { id: 5, kind: 'hosted', label: '个人工作账号', email_masked: 'use***@***.com', status: 'active', status_reason: null, tier: 'pro', created_at: iso(-5 * DAY), expires_at: null, usage: accountUsage(0), selfcheck: selfcheck('pass') } },
 ]
 const keys: Owned<ApiKey>[] = [
   { userId: 1, value: { id: 1, name: '开发环境', prefix: 'sk-pt-Demo', status: 'active', created_at: iso(-25 * DAY), last_used_at: iso(-120_000) } },
@@ -139,7 +139,7 @@ for (const entry of subscriptions) {
 orders.push({ userId: 1, value: { order_no: 'PT202610310001', product_id: 1, product_name: products[0].name, kind: 'concurrency', quantity: 1, amount_cents: 9900, currency: 'CNY', provider: 'mock', status: 'pending', renew_subscription_id: null, created_at: iso(-5 * 60_000), paid_at: null, fulfilled_at: null, expires_at: iso(25 * 60_000) } })
 orderTerms.set('PT202610310001', { unitQuantity: 5, durationDays: 30 })
 const rentalCandidates: PoolCandidate[] = Array.from({ length: 8 }, (_, index) => ({
-  vm_id: `demo-vm-${index + 1}`, label: `演示资源 ${index + 1}`, email_masked: `vm${index + 1}***@gmail.com`, cred_status: 'valid', schedule_state: 'on', tier: index % 2 ? 'pro' : 'max',
+  vm_id: `demo-vm-${index + 1}`, label: `演示资源 ${index + 1}`, email_masked: `vm${index + 1}***@***.com`, cred_status: 'valid', schedule_state: 'on', tier: index % 2 ? 'pro' : 'max',
 }))
 const pool: PoolItem[] = rentalCandidates.slice(0, 5).map((candidate, index) => ({
   vm_id: candidate.vm_id, tier: candidate.tier, status: index === 0 ? 'leased' : index === 4 ? 'maintenance' : 'available',
@@ -456,7 +456,7 @@ function pollOnboarding(account: Account): Onboarding {
       Object.assign(onboarding, { status: 'failed', bootstrap: { state: 'failed', message: account.status_reason }, error: { code: 'bootstrap_failed', message: account.status_reason }, can_regenerate: true })
       return onboarding
     }
-    account.status = 'active'; account.status_reason = null; account.tier = 'pro'; account.email_masked ||= 'de***@gmail.com'; account.usage = accountUsage(0)
+    account.status = 'active'; account.status_reason = null; account.tier = 'pro'; account.email_masked ||= 'dev***@***.com'; account.usage = accountUsage(0)
     Object.assign(onboarding, { status: 'active', auth_url: null, auth_url_expires_at: null, bootstrap: { state: 'succeeded', message: '演示初始化完成，账号已可用。' }, error: null, can_regenerate: false })
   }
   return onboarding

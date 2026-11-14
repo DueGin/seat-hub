@@ -98,7 +98,7 @@ func panelCallTests() []panelCallTest {
 			response: `{"ok":true,"data":{"items":[{"id":"vm-one","name":"Claude slot","platform":"anthropic","owner_user_id":"user-one","origin":"admin_assigned","account_tier":"max","email":"alice@example.test","has_token":true,"cred_status":"ok","schedule_state":"unschedulable","unschedulable_reason":"oauth_revoked"},{"id":"other","platform":"anthropic","owner_user_id":"user-two"},{"id":"codex","platform":"openai","owner_user_id":"user-one"}]}}`,
 			invoke: func(client *HTTPClient) error {
 				value, err := client.ListVMs(ctx, VMFilter{OwnerUserID: &ownerID, ClaudeOnly: true})
-				if err == nil && (len(value) != 1 || value[0].ID != "vm-one" || value[0].Label != "Claude slot" || value[0].Tier != "max" || value[0].EmailMasked != "a***@example.test" || !value[0].HasCredential || !value[0].CredentialRejected) {
+				if err == nil && (len(value) != 1 || value[0].ID != "vm-one" || value[0].Label != "Claude slot" || value[0].Tier != "max" || value[0].EmailMasked != "al***@***.test" || !value[0].HasCredential || !value[0].CredentialRejected) {
 					return fmt.Errorf("unexpected vms: %+v", value)
 				}
 				return err
@@ -628,7 +628,7 @@ func TestHTTPClientVMIdentityAndProxyFields(t *testing.T) {
 						}
 						vm = usage.VM
 					}
-					if vm.ID != "vm-one" || vm.Fingerprint != fingerprint || vm.Timezone != "Asia/Singapore" || vm.Locale != "zh-CN" || vm.Email != "alice@example.test" || vm.EmailMasked != "a***@example.test" || vm.AccountUUID != "account-one" {
+					if vm.ID != "vm-one" || vm.Fingerprint != fingerprint || vm.Timezone != "Asia/Singapore" || vm.Locale != "zh-CN" || vm.Email != "alice@example.test" || vm.EmailMasked != "al***@***.test" || vm.AccountUUID != "account-one" {
 						t.Fatalf("unexpected vm identity: %+v", vm)
 					}
 					if !reflect.DeepEqual(vm.Proxy, test.proxy) {
@@ -709,7 +709,7 @@ func TestFakeHTTPSelfcheckRoundTrip(t *testing.T) {
 		return usage.VM
 	}
 	vm := readVM()
-	if vm.Fingerprint.DeviceID == "" || vm.Proxy != nil || vm.ProxyConfigured || vm.AccountUUID != "account-one" || vm.Email != "alice@example.test" || vm.EmailMasked != "a***@example.test" || vm.Timezone != "Asia/Tokyo" || vm.Locale != "en-US" {
+	if vm.Fingerprint.DeviceID == "" || vm.Proxy != nil || vm.ProxyConfigured || vm.AccountUUID != "account-one" || vm.Email != "alice@example.test" || vm.EmailMasked != "al***@***.test" || vm.Timezone != "Asia/Tokyo" || vm.Locale != "en-US" {
 		t.Fatalf("unexpected initial vm: %+v", vm)
 	}
 	fingerprint, err := client.CollectIdentity(ctx, vm.ID)

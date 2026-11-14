@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useId, useRef } from 'react'
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode } from 'react'
+import type { ButtonHTMLAttributes, InputHTMLAttributes, MouseEvent, ReactNode } from 'react'
 import { Check, Copy, Inbox, LoaderCircle, Monitor, Moon, RefreshCw, Sun, TriangleAlert, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { setThemePreference, useTheme } from '@/lib/theme'
@@ -20,6 +20,22 @@ export function EmptyState({ title = '这里还没有数据', description = '完
 export function LoadingState() { return <div role="status" className="state"><LoaderCircle className="spin" size={26} /><p>正在加载工作台数据…</p></div> }
 export function ErrorState({ retry, error }: { retry?: () => void; error?: unknown }) { return <div role="alert" className="state"><TriangleAlert size={28} /><h3>暂时无法加载</h3><p>{error instanceof Error ? error.message : '请稍后重试'}</p>{retry && <Button variant="secondary" onClick={retry}><RefreshCw size={14} />重新加载</Button>}</div> }
 export function QueryState({ query, children }: { query: { isPending: boolean; isError: boolean; error: unknown; refetch: () => unknown }; children: ReactNode }) { return query.isPending ? <LoadingState /> : query.isError ? <ErrorState error={query.error} retry={() => { void query.refetch() }} /> : <>{children}</> }
+// Clicking outside a dialog never closes it: a stray click would throw away a
+// half-filled form. Dialogs close only through their own buttons or Escape.
+// A click on the backdrop nudges the dialog instead, so it is clear it is
+// still waiting rather than unresponsive. (A <dialog> receives backdrop clicks
+// itself, as do clicks on its own padding; only clicks outside its box count.)
+const MODAL_NUDGE: Keyframe[] = [{ transform: 'scale(1)' }, { transform: 'scale(1.015)', offset: 0.4 }, { transform: 'scale(1)' }]
+const DRAWER_NUDGE: Keyframe[] = [{ transform: 'translateX(0)' }, { transform: 'translateX(-8px)', offset: 0.4 }, { transform: 'translateX(0)' }]
+function nudgeOnBackdrop(event: MouseEvent<HTMLDialogElement>, keyframes: Keyframe[]) {
+  const dialog = event.currentTarget
+  if (event.target !== dialog) return
+  const box = dialog.getBoundingClientRect()
+  if (event.clientX >= box.left && event.clientX <= box.right && event.clientY >= box.top && event.clientY <= box.bottom) return
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return
+  dialog.getAnimations().forEach((animation) => animation.cancel())
+  dialog.animate(keyframes, { duration: 220, easing: 'ease-out' })
+}
 // Modal keeps the header and the optional footer pinned while the body scrolls,
 // so primary actions stay reachable however tall the content gets. Buttons in
 // the footer submit a form in the body through the form="…" attribute.
@@ -29,7 +45,7 @@ export function Modal({ open, onClose, title, children, footer, wide = false }: 
   const titleId = useId()
   useEffect(() => { closeRef.current = onClose }, [onClose])
   useEffect(() => { const dialog = ref.current; if (open && !dialog?.open) dialog?.showModal(); if (!open && dialog?.open) dialog.close(); return () => { if (dialog?.open) dialog.close() } }, [open])
-  return <dialog ref={ref} className={`modal ${wide ? 'modal-wide' : ''}`} aria-labelledby={titleId} onCancel={(event) => { event.preventDefault(); closeRef.current() }} onClick={(event) => { if (event.target === event.currentTarget) closeRef.current() }}><div className="modal-header"><h2 id={titleId}>{title}</h2><Button variant="ghost" aria-label="关闭弹窗" onClick={onClose}><X size={18} /></Button></div>{open && <div className="modal-body">{children}</div>}{open && footer && <div className="modal-footer">{footer}</div>}</dialog>
+  return <dialog ref={ref} className={`modal ${wide ? 'modal-wide' : ''}`} aria-labelledby={titleId} onCancel={(event) => { event.preventDefault(); closeRef.current() }} onClick={(event) => nudgeOnBackdrop(event, MODAL_NUDGE)}><div className="modal-header"><h2 id={titleId}>{title}</h2><Button variant="ghost" aria-label="关闭弹窗" onClick={onClose}><X size={18} /></Button></div>{open && <div className="modal-body">{children}</div>}{open && footer && <div className="modal-footer">{footer}</div>}</dialog>
 }
 export function Drawer({ open, onClose, title, children }: { open: boolean; onClose: () => void; title: string; children: ReactNode }) {
   const ref = useRef<HTMLDialogElement>(null)
@@ -37,7 +53,7 @@ export function Drawer({ open, onClose, title, children }: { open: boolean; onCl
   const titleId = useId()
   useEffect(() => { closeRef.current = onClose }, [onClose])
   useEffect(() => { const dialog = ref.current; if (open && !dialog?.open) dialog?.showModal(); if (!open && dialog?.open) dialog.close(); return () => { if (dialog?.open) dialog.close() } }, [open])
-  return <dialog ref={ref} className="drawer" aria-labelledby={titleId} onCancel={(event) => { event.preventDefault(); closeRef.current() }} onClick={(event) => { if (event.target === event.currentTarget) closeRef.current() }}><div className="modal-header"><h2 id={titleId}>{title}</h2><Button variant="ghost" aria-label="关闭抽屉" onClick={onClose}><X size={18} /></Button></div><div className="drawer-body">{open && children}</div></dialog>
+  return <dialog ref={ref} className="drawer" aria-labelledby={titleId} onCancel={(event) => { event.preventDefault(); closeRef.current() }} onClick={(event) => nudgeOnBackdrop(event, DRAWER_NUDGE)}><div className="modal-header"><h2 id={titleId}>{title}</h2><Button variant="ghost" aria-label="关闭抽屉" onClick={onClose}><X size={18} /></Button></div><div className="drawer-body">{open && children}</div></dialog>
 }
 export function CopyButton({ value, label = '复制' }: { value: string; label?: string }) { return <Button variant="secondary" onClick={() => { void navigator.clipboard.writeText(value).then(() => toast.success('已复制到剪贴板')).catch(() => toast.error('复制失败，请手动选择文本复制')) }}><Copy size={14} />{label}</Button> }
 export function StatCard({ label, value, detail, icon }: { label: string; value: ReactNode; detail?: ReactNode; icon?: ReactNode }) { return <Card className="stat-card"><div className="stat-label">{label}{icon}</div><div className="stat-value mono">{value}</div>{detail && <div className="stat-detail">{detail}</div>}</Card> }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/DueGin/seat-hub/internal/api"
+	"github.com/DueGin/seat-hub/internal/privacy"
 	"github.com/DueGin/seat-hub/internal/provision"
 	"github.com/DueGin/seat-hub/internal/selfcheck"
 	"github.com/DueGin/seat-hub/internal/store"
@@ -164,7 +165,7 @@ func toAccountDTO(a provision.Account, usageDTO *api.AccountUsageDTO, maxAttempt
 		ID:           a.ID,
 		Kind:         a.Kind,
 		Label:        a.Label,
-		EmailMasked:  a.EmailMasked,
+		EmailMasked:  privacy.MaskEmail(a.EmailMasked),
 		Status:       a.Status,
 		StatusReason: derefString(a.StatusReason),
 		Tier:         a.Tier,

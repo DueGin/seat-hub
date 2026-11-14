@@ -452,7 +452,7 @@ func TestRentalAllocationRequiresSelfcheckPass(t *testing.T) {
 	if err := service.db.QueryRow(`SELECT email_masked,tier FROM resources WHERE subscription_id=?`, subscriptionID).Scan(&email, &tier); err != nil {
 		t.Fatal(err)
 	}
-	if email != "ren***2@example.com" || tier != "max" {
+	if email != "ren***@***.com" || tier != "max" {
 		t.Fatalf("rental identity=%q/%q", email, tier)
 	}
 	subscriptionID = addSubscription(t, service, userID, "rental_account", 1, service.now().Add(time.Hour))
