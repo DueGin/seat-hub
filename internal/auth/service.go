@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/secret"
-	"github.com/DueGin/vm2api-portal/internal/store"
+	"github.com/DueGin/seat-hub/internal/secret"
+	"github.com/DueGin/seat-hub/internal/store"
 )
 
 const (
@@ -37,7 +37,7 @@ type LoginResult struct {
 var dummyPasswordHash string
 
 func init() {
-	h, err := HashPassword("vm2api-portal-nonexistent-account")
+	h, err := HashPassword("seat-hub-nonexistent-account")
 	if err == nil {
 		dummyPasswordHash = h
 	}

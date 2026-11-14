@@ -43,7 +43,7 @@
 **部署类**
 - `Dockerfile` 运行镜像先 `mkdir -p /data && chown`，否则 uid 10001 建不了 SQLite。
 - 新增 `.dockerignore`，避免把宿主 `node_modules` 带进构建。
-- systemd `ExecStart` 与 `DEPLOY.md` 安装路径统一为 `/opt/vm2api-portal/vm2api-portal`。
+- systemd `ExecStart` 与 `DEPLOY.md` 安装路径统一为 `/opt/seat-hub/seat-hub`。
 - `.env.example` 的 master key 与 mock 默认值对齐（`mock-master-key`），`make mock` 会加载 `.env`。
 - `DefaultSite` 返回完整的 `payment` 两段文档，全新安装的设置页不再白屏。
 - `base_url` 优先取 `PORTAL_PUBLIC_BASE_URL`，不再由请求 Host 决定。
@@ -57,7 +57,7 @@
 
 - `go build ./...`、`go test ./...`、`go vet ./...` 全绿；`go test -race` 在 gateway / auth / order / provision / portal / payment / app 通过。
 - 端到端（进程内）：注册 → 建商品 → 下单 → mock 支付 → 履约 → 建门面 key → 网关透传，断言上游收到的是该用户的 vm2api 密钥、请求体原样转发。
-- 真实二进制冒烟（`cmd/mock-vm2api` + `cmd/portal`）：
+- 真实二进制冒烟（`cmd/mock-vm2api` + `cmd/seat-hub`）：
   - 租赁池入池后商品库存由 0 变 1，下单可履约（原 critical 已修）。
   - 托管上号：创建 → 授权链接 → 粘贴授权码 → 初装 6 秒后转 `active`。
   - `/v1/models`、`/v1/messages` 经门面正常返回；`/v1/../api/panel/users` 返回 400（不再打到管理面）。

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/DueGin/vm2api-portal/internal/auth"
-	"github.com/DueGin/vm2api-portal/internal/store"
+	"github.com/DueGin/seat-hub/internal/auth"
+	"github.com/DueGin/seat-hub/internal/store"
 )
 
 // firstUserMu serialises the "first user becomes admin" check and create.

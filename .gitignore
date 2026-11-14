@@ -7,3 +7,4 @@ web/dist/
 *.db-wal
 *.db-shm
 .DS_Store
+/mock-vm2api

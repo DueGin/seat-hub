@@ -6,8 +6,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/DueGin/vm2api-portal/internal/config"
-	"github.com/DueGin/vm2api-portal/internal/payment"
+	"github.com/DueGin/seat-hub/internal/config"
+	"github.com/DueGin/seat-hub/internal/payment"
 )
 
 // buildProviders builds the payment provider map from the stored settings.

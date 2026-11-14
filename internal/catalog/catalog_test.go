@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/catalog"
-	"github.com/DueGin/vm2api-portal/internal/store"
+	"github.com/DueGin/seat-hub/internal/catalog"
+	"github.com/DueGin/seat-hub/internal/store"
 )
 
 func database(t *testing.T) *sql.DB {

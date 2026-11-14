@@ -11,9 +11,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/DueGin/vm2api-portal/internal/api"
-	"github.com/DueGin/vm2api-portal/internal/order"
-	"github.com/DueGin/vm2api-portal/internal/payment"
+	"github.com/DueGin/seat-hub/internal/api"
+	"github.com/DueGin/seat-hub/internal/order"
+	"github.com/DueGin/seat-hub/internal/payment"
 )
 
 // paymentAdapter bridges payment.Service to api.PaymentService.

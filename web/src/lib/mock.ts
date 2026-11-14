@@ -1,4 +1,5 @@
 import type {
+  ReleaseInfo, UpdateJob, UpdateStage, UpdateStatus,
   Account, AccountUsage, AdminDashboard, AdminUser, ApiKey, DailyUsage, Job,
   ModelUsage, Onboarding, Order, Overview, Page, Payment, PoolCandidate,
   PoolItem, Product, ProductKind, PublicConfig, Settings, Spend, Subscription,
@@ -242,8 +243,41 @@ function currentUser(): User {
   if (user.status === 'disabled') fail(403, 'user_disabled', '该演示用户已停用。')
   return user
 }
-function publicConfig(): PublicConfig {
+// In-site update simulation: a job walks through the real stages, then the
+// "restarted" server reports the new version. The running version survives the
+// page reload that follows, like a real update would.
+const MOCK_VERSION_KEY = 'seat-hub.mock.version'
+const mockReleases: ReleaseInfo[] = [
+  { version: 'v0.2.0', name: 'v0.2.0', notes: '- 新增「使用记录」页，按账号查看每次调用\n- 深色与浅色两套主题，默认跟随系统\n- 管理后台支持站内一键更新与回滚', url: 'https://github.com/DueGin/seat-hub/releases/tag/v0.2.0', published_at: iso(-DAY) },
+  { version: 'v0.1.0', name: 'v0.1.0', notes: '- 首个版本', url: 'https://github.com/DueGin/seat-hub/releases/tag/v0.1.0', published_at: iso(-10 * DAY) },
+]
+let mockJob: { kind: 'update' | 'rollback'; version: string; startedAt: number } | null = null
+function mockVersion(): string { return sessionStorage.getItem(MOCK_VERSION_KEY) || 'v0.1.0' }
+function mockJobView(): UpdateJob | null {
+  if (!mockJob) return null
+  const elapsed = Date.now() - mockJob.startedAt
+  if (elapsed > 7000) { sessionStorage.setItem(MOCK_VERSION_KEY, mockJob.version); mockJob = null; return null }
+  const total = mockJob.kind === 'update' ? 21_400_000 : 0
+  const stage: UpdateStage = mockJob.kind === 'rollback' ? 'restarting' : elapsed < 3000 ? 'downloading' : elapsed < 3800 ? 'verifying' : elapsed < 4300 ? 'installing' : 'restarting'
+  return { kind: mockJob.kind, version: mockJob.version, stage, done: Math.min(total, Math.round(total * elapsed / 3000)), total, started_at: new Date(mockJob.startedAt).toISOString() }
+}
+function mockUpdateStatus(): UpdateStatus {
+  const job = mockJobView()
+  const current = mockVersion()
+  const latest = mockReleases[0]
+  const updated = current === latest.version
   return {
+    current, commit: 'a1b2c3d4e5f6', build_time: iso(-DAY), supervisor: 'docker', drain_seconds: 20, can_update: true,
+    latest, changelog: mockReleases.filter(release => release.version > current), update_available: latest.version > current,
+    checked_at: new Date().toISOString(), job, pending: false,
+    rollback: updated ? { version: 'v0.1.0', source: 'image' } : null, last_failure: null,
+  }
+}
+
+function publicConfig(): PublicConfig {
+  mockJobView()
+  return {
+    version: mockVersion(),
     site_name: settings.site_name, base_url: '', registration_open: settings.registration_open, dev: true,
     payment_providers: [
       ...(settings.payment.epay.enabled ? [{ id: 'epay', name: '在线支付（演示）' }] : []),
@@ -685,6 +719,22 @@ function adminRequest(path: string, method: string, query: URLSearchParams, inpu
   const rawId = parts[2]
   const action = parts[3]
   if (path === '/admin/dashboard' && method === 'GET') return ok(dashboard())
+  if (path === '/admin/system/update' && method === 'GET') return ok(mockUpdateStatus())
+  if (path === '/admin/system/update' && method === 'POST') {
+    if (mockJob) fail(409, 'update_in_progress', '已有更新或回滚正在进行，请稍候')
+    const latest = mockReleases[0].version
+    if (input.version !== latest) fail(409, 'version_not_latest', '只能更新到最新发布的版本，请刷新后重试')
+    if (mockVersion() === latest) fail(409, 'version_not_newer', '该版本不比当前运行的版本新')
+    mockJob = { kind: 'update', version: latest, startedAt: Date.now() }
+    return ok(mockJobView(), 202)
+  }
+  if (path === '/admin/system/rollback' && method === 'POST') {
+    const target = mockUpdateStatus().rollback
+    if (!target) fail(409, 'no_rollback', '没有可以回滚到的上一个版本')
+    if (mockJob) fail(409, 'update_in_progress', '已有更新或回滚正在进行，请稍候')
+    mockJob = { kind: 'rollback', version: target!.version, startedAt: Date.now() + 2500 }
+    return ok(mockJobView() ?? { kind: 'rollback', version: target!.version, stage: 'restarting', done: 0, total: 0, started_at: new Date().toISOString() }, 202)
+  }
   if (path === '/admin/settings') {
     if (method === 'GET') return ok(settingsView())
     if (method === 'PUT') { patchSettings(input); return ok(settingsView()) }

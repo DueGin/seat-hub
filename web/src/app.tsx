@@ -1,10 +1,11 @@
-import { Component, lazy, Suspense, useEffect, useState } from 'react'
+import { Component, lazy, Suspense, useEffect, useRef, useState } from 'react'
 import type { ErrorInfo, ReactNode } from 'react'
 import { Navigate, NavLink, Outlet, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { useQueryClient } from '@tanstack/react-query'
-import { Activity, ArrowUpRight, History, Boxes, CircleHelp, CreditCard, Gauge, KeyRound, LayoutDashboard, ListTodo, LogOut, Menu, Package, Server, Settings, ShieldCheck, ShoppingBag, Users, X, Zap } from 'lucide-react'
+import { toast } from 'sonner'
+import { Activity, ArrowUpCircle, ArrowUpRight, History, Boxes, CircleHelp, CreditCard, Gauge, KeyRound, LayoutDashboard, ListTodo, LogOut, Menu, Package, Server, Settings, ShieldCheck, ShoppingBag, Users, X, Zap } from 'lucide-react'
 import { api, isMock } from '@/lib/api'
-import { useSession } from '@/lib/session'
+import { useConfig, useSession } from '@/lib/session'
 import { Brand, useSiteName } from '@/components/brand'
 import { Button, Card, EmptyState, ErrorState, LoadingState, ThemeToggle } from '@/components/ui'
 
@@ -36,7 +37,7 @@ const userNav = [
   { to: '/overview', label: '总览', icon: Gauge }, { to: '/accounts', label: '我的账号', icon: Server }, { to: '/keys', label: 'API 密钥', icon: KeyRound }, { to: '/usage', label: '用量分析', icon: Activity }, { to: '/records', label: '使用记录', icon: History }, { to: '/subscriptions', label: '我的订阅', icon: Boxes }, { to: '/orders', label: '订单记录', icon: CreditCard }, { to: '/profile', label: '账户安全', icon: ShieldCheck },
 ]
 const adminNav = [
-  { to: '/admin/dashboard', label: '管理总览', icon: LayoutDashboard }, { to: '/admin/products', label: '商品管理', icon: Package }, { to: '/admin/orders', label: '订单管理', icon: ShoppingBag }, { to: '/admin/users', label: '用户管理', icon: Users }, { to: '/admin/rental-pool', label: '租赁池', icon: Boxes }, { to: '/admin/accounts', label: '资源管理', icon: Server }, { to: '/admin/jobs', label: '任务队列', icon: ListTodo }, { to: '/admin/settings', label: '站点设置', icon: Settings },
+  { to: '/admin/dashboard', label: '管理总览', icon: LayoutDashboard }, { to: '/admin/products', label: '商品管理', icon: Package }, { to: '/admin/orders', label: '订单管理', icon: ShoppingBag }, { to: '/admin/users', label: '用户管理', icon: Users }, { to: '/admin/rental-pool', label: '租赁池', icon: Boxes }, { to: '/admin/accounts', label: '资源管理', icon: Server }, { to: '/admin/jobs', label: '任务队列', icon: ListTodo }, { to: '/admin/settings', label: '站点设置', icon: Settings }, { to: '/admin/system', label: '系统更新', icon: ArrowUpCircle },
 ]
 function AppLayout() {
   const [open, setOpen] = useState(false)
@@ -59,6 +60,23 @@ class AppErrorBoundary extends Component<{ children: ReactNode }, { failed: bool
   componentDidCatch(error: Error, info: ErrorInfo) { console.error('页面渲染失败', error, info.componentStack) }
   render() { return this.state.failed ? <div className="fatal-error"><ErrorState error={new Error('页面暂时无法显示，请刷新重试')} retry={() => window.location.reload()} /></div> : this.props.children }
 }
+// VersionWatcher offers a reload once the server runs a different version than
+// the one this page was loaded with (after an in-site update), so open tabs do
+// not keep talking to a newer API with an older frontend.
+function VersionWatcher() {
+  const config = useConfig()
+  const loaded = useRef<string | null>(null)
+  const notified = useRef(false)
+  const version = config.data?.version
+  useEffect(() => {
+    if (!version) return
+    if (loaded.current === null) { loaded.current = version; return }
+    if (version === loaded.current || notified.current) return
+    notified.current = true
+    toast(`系统已更新到 ${version}`, { description: '刷新页面以使用最新版本。', duration: Infinity, action: { label: '立即刷新', onClick: () => window.location.reload() } })
+  }, [version])
+  return null
+}
 // SiteTitle names the tab after the operator's site, not the upstream product.
 function SiteTitle() {
   const name = useSiteName()
@@ -66,5 +84,5 @@ function SiteTitle() {
   return null
 }
 export default function App() {
-  return <AppErrorBoundary><SiteTitle /><Suspense fallback={<LoadingState />}><Routes><Route path="/" element={<LandingPage />} /><Route path="/login" element={<AuthPage />} /><Route path="/register" element={<AuthPage register />} /><Route element={<Protected />}><Route element={<AppLayout />}><Route path="/overview" element={<OverviewPage />} /><Route path="/accounts" element={<AccountsPage />} /><Route path="/accounts/new" element={<HostedWizardPage />} /><Route path="/accounts/:id" element={<AccountDetailPage />} /><Route path="/subscriptions" element={<SubscriptionsPage />} /><Route path="/keys" element={<KeysPage />} /><Route path="/usage" element={<UsagePage />} /><Route path="/records" element={<RecordsPage />} /><Route path="/profile" element={<ProfilePage />} /><Route path="/orders" element={<OrdersPage />} /><Route path="/orders/:orderNo" element={<OrderDetailPage />} /><Route element={<Protected admin />}><Route path="/admin" element={<Navigate to="/admin/dashboard" replace />} /><Route path="/admin/:section" element={<AdminPage />} /></Route></Route></Route><Route path="*" element={<div className="not-found"><Brand /><EmptyState title="这个页面走丢了" description="返回工作台，继续你的工作。" action={<NavLink className="button button-primary" to="/overview">返回工作台</NavLink>} /></div>} /></Routes></Suspense></AppErrorBoundary>
+  return <AppErrorBoundary><SiteTitle /><VersionWatcher /><Suspense fallback={<LoadingState />}><Routes><Route path="/" element={<LandingPage />} /><Route path="/login" element={<AuthPage />} /><Route path="/register" element={<AuthPage register />} /><Route element={<Protected />}><Route element={<AppLayout />}><Route path="/overview" element={<OverviewPage />} /><Route path="/accounts" element={<AccountsPage />} /><Route path="/accounts/new" element={<HostedWizardPage />} /><Route path="/accounts/:id" element={<AccountDetailPage />} /><Route path="/subscriptions" element={<SubscriptionsPage />} /><Route path="/keys" element={<KeysPage />} /><Route path="/usage" element={<UsagePage />} /><Route path="/records" element={<RecordsPage />} /><Route path="/profile" element={<ProfilePage />} /><Route path="/orders" element={<OrdersPage />} /><Route path="/orders/:orderNo" element={<OrderDetailPage />} /><Route element={<Protected admin />}><Route path="/admin" element={<Navigate to="/admin/dashboard" replace />} /><Route path="/admin/:section" element={<AdminPage />} /></Route></Route></Route><Route path="*" element={<div className="not-found"><Brand /><EmptyState title="这个页面走丢了" description="返回工作台，继续你的工作。" action={<NavLink className="button button-primary" to="/overview">返回工作台</NavLink>} /></div>} /></Routes></Suspense></AppErrorBoundary>
 }

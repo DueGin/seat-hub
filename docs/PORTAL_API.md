@@ -18,6 +18,7 @@
 ```json
 {"site_name":"…","base_url":"https://portal.example.com","registration_open":true,
  "payment_providers":[{"id":"epay","name":"在线支付"},{"id":"manual","name":"人工转账"},{"id":"mock","name":"模拟支付"}],
+ "version":"v0.1.0",
  "dev":false}
 ```
 `base_url` 为空时前端用 `location.origin`。
@@ -198,6 +199,26 @@ utilization 为 0–100；窗口缺失为 `null`。
 
 `account_id`（可选，正整数）只看该用户某个托管或租赁账号上的调用，用于「使用记录」页；时间范围自动收窄到该账号的持有期（租赁号被多次租用时只返回本次租期）。账号不属于当前用户返回 404 `not_found`；账号尚未分配槽位时返回空列表；非正整数返回 422 `invalid_request`。
 
+## 站内更新
+
+`UpdateStatus`：
+```json
+{"current":"v0.1.0","commit":"…","build_time":"…","supervisor":"docker|systemd|","drain_seconds":20,
+ "can_update":true,"reason":"不能更新时的原因",
+ "latest":Release|null,"changelog":[Release],"update_available":true,
+ "checked_at":"…|null","check_error":"无法连接 GitHub 时的说明",
+ "job":UpdateJob|null,"pending":false,
+ "rollback":{"version":"v0.0.9","source":"image|download"}|null,
+ "last_failure":{"version":"v0.2.0","error":"…","at":"…"}|null}
+```
+`Release`：`{version, name, notes, url, published_at}`，`notes` 是纯文本（Markdown 原文），前端不要按 HTML 渲染。
+
+`UpdateJob`：`{kind:"update|rollback", version, stage:"downloading|verifying|installing|restarting|failed", done, total, error?, started_at}`。
+
+- `pending=true` 表示刚更新的版本还在确认期（启动后约 30 秒），这期间不能再次更新。
+- 进入 `restarting` 后服务会短暂不可用。前端应轮询 `GET /api/public/config`，等 `version` 变成目标版本后再刷新页面。
+- 错误码：409 `update_unavailable`（附原因）、`update_in_progress`、`update_pending`、`version_not_latest`、`version_not_newer`、`no_rollback`；422 `invalid_version`；502 `update_source_unavailable`。
+
 ## 管理后台（role=admin）
 
 | 方法 | 路径 | 说明 |
@@ -228,6 +249,9 @@ utilization 为 0–100；窗口缺失为 `null`。
 | GET | `/api/admin/jobs?status=failed|pending|running&page` | `{items:[{id,type,status,attempts,run_after,last_error,payload,created_at,updated_at}]}` |
 | POST | `/api/admin/jobs/{id}/retry` | |
 | GET/PUT | `/api/admin/settings` | `Settings`（PUT 部分更新；密钥字段只写，GET 返回 `"***"` 或空） |
+| GET | `/api/admin/system/update?refresh=1` | 站内更新状态 `UpdateStatus`。默认用服务端缓存（最多 10 分钟查一次 GitHub）；`refresh=1` 强制重查，但 15 秒内重复请求仍用缓存 |
+| POST | `/api/admin/system/update` | `{version}` 更新到指定版本，只能是最新发布且比当前新的版本。返回 202 和 `UpdateJob`，之后轮询状态接口看进度 |
+| POST | `/api/admin/system/rollback` | `{}` 回滚到上一个版本并重启。返回 202 和 `UpdateJob` |
 
 以上三个自检接口仅管理员可调用，均使用标准成功/失败信封。账号 `id` 必须为正整数；非法 ID、`rebuild` 类型、空白 VM ID，以及空值、非整数、重复或超出 1–100 的 `limit` 返回 422 `invalid_request`。自检执行成功时返回 HTTP 200 和实际检查状态，`state=fail|exhausted` 也会返回检查明细；执行错误沿用错误信封。
 

@@ -1,4 +1,4 @@
-# vm2api-portal 设计
+# seat-hub 设计
 
 账号托管 / 租赁门面。用户在这里买「托管席位」「租赁账号」「并发」，拿 `baseurl + apikey` 接入；请求经门面透传到 vm2api。**计费用量、账号额度全部以 vm2api 接口为准**，门面只管商品、订单、权益、资源绑定和鉴权。
 
@@ -8,7 +8,7 @@
            用户浏览器                         用户的客户端（Claude Code / SDK / curl）
                │ /  /api/*                          │ /v1/*   Bearer sk-pt-…
                ▼                                    ▼
-┌──────────────────────────── vm2api-portal（Go 单二进制）────────────────────────────┐
+┌──────────────────────────── seat-hub（Go 单二进制）────────────────────────────┐
 │ web（React SPA，go:embed）  portal API（/api）           gateway（/v1 透传）          │
 │                           ├ auth / 商品 / 订单 / 支付   ├ 门面 key → vm2api key 换头 │
 │                           ├ 权益 / 资源 / 托管上号        ├ 用户级并发闸               │
@@ -37,7 +37,7 @@
 | 账号真实用量 | `GET /api/panel/vms/:id`：5h/7d 利用率与重置时间、`estimate_*`、`billing.today/window_5h/window_7d`、`usage_stats`（30 天）、`cred_status`、`schedule_state`、席位占用 |
 | 用户真实用量 | `GET /api/panel/billing?user_id=`、`GET /api/panel/request-logs?user_id=`、`GET /api/panel/request-logs/stats?user_id=`、`GET /api/panel/api-keys/:id/stats` |
 
-vm2api 文档与源码在 `/Users/duegin/project/2api/vm2api`（只读参考）：`docs/PANEL_API.md`、`docs/API.md`、`docs/OAUTH.md`、`src/lib/admin/panel-routes.mjs`、`src/lib/admin/api-keys.mjs`、`src/lib/admin/resource-owner.mjs`。
+vm2api 文档与源码（另一个仓库，只读参考）：`docs/PANEL_API.md`、`docs/API.md`、`docs/OAUTH.md`、`src/lib/admin/panel-routes.mjs`、`src/lib/admin/api-keys.mjs`、`src/lib/admin/resource-owner.mjs`。
 
 ## 3. 计费维度与权益
 
@@ -141,7 +141,7 @@ active ──凭证失效（vm2api 不可调度 oauth_*）──▶ needs_reauth
 ## 11. 代码布局与所有权
 
 ```text
-cmd/portal/            主程序（装配、迁移、后台任务、静态资源）
+cmd/seat-hub/            主程序（装配、迁移、后台任务、静态资源）
 cmd/mock-vm2api/       本地联调用的 vm2api 假服务
 internal/config/       环境变量
 internal/store/        SQLite、迁移、各表 repo

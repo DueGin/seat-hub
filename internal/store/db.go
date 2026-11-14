@@ -18,7 +18,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/DueGin/vm2api-portal/internal/store/migrations"
+	"github.com/DueGin/seat-hub/internal/store/migrations"
 )
 
 var ErrNotFound = errors.New("not found")

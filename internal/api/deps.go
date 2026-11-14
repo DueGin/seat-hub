@@ -309,6 +309,9 @@ type SiteConfig struct {
 	RegistrationOpen bool                 `json:"registration_open"`
 	PaymentProviders []PaymentProviderDTO `json:"payment_providers"`
 	Dev              bool                 `json:"dev"`
+	// Version is the running build. Open pages compare it with the version
+	// they loaded with and offer a reload after an in-site update.
+	Version string `json:"version"`
 }
 
 type SettingsPayload struct {

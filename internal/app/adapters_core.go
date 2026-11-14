@@ -10,12 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/catalog"
-	"github.com/DueGin/vm2api-portal/internal/vm2api"
+	"github.com/DueGin/seat-hub/internal/catalog"
+	"github.com/DueGin/seat-hub/internal/vm2api"
 
-	"github.com/DueGin/vm2api-portal/internal/api"
-	"github.com/DueGin/vm2api-portal/internal/auth"
-	"github.com/DueGin/vm2api-portal/internal/store"
+	"github.com/DueGin/seat-hub/internal/api"
+	"github.com/DueGin/seat-hub/internal/auth"
+	"github.com/DueGin/seat-hub/internal/store"
 )
 
 // usersAdapter implements api.UserStore over the SQLite repositories.

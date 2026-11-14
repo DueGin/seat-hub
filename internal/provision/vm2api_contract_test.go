@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/vm2api"
+	"github.com/DueGin/seat-hub/internal/vm2api"
 )
 
 var _ vm2api.Client = (*vm2api.Fake)(nil)

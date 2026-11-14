@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/vm2api"
+	"github.com/DueGin/seat-hub/internal/vm2api"
 )
 
 // Engine gathers slot snapshots from vm2api and records results.

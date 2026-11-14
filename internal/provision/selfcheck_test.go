@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/selfcheck"
-	"github.com/DueGin/vm2api-portal/internal/vm2api"
+	"github.com/DueGin/seat-hub/internal/selfcheck"
+	"github.com/DueGin/seat-hub/internal/vm2api"
 )
 
 type slotCheckStep struct {

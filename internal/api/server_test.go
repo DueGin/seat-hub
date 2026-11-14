@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	authed "github.com/DueGin/vm2api-portal/internal/auth"
+	authed "github.com/DueGin/seat-hub/internal/auth"
 )
 
 // --- fakes ---
@@ -276,7 +276,7 @@ func newTestServerWithAdmin(t *testing.T, role string, admin AdminService) (*htt
 			Users: fakeUsers{}, Settings: fakeSettings{}, Audit: fakeAudit{},
 			Auth:    auth,
 			Catalog: fakeCatalog{}, Orders: fakeOrders{}, Payments: fakePayments{},
-			Accounts: fakeAccounts{}, Usage: fakeUsage{}, Keys: fakeKeys{}, Admin: admin,
+			Accounts: fakeAccounts{}, Usage: fakeUsage{}, Keys: fakeKeys{}, Admin: admin, System: &fakeSystem{},
 			Site: func(r *http.Request) SiteConfig { return SiteConfig{SiteName: "测试站", BaseURL: "http://x"} },
 			Dev:  true,
 		},

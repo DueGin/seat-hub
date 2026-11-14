@@ -21,6 +21,15 @@ type Config struct {
 
 	VM2APIBaseURL   string
 	VM2APIMasterKey string
+
+	// In-site update (internal/update). The update directory itself comes
+	// from update.Dir(), because the launcher needs it before config loads.
+	UpdateRepo  string // owner/name of the GitHub repository with releases
+	UpdateAPI   string // GitHub API base, overridable for mirrors
+	UpdateToken string // optional GitHub token (higher API rate limit)
+	// UpdateDrainSeconds bounds how long a restart waits for in-flight
+	// requests (long streams included) before closing them.
+	UpdateDrainSeconds int
 }
 
 func Load() (Config, error) {
@@ -35,6 +44,11 @@ func Load() (Config, error) {
 		MaxBodyMB:       envInt("PORTAL_MAX_BODY_MB", 128),
 		VM2APIBaseURL:   strings.TrimRight(env("VM2API_BASE_URL", ""), "/"),
 		VM2APIMasterKey: env("VM2API_MASTER_KEY", ""),
+
+		UpdateRepo:         strings.TrimSpace(env("PORTAL_UPDATE_REPO", "DueGin/seat-hub")),
+		UpdateAPI:          strings.TrimRight(strings.TrimSpace(env("PORTAL_UPDATE_API", "https://api.github.com")), "/"),
+		UpdateToken:        strings.TrimSpace(env("PORTAL_UPDATE_TOKEN", "")),
+		UpdateDrainSeconds: envInt("PORTAL_UPDATE_DRAIN_SECONDS", 20),
 	}
 	if len(c.SecretKey) < 32 {
 		return c, fmt.Errorf("PORTAL_SECRET_KEY must be at least 32 bytes")
@@ -52,6 +66,15 @@ func Load() (Config, error) {
 		if u, err := url.Parse(c.PublicBaseURL); err != nil || u.Host == "" {
 			return c, fmt.Errorf("PORTAL_PUBLIC_BASE_URL is not a valid URL: %q", c.PublicBaseURL)
 		}
+	}
+	if strings.Count(c.UpdateRepo, "/") != 1 || strings.HasPrefix(c.UpdateRepo, "/") || strings.HasSuffix(c.UpdateRepo, "/") {
+		return c, fmt.Errorf("PORTAL_UPDATE_REPO must be owner/name: %q", c.UpdateRepo)
+	}
+	if u, err := url.Parse(c.UpdateAPI); err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return c, fmt.Errorf("PORTAL_UPDATE_API is not a valid URL: %q", c.UpdateAPI)
+	}
+	if c.UpdateDrainSeconds < 0 || c.UpdateDrainSeconds > 600 {
+		c.UpdateDrainSeconds = 20
 	}
 	if c.MaxBodyMB <= 0 {
 		c.MaxBodyMB = 128

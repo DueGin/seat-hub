@@ -1,10 +1,15 @@
 package api
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/DueGin/seat-hub/internal/buildinfo"
+)
 
 func (s *Server) handlePublicConfig(w http.ResponseWriter, r *http.Request) {
 	site := s.Deps.Site(r)
 	site.Dev = s.Deps.Dev
+	site.Version = buildinfo.Current().Version
 	site.PaymentProviders = s.Deps.Payments.Providers(r.Context())
 	if site.PaymentProviders == nil {
 		site.PaymentProviders = []PaymentProviderDTO{}

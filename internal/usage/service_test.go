@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/store/migrations"
-	"github.com/DueGin/vm2api-portal/internal/vm2api"
+	"github.com/DueGin/seat-hub/internal/store/migrations"
+	"github.com/DueGin/seat-hub/internal/vm2api"
 	_ "modernc.org/sqlite"
 )
 

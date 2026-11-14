@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/DueGin/vm2api-portal/internal/store"
+	"github.com/DueGin/seat-hub/internal/store"
 )
 
 // adminSeedResource inserts a resource row for the admin user with the given

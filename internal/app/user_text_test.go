@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/DueGin/vm2api-portal/internal/api"
-	"github.com/DueGin/vm2api-portal/internal/provision"
+	"github.com/DueGin/seat-hub/internal/api"
+	"github.com/DueGin/seat-hub/internal/provision"
 )
 
 // The stored last_error is an internal error chain; users must only ever see

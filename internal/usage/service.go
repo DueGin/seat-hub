@@ -8,7 +8,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/vm2api"
+	"github.com/DueGin/seat-hub/internal/vm2api"
 )
 
 func (service *Service) owner(ctx context.Context, userID int64) (string, error) {

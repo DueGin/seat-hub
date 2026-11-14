@@ -7,9 +7,9 @@ import (
 	"errors"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/api"
-	"github.com/DueGin/vm2api-portal/internal/catalog"
-	"github.com/DueGin/vm2api-portal/internal/order"
+	"github.com/DueGin/seat-hub/internal/api"
+	"github.com/DueGin/seat-hub/internal/catalog"
+	"github.com/DueGin/seat-hub/internal/order"
 )
 
 // catalogAdapter implements api.CatalogService over catalog.Service.

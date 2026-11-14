@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/DueGin/vm2api-portal/internal/selfcheck"
+	"github.com/DueGin/seat-hub/internal/selfcheck"
 )
 
 // SweepSelfcheck records fresh verdicts without disrupting running slots.

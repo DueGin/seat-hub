@@ -41,6 +41,7 @@ type Deps struct {
 	Usage    UsageService
 	Keys     KeyService
 	Admin    AdminService
+	System   SystemService
 
 	Site func(r *http.Request) SiteConfig
 	Dev  bool
@@ -123,6 +124,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/admin/accounts/{id}/selfchecks", s.admin(s.handleAdminAccountSelfchecks))
 	mux.HandleFunc("POST /api/admin/accounts/{id}/retry", s.admin(s.handleAdminRetryAccount))
 	mux.HandleFunc("POST /api/admin/accounts/{id}/release", s.admin(s.handleAdminReleaseAccount))
+	mux.HandleFunc("GET /api/admin/system/update", s.admin(s.handleAdminUpdateStatus))
+	mux.HandleFunc("POST /api/admin/system/update", s.admin(s.handleAdminApplyUpdate))
+	mux.HandleFunc("POST /api/admin/system/rollback", s.admin(s.handleAdminRollback))
 	mux.HandleFunc("GET /api/admin/jobs", s.admin(s.handleAdminJobs))
 	mux.HandleFunc("POST /api/admin/jobs/{id}/retry", s.admin(s.handleAdminRetryJob))
 	mux.HandleFunc("GET /api/admin/settings", s.admin(s.handleAdminGetSettings))

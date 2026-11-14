@@ -4,13 +4,17 @@ import { Activity, Users, Wallet, Boxes } from 'lucide-react'
 import { Badge, Button, Card, Notice, PageHeader, QueryState, StatCard } from '@/components/ui'
 import { api } from '@/lib/api'
 import { money, number } from '@/lib/format'
-import type { AdminDashboard } from '@/lib/types'
+import type { AdminDashboard, UpdateStatus } from '@/lib/types'
 
 export function Dashboard() {
   const query = useQuery({ queryKey: ['admin', 'dashboard'], queryFn: () => api.get<AdminDashboard>('/admin/dashboard'), refetchInterval: 30_000 })
   const data = query.data
+  // Cached on the server (checked against GitHub at most every 10 minutes).
+  const updates = useQuery({ queryKey: ['admin', 'system', 'update'], queryFn: () => api.get<UpdateStatus>('/admin/system/update'), refetchInterval: 10 * 60_000, retry: false })
   return <div className="stack">
     <PageHeader eyebrow="运营中心" title="管理总览" description="关注收入、资源供给与服务健康，数据每 30 秒更新。" actions={<Button variant="secondary" disabled={query.isFetching} onClick={() => { void query.refetch() }}>刷新数据</Button>} />
+    {updates.data?.last_failure && <Notice danger>上次更新到 {updates.data.last_failure.version} 未能成功，已自动回滚。<Link to="/admin/system">查看详情 →</Link></Notice>}
+    {updates.data?.update_available && updates.data.latest && <Notice success>有新版本 {updates.data.latest.version} 可以更新。<Link to="/admin/system">前往系统更新 →</Link></Notice>}
     <QueryState query={query}>{data && <>
       <div className="metric-grid">
         <StatCard label="近 30 天收入" value={money(data.revenue_cents_30d)} detail="已收款订单 · 人民币" icon={<Wallet size={18} />} />

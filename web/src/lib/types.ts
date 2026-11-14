@@ -1,5 +1,9 @@
 export interface User { id: number; email: string; role: 'user' | 'admin'; status: 'active' | 'disabled'; created_at: string }
-export interface PublicConfig { site_name: string; base_url: string; registration_open: boolean; payment_providers: { id: string; name: string }[]; dev: boolean }
+export interface PublicConfig { site_name: string; base_url: string; registration_open: boolean; payment_providers: { id: string; name: string }[]; dev: boolean; version?: string }
+export interface ReleaseInfo { version: string; name: string; notes: string; url: string; published_at: string }
+export type UpdateStage = 'downloading' | 'verifying' | 'installing' | 'restarting' | 'failed'
+export interface UpdateJob { kind: 'update' | 'rollback'; version: string; stage: UpdateStage; done: number; total: number; error?: string; started_at: string }
+export interface UpdateStatus { current: string; commit: string; build_time: string; supervisor: string; drain_seconds: number; can_update: boolean; reason?: string; latest: ReleaseInfo | null; changelog: ReleaseInfo[]; update_available: boolean; checked_at: string | null; check_error?: string; job: UpdateJob | null; pending: boolean; rollback: { version: string; source: 'download' | 'image' } | null; last_failure: { version: string; error: string; at: string } | null }
 export type ProductKind = 'concurrency' | 'hosted_seat' | 'rental_account'
 export interface Product { id: number; kind: ProductKind; name: string; description: string; unit_quantity: number; duration_days: number; price_cents: number; currency: string; min_qty: number; max_qty: number; enabled: boolean; sort_order: number; badge: string; stock: number | null }
 export interface Subscription { id: number; kind: ProductKind; quantity: number; status: string; starts_at: string; expires_at: string; source_order_no?: string | null; renewable: boolean; renew_product_ids: number[] }

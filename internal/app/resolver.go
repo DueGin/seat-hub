@@ -7,9 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/gateway"
-	"github.com/DueGin/vm2api-portal/internal/secret"
-	"github.com/DueGin/vm2api-portal/internal/store"
+	"github.com/DueGin/seat-hub/internal/gateway"
+	"github.com/DueGin/seat-hub/internal/secret"
+	"github.com/DueGin/seat-hub/internal/store"
 )
 
 // resolver maps a presented portal key to a gateway.Principal.

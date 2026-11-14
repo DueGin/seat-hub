@@ -6,22 +6,25 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/api"
-	"github.com/DueGin/vm2api-portal/internal/auth"
-	"github.com/DueGin/vm2api-portal/internal/catalog"
-	"github.com/DueGin/vm2api-portal/internal/config"
-	"github.com/DueGin/vm2api-portal/internal/gateway"
-	"github.com/DueGin/vm2api-portal/internal/order"
-	"github.com/DueGin/vm2api-portal/internal/payment"
-	"github.com/DueGin/vm2api-portal/internal/secret"
-	"github.com/DueGin/vm2api-portal/internal/selfcheck"
-	"github.com/DueGin/vm2api-portal/internal/store"
-	"github.com/DueGin/vm2api-portal/internal/vm2api"
-	"github.com/DueGin/vm2api-portal/internal/webdist"
+	"github.com/DueGin/seat-hub/internal/api"
+	"github.com/DueGin/seat-hub/internal/auth"
+	"github.com/DueGin/seat-hub/internal/buildinfo"
+	"github.com/DueGin/seat-hub/internal/catalog"
+	"github.com/DueGin/seat-hub/internal/config"
+	"github.com/DueGin/seat-hub/internal/gateway"
+	"github.com/DueGin/seat-hub/internal/order"
+	"github.com/DueGin/seat-hub/internal/payment"
+	"github.com/DueGin/seat-hub/internal/secret"
+	"github.com/DueGin/seat-hub/internal/selfcheck"
+	"github.com/DueGin/seat-hub/internal/store"
+	"github.com/DueGin/seat-hub/internal/update"
+	"github.com/DueGin/seat-hub/internal/vm2api"
+	"github.com/DueGin/seat-hub/internal/webdist"
 )
 
 type App struct {
@@ -35,7 +38,15 @@ type App struct {
 	resolver *resolver
 	gw       *gateway.Gateway
 	authSvc  *auth.Service
+
+	// Updates is the in-site updater; restart is closed when it asks the
+	// process to drain and exit so the supervisor starts the new version.
+	Updates *update.Manager
+	restart chan struct{}
 }
+
+// RestartRequested is closed once an in-site update or rollback is installed.
+func (a *App) RestartRequested() <-chan struct{} { return a.restart }
 
 func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	box, err := secret.New(cfg.SecretKey)
@@ -90,6 +101,17 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		}, nil
 	}
 
+	restart := make(chan struct{})
+	var restartOnce sync.Once
+	updates := update.New(update.Config{
+		Repo: cfg.UpdateRepo, APIBase: cfg.UpdateAPI, Token: cfg.UpdateToken,
+		Dir: update.Dir(), Current: buildinfo.Current().Version,
+		GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, Supervisor: update.DetectSupervisor(),
+		HTTP:    updateHTTPClient(),
+		Restart: func() { restartOnce.Do(func() { close(restart) }) },
+		Log:     logger,
+	})
+
 	deps := api.Deps{
 		Users:    usersAdv,
 		Settings: settingsAdv,
@@ -102,6 +124,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		Usage:    prov,
 		Keys:     &keyAdapter{inner: prov.keys},
 		Admin:    prov,
+		System:   &systemAdapter{m: updates, drain: cfg.UpdateDrainSeconds},
 		Site:     siteFunc(settings, cfg.PublicBaseURL),
 		Dev:      cfg.Dev,
 	}
@@ -140,7 +163,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		mux.ServeHTTP(w, r)
 	})
 
-	app := &App{Cfg: cfg, Log: logger, DB: db, Box: box, VM: vmClient, resolver: res, gw: gw, authSvc: authSvc}
+	app := &App{Cfg: cfg, Log: logger, DB: db, Box: box, VM: vmClient, resolver: res, gw: gw, authSvc: authSvc, Updates: updates, restart: restart}
 	app.Server = &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           recoverer(logger, root),
@@ -259,4 +282,13 @@ func recoverer(logger *slog.Logger, next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(w, r)
 	})
+}
+
+// updateHTTPClient talks to GitHub for release checks and downloads. It honours
+// HTTPS_PROXY, and bounds the wait for response headers so a stuck connection
+// cannot hang the admin page; the body (a download) is bounded by the job.
+func updateHTTPClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	return &http.Client{Transport: transport}
 }

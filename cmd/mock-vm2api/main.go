@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/vm2api"
+	"github.com/DueGin/seat-hub/internal/vm2api"
 )
 
 func main() {

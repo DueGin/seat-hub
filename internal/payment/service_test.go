@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/store/migrations"
+	"github.com/DueGin/seat-hub/internal/store/migrations"
 	_ "modernc.org/sqlite"
 )
 

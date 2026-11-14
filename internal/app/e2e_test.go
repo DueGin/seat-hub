@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/config"
-	"github.com/DueGin/vm2api-portal/internal/store"
-	"github.com/DueGin/vm2api-portal/internal/vm2api"
+	"github.com/DueGin/seat-hub/internal/config"
+	"github.com/DueGin/seat-hub/internal/store"
+	"github.com/DueGin/seat-hub/internal/vm2api"
 )
 
 type harness struct {

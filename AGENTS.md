@@ -1,4 +1,4 @@
-# vm2api-portal 工作区约定（所有 agent 必读）
+# seat-hub 工作区约定（所有 agent 必读）
 
 多 agent 并行开发**同一个工作树**。遵守下面规则，否则会互相打断。
 
@@ -28,7 +28,7 @@
 | `internal/catalog/`, `internal/order/`, `internal/payment/` | Worker B（codex） |
 | `internal/provision/`（除 `vm2api_contract_test.go`）, `internal/usage/` | Worker C（kimi） |
 | `web/` | Worker D（kimi） |
-| `internal/api/`, `internal/gateway/`, `internal/app/`, `internal/config/`, `internal/secret/`, `internal/auth/`, `cmd/portal/`, `Dockerfile`, `deploy/` | 协调者（Claude） |
+| `internal/api/`, `internal/gateway/`, `internal/app/`, `internal/config/`, `internal/secret/`, `internal/auth/`, `cmd/seat-hub/`, `Dockerfile`, `deploy/` | 协调者（Claude） |
 | `internal/store/`（除 migrations） | 协调者（Claude） |
 
 ## 构建与验证
@@ -43,4 +43,4 @@ cd web && pnpm install && pnpm build   # 前端产物
 
 - `docs/DESIGN.md`：架构、状态机、计费口径、托管上号流程、网关行为。
 - `docs/PORTAL_API.md`：前后端 HTTP 契约（唯一事实来源）。
-- vm2api（只读源码）：`/Users/duegin/project/2api/vm2api`，重点 `docs/PANEL_API.md`、`src/lib/admin/panel-routes.mjs`、`src/lib/admin/api-keys.mjs`、`src/lib/admin/resource-owner.mjs`。
+- vm2api（只读源码，另一个仓库）：重点 `docs/PANEL_API.md`、`src/lib/admin/panel-routes.mjs`、`src/lib/admin/api-keys.mjs`、`src/lib/admin/resource-owner.mjs`。

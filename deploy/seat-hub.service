@@ -1,0 +1,20 @@
+[Unit]
+Description=seat-hub (account hosting / rental storefront)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/seat-hub
+EnvironmentFile=/opt/seat-hub/.env
+# Enables in-site update: after installing a new version the process exits
+# with status 75 and systemd starts it again.
+Environment=SEAT_HUB_SUPERVISOR=systemd
+ExecStart=/opt/seat-hub/seat-hub
+Restart=always
+RestartSec=1
+LimitNOFILE=65535
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

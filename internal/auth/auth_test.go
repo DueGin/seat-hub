@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/secret"
-	"github.com/DueGin/vm2api-portal/internal/store"
+	"github.com/DueGin/seat-hub/internal/secret"
+	"github.com/DueGin/seat-hub/internal/store"
 )
 
 func TestHashAndVerifyPassword(t *testing.T) {
@@ -133,7 +133,7 @@ func TestDummyHashIsARealArgon2Hash(t *testing.T) {
 	if dummyPasswordHash == "" {
 		t.Fatal("dummy hash missing: unknown emails skip the argon2 burn")
 	}
-	if !VerifyPassword(dummyPasswordHash, "vm2api-portal-nonexistent-account") {
+	if !VerifyPassword(dummyPasswordHash, "seat-hub-nonexistent-account") {
 		t.Fatal("dummy hash is not a valid argon2id verification target")
 	}
 }

@@ -19,7 +19,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/vm2api"
+	"github.com/DueGin/seat-hub/internal/vm2api"
 )
 
 // Code identifies one rule. Values are stable: they are stored in slot_checks

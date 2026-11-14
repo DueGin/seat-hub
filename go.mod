@@ -1,4 +1,4 @@
-module github.com/DueGin/vm2api-portal
+module github.com/DueGin/seat-hub
 
 go 1.26.0
 

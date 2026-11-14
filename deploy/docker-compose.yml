@@ -1,0 +1,27 @@
+# seat-hub with docker compose.
+#
+#   cp .env.example .env   # fill in the values, see docs/DEPLOY.md
+#   docker compose up -d
+#
+# In-site update (admin console → 系统更新) downloads new versions into the
+# data volume and restarts the container, so `restart` must not be "no".
+# `docker compose pull && docker compose up -d` still works and always wins:
+# a newer image replaces any older in-site download.
+services:
+  seat-hub:
+    image: ghcr.io/duegin/seat-hub:latest
+    container_name: seat-hub
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8790:8790"   # put nginx / Caddy in front; see docs/DEPLOY.md
+    volumes:
+      - seat-hub-data:/data
+    # vm2api on the same host, listening on the host's 127.0.0.1:8787:
+    # set VM2API_BASE_URL=http://host.docker.internal:8787 in .env.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    stop_grace_period: 40s
+
+volumes:
+  seat-hub-data:

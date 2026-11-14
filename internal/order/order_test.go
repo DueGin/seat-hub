@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DueGin/vm2api-portal/internal/catalog"
-	"github.com/DueGin/vm2api-portal/internal/order"
-	"github.com/DueGin/vm2api-portal/internal/payment"
-	"github.com/DueGin/vm2api-portal/internal/store/migrations"
+	"github.com/DueGin/seat-hub/internal/catalog"
+	"github.com/DueGin/seat-hub/internal/order"
+	"github.com/DueGin/seat-hub/internal/payment"
+	"github.com/DueGin/seat-hub/internal/store/migrations"
 	_ "modernc.org/sqlite"
 )
 

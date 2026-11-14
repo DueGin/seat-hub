@@ -8,14 +8,14 @@ import (
 	"log/slog"
 	"net/http"
 
-	"github.com/DueGin/vm2api-portal/internal/api"
-	"github.com/DueGin/vm2api-portal/internal/order"
-	"github.com/DueGin/vm2api-portal/internal/portal"
-	"github.com/DueGin/vm2api-portal/internal/provision"
-	"github.com/DueGin/vm2api-portal/internal/secret"
-	"github.com/DueGin/vm2api-portal/internal/store"
-	"github.com/DueGin/vm2api-portal/internal/usage"
-	"github.com/DueGin/vm2api-portal/internal/vm2api"
+	"github.com/DueGin/seat-hub/internal/api"
+	"github.com/DueGin/seat-hub/internal/order"
+	"github.com/DueGin/seat-hub/internal/portal"
+	"github.com/DueGin/seat-hub/internal/provision"
+	"github.com/DueGin/seat-hub/internal/secret"
+	"github.com/DueGin/seat-hub/internal/store"
+	"github.com/DueGin/seat-hub/internal/usage"
+	"github.com/DueGin/seat-hub/internal/vm2api"
 )
 
 // provisioner is the single object the HTTP layer talks to for accounts,
