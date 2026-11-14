@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/DueGin/vm2api-portal/internal/api"
@@ -257,9 +258,27 @@ func toOnboardingDTO(ob provision.Onboarding) api.OnboardingDTO {
 		out.Bootstrap = &api.BootstrapDTO{State: ob.Bootstrap.State, Message: ob.Bootstrap.Message}
 	}
 	if ob.Error != nil {
-		out.Error = &api.ErrorDTO{Code: ob.Error.Code, Message: ob.Error.Message}
+		code, message := userOnboardingError(ob.Error.Reason)
+		out.Error = &api.ErrorDTO{Code: code, Message: message}
 	}
 	return out
+}
+
+// userOnboardingError turns a failed resource's stage code into text a user
+// may see. The stored last_error is an internal error chain (upstream paths,
+// ids, status codes) and is only shown in the admin console.
+func userOnboardingError(reason string) (string, string) {
+	switch {
+	case reason == "account_duplicate":
+		return "account_duplicate", "该 Claude 账号已在其它槽位托管，不能重复上号"
+	case strings.HasPrefix(reason, "selfcheck_exhausted"):
+		return "selfcheck_exhausted", "运行环境多次自检未通过，已转人工处理，请联系客服"
+	case strings.HasPrefix(reason, "selfcheck_failed"):
+		return "selfcheck_failed", "运行环境自检未通过，请稍后点击重试"
+	case strings.HasPrefix(reason, "provisioning_failed"):
+		return "provisioning_failed", "账号运行环境准备未完成，请点击重试；多次失败请联系客服"
+	}
+	return "onboarding_failed", "授权或初始化未完成，请重新生成授权链接后再试；多次失败请联系客服"
 }
 
 func (p *provisionSpan) Onboarding(ctx context.Context, userID, id int64) (api.OnboardingDTO, error) {
@@ -313,7 +332,17 @@ func mapProvisionErr(err error) error {
 	case errors.Is(err, provision.ErrSelfcheckFailed):
 		message := "槽位自检未通过，系统正在重建运行环境，请稍后再试"
 		if err != provision.ErrSelfcheckFailed {
-			message += "（" + err.Error() + "）"
+			detail := err.Error()
+			// A bare selfcheckFailure ("<sentinel>: <messages>（<rule codes>）") is
+			// the hosted onboarding path a user sees: keep only the messages.
+			// Wrapped ones (rental admission) are admin-facing and keep the codes.
+			if rest, ok := strings.CutPrefix(detail, provision.ErrSelfcheckFailed.Error()+": "); ok {
+				detail = rest
+				if cut := strings.LastIndex(detail, "（"); cut > 0 {
+					detail = detail[:cut]
+				}
+			}
+			message += "（" + detail + "）"
 		}
 		return &api.UserError{Status: 409, Code: "selfcheck_failed", Message: message}
 	case errors.Is(err, provision.ErrNotFound), errors.Is(err, usage.ErrNotFound):
@@ -476,9 +505,17 @@ func (p *provisionSpan) Summary(ctx context.Context, userID int64, from, until t
 func (p *provisionSpan) Logs(ctx context.Context, userID int64, q api.UsageLogQuery) (api.UsageLogPageDTO, error) {
 	page, err := p.usage.Logs(ctx, userID, usage.LogQuery{
 		From: q.From, Until: q.Until, Page: q.Page, PageSize: q.PageSize,
-		Model: q.Model, KeyID: q.KeyID, Status: q.Status,
+		Model: q.Model, KeyID: q.KeyID, AccountID: q.AccountID, Status: q.Status,
 	})
 	if err != nil {
+		switch {
+		case errors.Is(err, usage.ErrNotFound):
+			return api.UsageLogPageDTO{}, api.Err(err, 404, "not_found", "账号或密钥不存在")
+		case errors.Is(err, usage.ErrInvalidRange):
+			return api.UsageLogPageDTO{}, api.Err(err, 422, "invalid_range", "时间范围不合法")
+		case errors.Is(err, usage.ErrInvalidQuery), errors.Is(err, usage.ErrInvalidPagination):
+			return api.UsageLogPageDTO{}, api.Err(err, 422, "invalid_request", "查询参数不合法")
+		}
 		return api.UsageLogPageDTO{}, err
 	}
 	out := api.UsageLogPageDTO{Total: page.Total, Page: page.Page, PageSize: page.PageSize, Items: make([]api.UsageLogRowDTO, 0, len(page.Items))}

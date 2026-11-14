@@ -492,7 +492,9 @@ type UsageLogQuery struct {
 	Until    time.Time
 	Model    string
 	KeyID    int64
-	Status   string
+	// AccountID limits the log to one of the user's hosted or rental accounts.
+	AccountID int64
+	Status    string
 }
 
 type UsageLogPageDTO struct {

@@ -53,6 +53,7 @@ type Fake struct {
 
 type fakeKey struct {
 	key                  Key
+	secret               string // only used to attribute mock protocol calls
 	name, userID, suffix string
 	active               bool
 	maxConcurrency       int
@@ -251,7 +252,7 @@ func (fake *Fake) CreateKey(ctx context.Context, in CreateKeyInput) (Key, error)
 	}
 	stamp := fake.now().UTC()
 	fake.keys[key.ID] = fakeKey{
-		key: key, name: string([]rune(name)[:min(100, len([]rune(name)))]),
+		key: key, secret: secret, name: string([]rune(name)[:min(100, len([]rune(name)))]),
 		userID: in.UserID, suffix: secret[len(secret)-4:], active: true,
 		maxConcurrency: fakeClampConcurrency(in.MaxConcurrency), createdAt: stamp, updatedAt: stamp,
 	}
@@ -529,6 +530,9 @@ func (fake *Fake) ExchangeCode(ctx context.Context, vmID, sessionID, code string
 	vm.HasCredential = true
 	vm.CredentialRejected = false
 	vm.CredStatus = "valid"
+	if vm.EmailMasked == "" {
+		vm.EmailMasked, vm.Tier = "cla***"+strings.TrimPrefix(vmID, "vm_")+"@example.com", "max"
+	}
 	if vm.ScheduleState == "unschedulable" && vm.UnschedulableCode == "no_credential" {
 		vm.ScheduleState = "on"
 	}
@@ -692,7 +696,7 @@ func (fake *Fake) UserRequestLogs(ctx context.Context, userID string, query LogQ
 
 func (fake *Fake) filteredLogsLocked(userID string, query LogQuery) []LogRow {
 	rows := make([]LogRow, 0)
-	for _, row := range fake.logsLocked(userID, query.KeyID, "", query.From, query.Until) {
+	for _, row := range fake.logsLocked(userID, query.KeyID, query.VMID, query.From, query.Until) {
 		if query.Model != "" && row.Model != query.Model {
 			continue
 		}
@@ -1352,7 +1356,7 @@ func (fake *Fake) panelUsage(request *http.Request) (int, any, error) {
 		}
 		rows := fake.filteredLogsLocked(owner, LogQuery{
 			From: from, Until: until,
-			KeyID: query.Get("api_key_id"), Model: query.Get("model"), Status: query.Get("status"),
+			KeyID: query.Get("api_key_id"), VMID: query.Get("vm_id"), Model: query.Get("model"), Status: query.Get("status"),
 		})
 		total := len(rows)
 		rows = rows[min(offset, len(rows)):]

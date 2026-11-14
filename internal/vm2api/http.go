@@ -625,6 +625,9 @@ func (client *HTTPClient) UserRequestLogs(ctx context.Context, userID string, in
 	if input.KeyID != "" {
 		query.Set("api_key_id", input.KeyID)
 	}
+	if input.VMID != "" {
+		query.Set("vm_id", input.VMID)
+	}
 	if input.Status != "" {
 		query.Set("status", input.Status)
 	}

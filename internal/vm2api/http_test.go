@@ -240,10 +240,10 @@ func panelCallTests() []panelCallTest {
 		},
 		{
 			name: "user logs", method: http.MethodGet, path: "/request-logs",
-			query:    url.Values{"user_id": {ownerID}, "since": {"2026-10-31T00:00:00Z"}, "until": {"2026-10-31T01:00:00Z"}, "limit": {"10"}, "offset": {"20"}, "api_key_id": {"key-one"}, "status": {"error"}, "model": {"claude"}},
+			query:    url.Values{"user_id": {ownerID}, "since": {"2026-10-31T00:00:00Z"}, "until": {"2026-10-31T01:00:00Z"}, "limit": {"10"}, "offset": {"20"}, "api_key_id": {"key-one"}, "vm_id": {"vm-one"}, "status": {"error"}, "model": {"claude"}},
 			response: `{"ok":true,"total":31,"limit":10,"offset":20,"items":[{"request_id":"req-one","created_at":"2026-10-31T08:00:00+08:00","model":"claude","api_key_id":"key-one","vm_id":"vm-one","stream":true,"status":429,"error_code":"rate_limit","input_tokens":10,"output_tokens":20,"cache_read_tokens":30,"cache_creation_tokens":40,"total_cost":0.25,"duration_ms":300,"first_token_ms":100}]}`,
 			invoke: func(client *HTTPClient) error {
-				value, err := client.UserRequestLogs(ctx, ownerID, LogQuery{From: from, Until: until, Page: 3, PageSize: 10, Model: "claude", KeyID: "key-one", Status: "error"})
+				value, err := client.UserRequestLogs(ctx, ownerID, LogQuery{From: from, Until: until, Page: 3, PageSize: 10, Model: "claude", KeyID: "key-one", VMID: "vm-one", Status: "error"})
 				if err != nil {
 					return err
 				}

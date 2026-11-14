@@ -260,6 +260,7 @@ type LogQuery struct {
 	PageSize    int
 	Model       string
 	KeyID       string // vm2api key id
+	VMID        string // only requests served by this slot
 	Status      string // "" | success | error
 }
 

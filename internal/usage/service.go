@@ -128,6 +128,27 @@ func (mapping mappings) account(upstreamID string, from, until time.Time) (accou
 	return match, found
 }
 
+// accountByID finds one of the user's accounts that has (or had) a slot.
+func (mapping mappings) accountByID(id int64) (string, accountMapping, bool) {
+	for upstreamID, accounts := range mapping.accounts {
+		for _, account := range accounts {
+			if account.id == id {
+				return upstreamID, account, true
+			}
+		}
+	}
+	return "", accountMapping{}, false
+}
+
+func (service *Service) ownsAccount(ctx context.Context, userID, accountID int64) (bool, error) {
+	var owned bool
+	err := service.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM resources WHERE id = ? AND user_id = ?)`, accountID, userID).Scan(&owned)
+	if err != nil {
+		return false, fmt.Errorf("check account owner: %w", err)
+	}
+	return owned, nil
+}
+
 func emptySummary(from, until time.Time) Summary {
 	return Summary{
 		From: from, Until: until,
@@ -267,7 +288,7 @@ func (service *Service) breakdown(ctx context.Context, owner string, from, until
 }
 
 func (service *Service) Logs(ctx context.Context, userID int64, query LogQuery) (LogPage, error) {
-	if query.KeyID < 0 || query.Status != "" && query.Status != "success" && query.Status != "error" {
+	if query.KeyID < 0 || query.AccountID < 0 || query.Status != "" && query.Status != "success" && query.Status != "error" {
 		return LogPage{}, ErrInvalidQuery
 	}
 	if query.Page < 0 || query.PageSize < 0 {
@@ -316,6 +337,32 @@ func (service *Service) Logs(ctx context.Context, userID int64, query LogQuery) 
 		}
 	}
 	result := LogPage{Items: []LogRow{}, Page: query.Page, PageSize: query.PageSize}
+	var upstreamVMID string
+	if query.AccountID != 0 {
+		vmID, account, found := mapping.accountByID(query.AccountID)
+		if !found {
+			// An account that never got a slot has no requests; one that is not
+			// the caller's must look exactly like one that does not exist.
+			owned, err := service.ownsAccount(ctx, userID, query.AccountID)
+			if err != nil {
+				return LogPage{}, err
+			}
+			if !owned {
+				return LogPage{}, ErrNotFound
+			}
+			return result, nil
+		}
+		if query.From.Before(account.created) {
+			query.From = account.created
+		}
+		if !account.released.IsZero() && query.Until.After(account.released) {
+			query.Until = account.released
+		}
+		if !query.Until.After(query.From) {
+			return result, nil
+		}
+		upstreamVMID = vmID
+	}
 	if owner == "" {
 		return result, nil
 	}
@@ -324,7 +371,7 @@ func (service *Service) Logs(ctx context.Context, userID int64, query LogQuery) 
 	}
 	page, err := service.client.UserRequestLogs(ctx, owner, vm2api.LogQuery{
 		From: query.From, Until: query.Until, Page: query.Page, PageSize: query.PageSize,
-		Model: query.Model, KeyID: upstreamKeyID, Status: query.Status,
+		Model: query.Model, KeyID: upstreamKeyID, VMID: upstreamVMID, Status: query.Status,
 	})
 	if err != nil {
 		return LogPage{}, fmt.Errorf("fetch request logs: %w", err)

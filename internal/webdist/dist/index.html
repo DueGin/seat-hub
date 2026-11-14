@@ -3,11 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#101512" />
-    <meta name="description" content="vm2api：你的 AI 账号、并发与用量，一个工作台。" />
-    <title>vm2api · 智能连接，有序运行</title>
-    <script type="module" crossorigin src="/assets/index-DuTAcKCa.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-CHVyvs8X.css">
+    <meta name="theme-color" content="#141210" />
+    <script>
+      // Apply the saved theme before first paint (see src/lib/theme.ts).
+      (function () {
+        var preference = 'system'
+        try { preference = localStorage.getItem('portal.theme') || 'system' } catch (error) {}
+        var light = preference === 'light' || (preference !== 'dark' && window.matchMedia('(prefers-color-scheme: light)').matches)
+        document.documentElement.dataset.theme = light ? 'light' : 'dark'
+        document.querySelector('meta[name="theme-color"]').setAttribute('content', light ? '#f6f3ee' : '#141210')
+      })()
+    </script>
+    <meta name="description" content="你的 AI 账号、并发与用量，一个工作台。" />
+    <title>AI 工作台 · 智能连接，有序运行</title>
+    <script type="module" crossorigin src="/assets/index-DplgLczr.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-mwX4SPLx.css">
   </head>
   <body>
     <div id="root"></div>

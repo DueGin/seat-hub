@@ -500,3 +500,72 @@ func TestUnlinkedUserReturnsEmptyCollections(t *testing.T) {
 		t.Fatalf("unlinked user foreign key: %v", err)
 	}
 }
+
+func TestLogsFilterByAccount(t *testing.T) {
+	fixture := setup(t)
+	ctx := context.Background()
+	fixture.exec(t, `INSERT INTO resources (id, user_id, kind, vm_id, label, status, created_at, updated_at)
+		VALUES (25, 1, 'hosted', 'internal-vm-extra', '副号', 'active', ?, ?)`, fixture.stamp(-24*time.Hour), fixture.stamp(0))
+	fixture.exec(t, `INSERT INTO resources (id, user_id, kind, label, status, created_at, updated_at)
+		VALUES (26, 1, 'hosted', '未分配', 'provisioning', ?, ?)`, fixture.stamp(-time.Hour), fixture.stamp(0))
+	fixture.client.AddVM(vm2api.VM{ID: "internal-vm-extra", OwnerUserID: fixture.owners[0]})
+	fixture.log(t, 0, vm2api.LogRow{RequestID: "main-1", CreatedAt: fixture.now.Add(-time.Minute)})
+	fixture.log(t, 0, vm2api.LogRow{RequestID: "main-2", CreatedAt: fixture.now.Add(-2 * time.Minute)})
+	fixture.log(t, 0, vm2api.LogRow{RequestID: "extra-1", VMID: "internal-vm-extra", CreatedAt: fixture.now.Add(-3 * time.Minute)})
+	fixture.log(t, 1, vm2api.LogRow{RequestID: "other-user"})
+
+	page, err := fixture.service.Logs(ctx, 1, LogQuery{AccountID: 21})
+	if err != nil || page.Total != 2 || len(page.Items) != 2 {
+		t.Fatalf("main account=%+v, err=%v", page, err)
+	}
+	for _, item := range page.Items {
+		if item.AccountID == nil || *item.AccountID != 21 {
+			t.Fatalf("main account item=%+v", item)
+		}
+	}
+	page, err = fixture.service.Logs(ctx, 1, LogQuery{AccountID: 25})
+	if err != nil || page.Total != 1 || page.Items[0].RequestID != "extra-1" || *page.Items[0].AccountLabel != "副号" {
+		t.Fatalf("extra account=%+v, err=%v", page, err)
+	}
+	assertRedacted(t, page, "internal-vm-extra", "other-user")
+	// An account that has no slot yet has no calls, not an error.
+	page, err = fixture.service.Logs(ctx, 1, LogQuery{AccountID: 26})
+	if err != nil || page.Total != 0 || page.Items == nil {
+		t.Fatalf("slotless account=%+v, err=%v", page, err)
+	}
+	// Another user's account and a missing one are indistinguishable.
+	for _, id := range []int64{22, 999} {
+		if _, err := fixture.service.Logs(ctx, 1, LogQuery{AccountID: id}); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("account %d: %v", id, err)
+		}
+	}
+	if _, err := fixture.service.Logs(ctx, 1, LogQuery{AccountID: -1}); !errors.Is(err, ErrInvalidQuery) {
+		t.Fatalf("negative account: %v", err)
+	}
+}
+
+func TestLogsAccountFilterKeepsToItsLease(t *testing.T) {
+	fixture := setup(t)
+	ctx := context.Background()
+	fixture.exec(t, `UPDATE resources SET kind = 'rental', status = 'released', released_at = ? WHERE id = 21`, fixture.stamp(-2*time.Hour))
+	fixture.exec(t, `INSERT INTO resources (id, user_id, kind, vm_id, label, status, created_at, updated_at)
+		VALUES (23, 1, 'rental', 'internal-vm-0', '再次租用', 'active', ?, ?)`, fixture.stamp(-time.Hour), fixture.stamp(0))
+	fixture.log(t, 0, vm2api.LogRow{RequestID: "old-rental", CreatedAt: fixture.now.Add(-3 * time.Hour)})
+	fixture.log(t, 0, vm2api.LogRow{RequestID: "between-rentals", CreatedAt: fixture.now.Add(-90 * time.Minute)})
+	fixture.log(t, 0, vm2api.LogRow{RequestID: "new-rental", CreatedAt: fixture.now.Add(-30 * time.Minute)})
+	from := fixture.now.Add(-24 * time.Hour)
+	for _, testcase := range []struct {
+		account int64
+		want    string
+	}{{21, "old-rental"}, {23, "new-rental"}} {
+		page, err := fixture.service.Logs(ctx, 1, LogQuery{AccountID: testcase.account, From: from})
+		if err != nil || page.Total != 1 || page.Items[0].RequestID != testcase.want {
+			t.Fatalf("account %d=%+v, err=%v", testcase.account, page, err)
+		}
+	}
+	// A range that ends before the lease began is empty without asking upstream.
+	page, err := fixture.service.Logs(ctx, 1, LogQuery{AccountID: 23, From: from, Until: fixture.now.Add(-2 * time.Hour)})
+	if err != nil || page.Total != 0 || page.Items == nil {
+		t.Fatalf("out of lease=%+v, err=%v", page, err)
+	}
+}

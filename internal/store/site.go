@@ -29,7 +29,7 @@ type Site struct {
 
 func DefaultSite() Site {
 	return Site{
-		SiteName:         "vm2api 门面",
+		SiteName:         "AI 工作台",
 		RegistrationOpen: true,
 		BaseConcurrency:  1,
 		HostedGraceHours: 24,

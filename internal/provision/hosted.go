@@ -169,6 +169,9 @@ func provisioningIncomplete(account Account) bool {
 type OnboardingError struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// Reason is the resource's status_reason (stage code). Message is the raw
+	// internal error, so callers that face users must translate Reason instead.
+	Reason string `json:"-"`
 }
 
 type Onboarding struct {
@@ -192,6 +195,9 @@ func (service *Service) Onboarding(ctx context.Context, userID, resourceID int64
 	result := Onboarding{AccountID: resourceID, Status: account.Status, CanRegenerate: account.VMID != "" && (account.Status == "awaiting_auth" || account.Status == "needs_reauth" || account.Status == "failed")}
 	if account.LastError != nil {
 		result.Error = &OnboardingError{Code: "onboarding_failed", Message: *account.LastError}
+		if account.StatusReason != nil {
+			result.Error.Reason = *account.StatusReason
+		}
 	}
 	var url, expires string
 	err = service.db.QueryRowContext(ctx, `SELECT auth_url,expires_at FROM oauth_sessions WHERE resource_id=? AND status='open' AND julianday(expires_at)>julianday(?) ORDER BY id DESC LIMIT 1`, resourceID, timestamp(service.now())).Scan(&url, &expires)
@@ -378,6 +384,7 @@ func (service *Service) watchBootstrap(ctx context.Context, resourceID int64, de
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("commit bootstrap completion: %w", err)
 		}
+		service.syncAccountIdentity(ctx, account.VMID)
 		return nil
 	default:
 		return service.failResource(ctx, resourceID, fmt.Errorf("unknown bootstrap state: %s", bootstrap.State))

@@ -83,8 +83,25 @@ func (service *Service) allocateRental(ctx context.Context, subscriptionID int64
 		if err := service.client.SetSchedulable(ctx, vmID, true); err != nil {
 			return service.quarantineRental(ctx, vmID, fmt.Errorf("enable rental scheduling: %w", err))
 		}
+		service.syncAccountIdentity(ctx, vmID)
 	}
 	return nil
+}
+
+// syncAccountIdentity copies the signed-in account's masked email and plan
+// from vm2api onto the live resource that holds the slot, so the user sees
+// which account they have instead of "waiting for authorization". It is
+// best-effort: the account works without it and the next sync fills it in.
+func (service *Service) syncAccountIdentity(ctx context.Context, vmID string) {
+	usage, err := service.client.GetAccountUsage(ctx, vmID)
+	if err != nil || usage.VM.EmailMasked == "" && usage.VM.Tier == "" {
+		return
+	}
+	_, _ = service.db.ExecContext(ctx, `UPDATE resources SET
+		email_masked=CASE WHEN ?<>'' THEN ? ELSE email_masked END,
+		tier=CASE WHEN ?<>'' THEN ? ELSE tier END, updated_at=?
+		WHERE vm_id=? AND status NOT IN ('released','releasing')`,
+		usage.VM.EmailMasked, usage.VM.EmailMasked, usage.VM.Tier, usage.VM.Tier, timestamp(service.now()), vmID)
 }
 
 // claimRental leases the accounts a subscription is missing and commits.

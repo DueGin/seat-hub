@@ -86,7 +86,11 @@ type LogQuery struct {
 	PageSize    int
 	Model       string
 	KeyID       int64
-	Status      string
+	// AccountID limits the log to one of the user's accounts (0 = all). The
+	// range is clamped to the account's lifetime, so a rental slot that was
+	// leased more than once only shows this lease.
+	AccountID int64
+	Status    string
 }
 
 type LogPage struct {

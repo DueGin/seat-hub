@@ -17,9 +17,9 @@ const sessionKey = 'vm2api.mock.session.v1'
 let sequence = 100
 const nextId = () => ++sequence
 const users: User[] = [
-  { id: 1, email: 'demo@vm2api.local', role: 'admin', status: 'active', created_at: iso(-90 * DAY) },
-  { id: 2, email: 'user@vm2api.local', role: 'user', status: 'active', created_at: iso(-40 * DAY) },
-  { id: 3, email: 'disabled@vm2api.local', role: 'user', status: 'disabled', created_at: iso(-35 * DAY) },
+  { id: 1, email: 'demo@example.com', role: 'admin', status: 'active', created_at: iso(-90 * DAY) },
+  { id: 2, email: 'user@example.com', role: 'user', status: 'active', created_at: iso(-40 * DAY) },
+  { id: 3, email: 'disabled@example.com', role: 'user', status: 'disabled', created_at: iso(-35 * DAY) },
 ]
 const passwords = new Map<number, string>()
 const loginAttempts = new Map<string, { count: number; until: number }>()
@@ -39,7 +39,7 @@ function setSession(id: number | null) {
 }
 
 let settings: NormalizedSettings = {
-  site_name: 'vm2api 演示环境', registration_open: true, base_concurrency: 1,
+  site_name: 'AI 工作台 演示环境', registration_open: true, base_concurrency: 1,
   concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0,
   hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0,
   hosted_vm_template: { runtime_type: 'docker' },
@@ -330,6 +330,7 @@ function filteredLogs(userId: number, query: URLSearchParams, days = 30): UsageL
   return myValues(logs, userId).filter(log => log.created_at >= range.from && log.created_at <= range.until
     && (!query.get('model') || log.model === query.get('model'))
     && (!query.get('key_id') || log.key_id === Number(query.get('key_id')))
+    && (!query.get('account_id') || log.account_id === Number(query.get('account_id')))
     && (!status || (status === 'success' ? log.status_code < 400 : log.status_code >= 400))).map(logView)
 }
 function chartData(items: UsageLog[], range: { from: string; until: string }): { daily: DailyUsage[]; by_model: ModelUsage[] } {
@@ -372,7 +373,7 @@ function usageSummary(userId: number, query: URLSearchParams): UsageSummary {
     account.requests++; account.tokens += tokenCount(log); account.cost_usd = money(account.cost_usd + log.cost_usd); byAccount.set(log.account_id, account)
   }
   const successful = items.filter(log => log.status_code < 400)
-  const timings = successful.map(log => log.first_token_ms).sort((a, b) => a - b)
+  const timings = successful.map(log => log.first_token_ms).filter((value): value is number => value !== null).sort((a, b) => a - b)
   return {
     ...range, totals, ...chartData(items, range), by_key: [...byKey.values()], by_account: [...byAccount.values()],
     stats: { success_rate: items.length ? successful.length / items.length : 0, avg_ttft_ms: timings.length ? Math.round(timings.reduce((sum, value) => sum + value, 0) / timings.length) : 0, p95_ttft_ms: timings[Math.max(0, Math.ceil(timings.length * 0.95) - 1)] ?? 0, error_count: items.length - successful.length },

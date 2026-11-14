@@ -432,7 +432,7 @@ func TestRentalAllocationRequiresSelfcheckPass(t *testing.T) {
 	ctx := context.Background()
 	for index, state := range []string{"pending", "fail", "pass"} {
 		vmID := fmt.Sprintf("rental-%d", index)
-		fake.AddVM(vm2api.VM{ID: vmID, Platform: "anthropic", HasCredential: true})
+		fake.AddVM(vm2api.VM{ID: vmID, Platform: "anthropic", HasCredential: true, EmailMasked: fmt.Sprintf("ren***%d@example.com", index), Tier: "max"})
 		if _, err := service.db.Exec(`INSERT INTO rental_pool(vm_id,status,selfcheck_state,created_at,updated_at) VALUES (?,'available',?,?,?)`, vmID, state, timestamp(service.now()), timestamp(service.now())); err != nil {
 			t.Fatal(err)
 		}
@@ -447,6 +447,13 @@ func TestRentalAllocationRequiresSelfcheckPass(t *testing.T) {
 	}
 	if vmID != "rental-2" {
 		t.Fatalf("allocated=%s", vmID)
+	}
+	var email, tier string
+	if err := service.db.QueryRow(`SELECT email_masked,tier FROM resources WHERE subscription_id=?`, subscriptionID).Scan(&email, &tier); err != nil {
+		t.Fatal(err)
+	}
+	if email != "ren***2@example.com" || tier != "max" {
+		t.Fatalf("rental identity=%q/%q", email, tier)
 	}
 	subscriptionID = addSubscription(t, service, userID, "rental_account", 1, service.now().Add(time.Hour))
 	if err := service.AllocateRental(ctx, subscriptionID); !errors.Is(err, ErrOutOfStock) {

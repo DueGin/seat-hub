@@ -187,7 +187,7 @@ utilization 为 0–100；窗口缺失为 `null`。
  "stats":{"success_rate":0.99,"avg_ttft_ms":820,"p95_ttft_ms":2100,"error_count":3}}
 ```
 
-### `GET /api/usage/logs?page&page_size&from&until&model&key_id&status=success|error`
+### `GET /api/usage/logs?page&page_size&from&until&model&key_id&account_id&status=success|error`
 ```json
 {"items":[{"request_id":"…","created_at":"…","model":"…","key_id":1,"key_name":"默认",
   "account_id":7,"account_label":"主号","stream":true,"status_code":200,"error_label":null,
@@ -195,6 +195,8 @@ utilization 为 0–100；窗口缺失为 `null`。
   "cost_usd":0.01,"duration_ms":1234,"first_token_ms":456}],
  "total":100,"page":1,"page_size":20}
 ```
+
+`account_id`（可选，正整数）只看该用户某个托管或租赁账号上的调用，用于「使用记录」页；时间范围自动收窄到该账号的持有期（租赁号被多次租用时只返回本次租期）。账号不属于当前用户返回 404 `not_found`；账号尚未分配槽位时返回空列表；非正整数返回 422 `invalid_request`。
 
 ## 管理后台（role=admin）
 
@@ -239,7 +241,7 @@ utilization 为 0–100；窗口缺失为 `null`。
 
 `Settings`（全新安装也返回完整的 `payment` 两段文档，前端可直接读 `payment.epay.*` / `payment.manual.*`）:
 ```json
-{"site_name":"vm2api 门面","registration_open":true,
+{"site_name":"AI 工作台","registration_open":true,
  "base_concurrency":1,"concurrency_per_hosted_seat":0,"concurrency_per_rental_account":0,
  "hosted_grace_hours":24,"rental_grace_hours":0,"gateway_queue_timeout_ms":0,
  "hosted_vm_template":{"runtime_type":"docker"},

@@ -54,13 +54,11 @@ export function ListPagination({ data, onChange }: { data?: { page: number; page
 export function ConfirmAction({ title, description, children, pending, error, onClose, onConfirm, label = '确认操作', danger = false, phrase, confirmation, onConfirmation }: {
   title: string; description: ReactNode; children?: ReactNode; pending: boolean; error: unknown; onClose: () => void; onConfirm: () => void; label?: string; danger?: boolean; phrase?: string; confirmation?: string; onConfirmation?: (value: string) => void
 }) {
-  return <Modal open title={title} onClose={() => { if (!pending) onClose() }}>
+  return <Modal open title={title} onClose={() => { if (!pending) onClose() }} footer={<><MutationError error={error} /><Button variant="secondary" disabled={pending} onClick={onClose}>返回</Button><Button variant={danger ? 'danger' : 'primary'} disabled={pending || Boolean(phrase && confirmation !== phrase)} onClick={onConfirm}>{pending ? '正在提交…' : label}</Button></>}>
     <div className="stack">
       <Notice>{description}</Notice>
       {children}
       {phrase && <Field label={`请输入「${phrase}」确认`}><FieldInput autoComplete="off" autoFocus value={confirmation ?? ''} onChange={(event) => onConfirmation?.(event.target.value)} /></Field>}
-      <MutationError error={error} />
-      <div className="toolbar"><Button variant="secondary" disabled={pending} onClick={onClose}>返回</Button><Button variant={danger ? 'danger' : 'primary'} disabled={pending || Boolean(phrase && confirmation !== phrase)} onClick={onConfirm}>{pending ? '正在提交…' : label}</Button></div>
     </div>
   </Modal>
 }

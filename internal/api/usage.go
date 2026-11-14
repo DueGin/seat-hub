@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 )
 
@@ -71,14 +72,24 @@ func (s *Server) handleUsageLogs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusUnprocessableEntity, "invalid_status", "status 只能是 success 或 error")
 		return
 	}
+	var accountID int64
+	if v := r.URL.Query().Get("account_id"); v != "" {
+		id, err := strconv.ParseInt(v, 10, 64)
+		if err != nil || id <= 0 {
+			writeErr(w, http.StatusUnprocessableEntity, "invalid_request", "account_id 必须是正整数")
+			return
+		}
+		accountID = id
+	}
 	out, err := s.Deps.Usage.Logs(r.Context(), u.ID, UsageLogQuery{
-		Page:     page,
-		PageSize: size,
-		From:     from,
-		Until:    until,
-		Model:    r.URL.Query().Get("model"),
-		KeyID:    parseInt64(r.URL.Query().Get("key_id")),
-		Status:   status,
+		Page:      page,
+		PageSize:  size,
+		From:      from,
+		Until:     until,
+		Model:     r.URL.Query().Get("model"),
+		KeyID:     parseInt64(r.URL.Query().Get("key_id")),
+		AccountID: accountID,
+		Status:    status,
 	})
 	if err != nil {
 		s.fail(w, r, err)
