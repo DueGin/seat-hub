@@ -739,3 +739,57 @@ func TestAdminPatchRentalSubscriptionReallocates(t *testing.T) {
 		t.Fatalf("active rental accounts=%d after extension", count)
 	}
 }
+
+// A platform VM someone put into a vm2api pool by hand cannot go into a
+// tenant's pool once rented, so it is flagged in the candidate list, refused
+// at admission, flagged in the pool list, and its scope warning reaches the
+// dashboard.
+func TestAdminRentalForeignPool(t *testing.T) {
+	service, client := adminFixture(t)
+	ctx := context.Background()
+	client.AddVM(vm2api.VM{ID: "vm-07"})
+	client.AddVM(vm2api.VM{ID: "vm-08"})
+	if _, err := client.CreatePool(ctx, "GUO", []string{"vm-08"}); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := service.RentalCandidates(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flags := map[string]string{}
+	for _, item := range candidates {
+		flags[item.VMID] = item.ForeignPool
+	}
+	if flags["vm-07"] != "" || flags["vm-08"] != "GUO" {
+		t.Fatalf("candidate flags = %+v", flags)
+	}
+	adminWantError(t, service.RentalAdd(ctx, []string{"vm-07", "vm-08"}, "外部池"), 409, "vm_in_foreign_pool")
+	if count := adminCount(t, service, `SELECT COUNT(*) FROM rental_pool`); count != 0 {
+		t.Fatal("a refused batch was partly admitted")
+	}
+	// A VM already in the rental pool that lands in a foreign pool later is
+	// shown with the pool's name.
+	stamp := store.FmtTime(service.now())
+	adminExec(t, service, `INSERT INTO rental_pool(vm_id,status,selfcheck_state,created_at,updated_at) VALUES ('vm-08','available','pass',?,?)`, stamp, stamp)
+	rows, err := service.RentalPool(ctx)
+	if err != nil || len(rows) != 1 || rows[0].ForeignPool != "GUO" {
+		t.Fatalf("pool rows = %+v err = %v", rows, err)
+	}
+
+	if err := service.RecheckScopes(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if count := adminCount(t, service, `SELECT COUNT(*) FROM jobs WHERE type='scope_reconcile' AND status='pending'`); count != 1 {
+		t.Fatalf("recheck queued %d reconcile jobs", count)
+	}
+	adminExec(t, service, `INSERT INTO settings(key,value,updated_at) VALUES ('scope_warnings',?,?)`,
+		`{"checked_at":"2026-10-31T12:00:00Z","items":[{"user_id":2,"vm_id":"vm-08","pool_id":"pool_00000001","pool_name":"GUO","message":"账号 vm-08 在 vm2api 账号池「GUO」里"}]}`, stamp)
+	dashboard, err := service.Dashboard(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	warnings := dashboard.ScopeWarnings
+	if warnings.CheckedAt == "" || len(warnings.Items) != 1 || warnings.Items[0].UserEmail != "tenant@example.com" || warnings.Items[0].PoolName != "GUO" {
+		t.Fatalf("dashboard warnings = %+v", warnings)
+	}
+}

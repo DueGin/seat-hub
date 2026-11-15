@@ -621,6 +621,8 @@ type AdminCoreService interface {
 	RetryJob(ctx context.Context, id int64) error
 	GrantSubscription(ctx context.Context, adminID, userID int64, kind string, quantity, durationDays int, note string) error
 	PatchSubscription(ctx context.Context, id int64, expiresAt *string, status string) error
+	// RecheckScopes queues an account-scope reconcile now.
+	RecheckScopes(ctx context.Context) error
 }
 
 type AdminDashboardDTO struct {
@@ -631,6 +633,23 @@ type AdminDashboardDTO struct {
 	Accounts      AccountsCounts `json:"accounts"`
 	RentalPool    RentalCounts   `json:"rental_pool"`
 	VM2API        VM2APIHealth   `json:"vm2api"`
+	// ScopeWarnings are account-scope problems only an admin can fix (e.g. a
+	// VM held by a vm2api pool the portal does not own). docs/KEY_SCOPE.md.
+	ScopeWarnings ScopeWarningsDTO `json:"scope_warnings"`
+}
+
+type ScopeWarningsDTO struct {
+	CheckedAt string            `json:"checked_at"` // last reconcile; "" before the first
+	Items     []ScopeWarningDTO `json:"items"`
+}
+
+type ScopeWarningDTO struct {
+	UserID    int64  `json:"user_id"`
+	UserEmail string `json:"user_email"`
+	VMID      string `json:"vm_id"`
+	PoolID    string `json:"pool_id"`
+	PoolName  string `json:"pool_name"`
+	Message   string `json:"message"`
 }
 
 type AccountsCounts struct {
@@ -662,6 +681,9 @@ type RentalPoolRowDTO struct {
 	Note           string        `json:"note"`
 	VM             *RentalVMDTO  `json:"vm"`
 	Selfcheck      *SelfcheckDTO `json:"selfcheck"`
+	// ForeignPool names the vm2api pool (not the portal's) holding this VM;
+	// such a VM is not leased until it is taken out of that pool.
+	ForeignPool string `json:"foreign_pool,omitempty"`
 }
 
 type RentalVMDTO struct {
@@ -681,6 +703,7 @@ type RentalCandidateDTO struct {
 	CredStatus    string `json:"cred_status"`
 	ScheduleState string `json:"schedule_state"`
 	Tier          string `json:"tier"`
+	ForeignPool   string `json:"foreign_pool,omitempty"` // set → cannot be added
 }
 
 type JobDTO struct {

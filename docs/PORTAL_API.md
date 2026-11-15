@@ -227,7 +227,8 @@ utilization 为 0–100；窗口缺失为 `null`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/admin/dashboard` | `{users, paying_users, revenue_cents_30d, orders_pending, accounts:{hosted_active, rental_active, failed}, rental_pool:{total, available, leased, maintenance}, vm2api:{ok, version, latency_ms, error}}` |
+| GET | `/api/admin/dashboard` | `{users, paying_users, revenue_cents_30d, orders_pending, accounts:{hosted_active, rental_active, failed}, rental_pool:{total, available, leased, maintenance}, vm2api:{ok, version, latency_ms, error}, scope_warnings:{checked_at, items:[{user_id, user_email, vm_id, pool_id, pool_name, message}]}}`。`scope_warnings` 是需要管理员处理的账号范围问题（号被 vm2api 里的外部账号池占用，见 [KEY_SCOPE.md](KEY_SCOPE.md)），每次对账重算 |
+| POST | `/api/admin/scope/recheck` | `{}` 立即排一次账号范围对账（`scope_reconcile`），处理完外部账号池后用 |
 | GET/POST | `/api/admin/products` | 列表（含未上架）/ 新建 `Product` 字段（无 `id`、`stock`） |
 | PATCH/DELETE | `/api/admin/products/{id}` | 有订单引用时 DELETE 改为下架 |
 | GET | `/api/admin/orders?status&user_id&page` | `Order` + `user_email` |
@@ -250,9 +251,9 @@ utilization 为 0–100；窗口缺失为 `null`。
 |---|---|---|
 | POST | `/api/admin/users/{id}/grant` | `{kind, quantity, duration_days, note}` 赠送订阅（生成 provider=`grant` 的已履约订单） |
 | PATCH | `/api/admin/subscriptions/{id}` | `{expires_at?, status?:"cancelled"}` |
-| GET | `/api/admin/rental-pool` | `{items:[{vm_id, tier, status:"available|leased|maintenance", leased_to_user_id, leased_to_email, note, selfcheck:Selfcheck|null, vm:{label, email_masked, cred_status, schedule_state, tier, five_hour, seven_day}}]}` |
-| GET | `/api/admin/rental-pool/candidates` | vm2api 中未归属、Claude、未入池的 VM：`{items:[{vm_id,label,email_masked,cred_status,schedule_state,tier}]}` |
-| POST | `/api/admin/rental-pool` | `{vm_ids:[…], note?}` 入池前自检，未通过返回 409 `selfcheck_failed` |
+| GET | `/api/admin/rental-pool` | `{items:[{vm_id, tier, status:"available|leased|maintenance", leased_to_user_id, leased_to_email, note, selfcheck:Selfcheck|null, vm:{label, email_masked, cred_status, schedule_state, tier, five_hour, seven_day}, foreign_pool?}]}`。`foreign_pool` 有值表示该号在 vm2api 的外部账号池里，不会被分配 |
+| GET | `/api/admin/rental-pool/candidates` | vm2api 中未归属、Claude、未入池的 VM：`{items:[{vm_id,label,email_masked,cred_status,schedule_state,tier,foreign_pool?}]}`，`foreign_pool` 有值的不能入池 |
+| POST | `/api/admin/rental-pool` | `{vm_ids:[…], note?}` 入池前自检，未通过返回 409 `selfcheck_failed`；号在外部账号池里返回 409 `vm_in_foreign_pool` |
 | PATCH | `/api/admin/rental-pool/{vm_id}` | `{status:"available|maintenance", note?}`（`leased` 不可手改） |
 | DELETE | `/api/admin/rental-pool/{vm_id}` | 仅非 leased |
 | POST | `/api/admin/rental-pool/{vm_id}/selfcheck` | `{}` 重跑入池自检 → `Selfcheck`；`vm_id` 不能为空或全空白 |

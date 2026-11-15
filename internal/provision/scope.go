@@ -260,16 +260,41 @@ func (service *Service) ReconcileScopes(ctx context.Context) error {
 		return err
 	}
 	var failures []error
+	// Problems only an admin can fix become warnings, not job failures: this
+	// job runs again in 10 minutes anyway, and a failed job would retry the
+	// same 409 eight times. The list is rebuilt on every run, so a fixed
+	// problem disappears from the dashboard by itself.
+	warnings := ScopeWarnings{CheckedAt: timestamp(service.now()), Items: []ScopeWarning{}}
+	seen := make(map[string]bool)
+	classify := func(userID int64, err error) {
+		warning, manual := warningFor(userID, err)
+		if !manual {
+			failures = append(failures, err)
+			return
+		}
+		key := fmt.Sprintf("%d/%s/%s", warning.UserID, warning.VMID, warning.PoolID)
+		if !seen[key] {
+			seen[key] = true
+			warnings.Items = append(warnings.Items, warning)
+		}
+	}
 	// Finish any migration that failed at start first. A user still on a
 	// legacy vm2api user keeps their VMs there: moving those VMs to the
 	// service user below would cut off their not-yet-migrated keys.
-	if err := service.MigrateLegacyScopes(ctx); err != nil {
+	failed, err := service.migrateUsers(ctx)
+	if err != nil {
 		failures = append(failures, err)
+	}
+	for _, item := range failed {
+		classify(item.userID, item.err)
 	}
 	for _, userID := range users {
 		if err := service.SyncUserScope(ctx, userID); err != nil {
-			failures = append(failures, fmt.Errorf("sync user %d scope: %w", userID, err))
+			classify(userID, fmt.Errorf("sync user %d scope: %w", userID, err))
 		}
+	}
+	if err := service.saveScopeWarnings(ctx, warnings); err != nil {
+		failures = append(failures, err)
 	}
 	// Wait for all in-flight portal key writes before identifying orphans.
 	service.scopeWrites.Lock()
@@ -334,20 +359,54 @@ func (service *Service) ReconcileScopes(ctx context.Context) error {
 // sk-pt- secret is unchanged), move the user's VMs to the service user,
 // disable the old per-user vm2api user and clear users.vm2api_user_id.
 func (service *Service) MigrateLegacyScopes(ctx context.Context) error {
-	users, err := service.scopeUsers(ctx, `SELECT id FROM users WHERE COALESCE(vm2api_user_id,'')<>'' OR EXISTS (SELECT 1 FROM api_keys WHERE user_id=users.id AND (upstream_owner='' OR previous_vm2api_key_ids<>'[]')) ORDER BY id`)
+	failed, err := service.migrateUsers(ctx)
 	if err != nil {
 		return err
 	}
 	var failures []error
+	for _, item := range failed {
+		failures = append(failures, item.err)
+	}
+	return errors.Join(failures...)
+}
+
+// migrateJob is scope_migrate: a migration blocked by something only an admin
+// can fix (a foreign pool) becomes a scope warning instead of a failed job;
+// the reconcile retries it every 10 minutes.
+func (service *Service) migrateJob(ctx context.Context) error {
+	failed, err := service.migrateUsers(ctx)
+	if err != nil {
+		return err
+	}
+	var failures []error
+	for _, item := range failed {
+		if err := service.absorbManual(ctx, item.userID, item.err); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+type userFailure struct {
+	userID int64
+	err    error
+}
+
+func (service *Service) migrateUsers(ctx context.Context) ([]userFailure, error) {
+	users, err := service.scopeUsers(ctx, `SELECT id FROM users WHERE COALESCE(vm2api_user_id,'')<>'' OR EXISTS (SELECT 1 FROM api_keys WHERE user_id=users.id AND (upstream_owner='' OR previous_vm2api_key_ids<>'[]')) ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	var failed []userFailure
 	for _, userID := range users {
 		unlock := service.LockScope(userID)
 		err := service.migrateUserScope(ctx, userID)
 		unlock()
 		if err != nil {
-			failures = append(failures, fmt.Errorf("migrate user %d scope: %w", userID, err))
+			failed = append(failed, userFailure{userID: userID, err: fmt.Errorf("migrate user %d scope: %w", userID, err)})
 		}
 	}
-	return errors.Join(failures...)
+	return failed, nil
 }
 
 // Pool creation has its own lock because KeyScopeFor is also called while a
@@ -380,6 +439,7 @@ func (service *Service) createUserPool(ctx context.Context, userID int64) (strin
 	}
 	members := scopeVMIDs(accounts)
 	pool, err := service.client.CreatePool(ctx, name, members)
+	adopted := ""
 	if vm2api.IsCode(err, "vm_pool_name_taken") {
 		pools, listErr := service.client.ListPools(ctx)
 		if listErr != nil {
@@ -387,13 +447,14 @@ func (service *Service) createUserPool(ctx context.Context, userID int64) (strin
 		}
 		for _, candidate := range pools {
 			if candidate.Name == name {
+				adopted = candidate.ID
 				pool, err = service.client.SetPoolMembers(ctx, candidate.ID, members)
 				break
 			}
 		}
 	}
 	if err != nil {
-		return "", fmt.Errorf("create user pool: %w", err)
+		return "", fmt.Errorf("create user pool: %w", service.explainPoolConflict(ctx, err, members, adopted))
 	}
 	if pool.ID == "" {
 		return "", errors.New("create user pool returned an empty id")
@@ -459,24 +520,7 @@ func (service *Service) setUserPoolMembers(ctx context.Context, userID int64) er
 		_, err = service.ensureUserPool(ctx, userID)
 	}
 	if err != nil {
-		if vm2api.IsCode(err, "vm_in_other_pool") {
-			// Some upstream responses omit vm_id from their error envelope.
-			// Name the actual conflicting VM when the pool inventory is available.
-			if pools, listErr := service.client.ListPools(ctx); listErr == nil {
-				for _, pool := range pools {
-					if pool.ID == poolID {
-						continue
-					}
-					for _, vmID := range pool.VMIDs {
-						for _, desired := range ids {
-							if vmID == desired {
-								return fmt.Errorf("vm %s belongs to foreign pool %s: %w", vmID, pool.ID, err)
-							}
-						}
-					}
-				}
-			}
-		}
+		err = service.explainPoolConflict(ctx, err, ids, poolID)
 		return fmt.Errorf("sync pool members %v: %w", ids, err)
 	}
 	return nil

@@ -50,7 +50,7 @@ func New(db *sql.DB, client vm2api.Client) *Service {
 	service.engine.Register("sync_concurrency", service.syncJob)
 	service.engine.Register("sync_scope", service.scopeSyncJob)
 	service.engine.Register("scope_reconcile", func(ctx context.Context, job Job) error { return service.ReconcileScopes(ctx) })
-	service.engine.Register("scope_migrate", func(ctx context.Context, job Job) error { return service.MigrateLegacyScopes(ctx) })
+	service.engine.Register("scope_migrate", func(ctx context.Context, job Job) error { return service.migrateJob(ctx) })
 	service.engine.Register("sweep_expiry", func(ctx context.Context, job Job) error { return service.SweepExpiry(ctx) })
 	service.engine.Register("selfcheck_sweep", func(ctx context.Context, job Job) error { return service.SweepSelfcheck(ctx) })
 	return service
@@ -130,7 +130,7 @@ func (service *Service) syncJob(ctx context.Context, job Job) error {
 	if err != nil {
 		return err
 	}
-	return service.SyncUserScope(ctx, payload.UserID)
+	return service.absorbManual(ctx, payload.UserID, service.SyncUserScope(ctx, payload.UserID))
 }
 
 func (service *Service) scopeSyncJob(ctx context.Context, job Job) error {
@@ -138,7 +138,7 @@ func (service *Service) scopeSyncJob(ctx context.Context, job Job) error {
 	if err != nil {
 		return err
 	}
-	return service.SyncUserScope(ctx, payload.UserID)
+	return service.absorbManual(ctx, payload.UserID, service.SyncUserScope(ctx, payload.UserID))
 }
 
 func (service *Service) Run(ctx context.Context) error {
