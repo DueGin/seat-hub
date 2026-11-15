@@ -100,6 +100,7 @@ func (s *Server) Handler() http.Handler {
 
 	// Admin
 	mux.HandleFunc("GET /api/admin/dashboard", s.admin(s.handleAdminDashboard))
+	mux.HandleFunc("POST /api/admin/scope/recheck", s.admin(s.handleAdminScopeRecheck))
 	mux.HandleFunc("GET /api/admin/products", s.admin(s.handleAdminListProducts))
 	mux.HandleFunc("POST /api/admin/products", s.admin(s.handleAdminCreateProduct))
 	mux.HandleFunc("PATCH /api/admin/products/{id}", s.admin(s.handleAdminPatchProduct))

@@ -170,6 +170,10 @@ func (p *provisioner) PatchSubscription(ctx context.Context, id int64, expiresAt
 	return p.admin.PatchSubscription(ctx, id, expiresAt, status)
 }
 
+func (p *provisioner) RecheckScopes(ctx context.Context) error {
+	return p.admin.RecheckScopes(ctx)
+}
+
 func (p *provisioner) AdminList(ctx context.Context, kind, status string, userID int64, page, pageSize int) ([]api.AdminAccountDTO, int64, error) {
 	return p.adminAccounts(ctx, kind, status, userID, page, pageSize)
 }

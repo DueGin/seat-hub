@@ -1,4 +1,4 @@
-import{b as de,r as d,k as q,v as oe,j as e,i as ue,P as he,g as a,N as m,C as G,R as xe,Q as W,E as X,O as je,s as pe,q as O,M as g,F as me,f as ye,o as Q,y as Z,m as h}from"./index-DWm_zOiU.js";import{u as R}from"./useMutation-ObfvKTTc.js";import{a as ee,n as y,u as T,d as ve}from"./format-CqbfF7nU.js";import{h as se,K as be,t as te,a as ge}from"./key-scope-C1LljFNh.js";import{P as ke}from"./plus-BzwX2eaO.js";function L(n){return`'${n.replace(/'/g,"'\\''")}'`}function fe(n){return{curl:`export PORTAL_API_KEY='替换为你的 API Key'
+import{b as de,r as d,k as q,v as oe,j as e,i as ue,P as he,g as a,N as m,C as G,R as xe,Q as W,E as X,O as je,s as pe,q as O,M as g,F as me,f as ye,o as Q,y as Z,m as h}from"./index-v0dwzwwD.js";import{u as R}from"./useMutation-8N1NEn-m.js";import{a as ee,n as y,u as T,d as ve}from"./format-CqbfF7nU.js";import{h as se,K as be,t as te,a as ge}from"./key-scope-B9wjYbnK.js";import{P as ke}from"./plus-CwHmRw4B.js";function L(n){return`'${n.replace(/'/g,"'\\''")}'`}function fe(n){return{curl:`export PORTAL_API_KEY='替换为你的 API Key'
 
 # List available models first.
 curl ${L(`${n}/v1/models`)} \\

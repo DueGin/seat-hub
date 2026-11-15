@@ -53,6 +53,16 @@ func (service *Service) Dashboard(ctx context.Context) (api.AdminDashboardDTO, e
 	if err != nil {
 		return result, fmt.Errorf("查询租赁池统计失败: %w", err)
 	}
+	warnings, err := service.provisioning.LoadScopeWarnings(ctx)
+	if err != nil {
+		return result, err
+	}
+	result.ScopeWarnings = api.ScopeWarningsDTO{CheckedAt: warnings.CheckedAt, Items: make([]api.ScopeWarningDTO, 0, len(warnings.Items))}
+	for _, item := range warnings.Items {
+		warning := api.ScopeWarningDTO{UserID: item.UserID, VMID: item.VMID, PoolID: item.PoolID, PoolName: item.PoolName, Message: item.Message}
+		_ = service.db.QueryRowContext(ctx, `SELECT email FROM users WHERE id=?`, item.UserID).Scan(&warning.UserEmail)
+		result.ScopeWarnings.Items = append(result.ScopeWarnings.Items, warning)
+	}
 	health, err := service.client.Ping(ctx)
 	result.VM2API = api.VM2APIHealth{OK: health.OK, Version: health.Version, LatencyMS: health.LatencyMS}
 	if err != nil {
@@ -113,7 +123,12 @@ func (service *Service) RentalPool(ctx context.Context) ([]api.RentalPoolRowDTO,
 	for _, vm := range vms {
 		byID[vm.ID] = vm
 	}
+	// Best effort: the rows are still useful when the pool list is unavailable.
+	foreign, _ := service.provisioning.ForeignPoolVMs(ctx)
 	for index := range items {
+		if pool, held := foreign[items[index].VMID]; held {
+			items[index].ForeignPool = pool.Name
+		}
 		if vm, exists := byID[items[index].VMID]; exists {
 			items[index].VM = &api.RentalVMDTO{
 				Label: vm.Label, EmailMasked: privacy.MaskEmail(vm.EmailMasked), CredStatus: vm.CredStatus,
@@ -151,12 +166,17 @@ func (service *Service) RentalCandidates(ctx context.Context) ([]api.RentalCandi
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("读取已归属账号失败: %w", err)
 	}
+	foreign, err := service.provisioning.ForeignPoolVMs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("获取上游账号池失败: %w", err)
+	}
 	items := make([]api.RentalCandidateDTO, 0)
 	for _, vm := range vms {
 		if adminRentable(vm) && !excluded[vm.ID] {
 			items = append(items, api.RentalCandidateDTO{
 				VMID: vm.ID, Label: vm.Label, EmailMasked: privacy.MaskEmail(vm.EmailMasked),
 				CredStatus: vm.CredStatus, ScheduleState: vm.ScheduleState, Tier: vm.Tier,
+				ForeignPool: foreign[vm.ID].Name,
 			})
 		}
 	}
@@ -185,10 +205,17 @@ func (service *Service) RentalAdd(ctx context.Context, vmIDs []string, note stri
 	for _, vm := range vms {
 		byID[vm.ID] = vm
 	}
+	foreign, err := service.provisioning.ForeignPoolVMs(ctx)
+	if err != nil {
+		return fmt.Errorf("获取上游账号池失败: %w", err)
+	}
 	for _, vmID := range vmIDs {
 		vm, exists := byID[vmID]
 		if !exists {
 			return adminError(http.StatusNotFound, "vm_not_found", "上游账号不存在")
+		}
+		if pool, held := foreign[vmID]; held {
+			return adminError(http.StatusConflict, "vm_in_foreign_pool", fmt.Sprintf("账号 %s 在 vm2api 账号池「%s」里，租出后无法放进用户的账号池；请先在 vm2api 面板把它移出该账号池", vmID, pool.Name))
 		}
 		if !adminRentable(vm) {
 			return adminError(http.StatusConflict, "vm_not_available", "账号已归属用户或不符合入池条件")
@@ -551,4 +578,10 @@ func (service *Service) PatchSubscription(ctx context.Context, id int64, expires
 		}
 	}
 	return nil
+}
+
+// RecheckScopes queues an account-scope reconcile now, so an admin who just
+// fixed a scope warning does not wait for the 10-minute cycle.
+func (service *Service) RecheckScopes(ctx context.Context) error {
+	return service.provisioning.EnqueueScopeReconcile(ctx)
 }

@@ -141,6 +141,8 @@ orders.push({ userId: 1, value: { order_no: 'PT202610310001', product_id: 1, pro
 orderTerms.set('PT202610310001', { unitQuantity: 5, durationDays: 30 })
 const rentalCandidates: PoolCandidate[] = Array.from({ length: 8 }, (_, index) => ({
   vm_id: `demo-vm-${index + 1}`, label: `演示资源 ${index + 1}`, email_masked: `vm${index + 1}***@***.com`, cred_status: 'valid', schedule_state: 'on', tier: index % 2 ? 'pro' : 'max',
+  // Demo: one candidate sits in a vm2api pool someone made by hand.
+  ...(index === 6 ? { foreign_pool: 'GUO' } : {}),
 }))
 const pool: PoolItem[] = rentalCandidates.slice(0, 5).map((candidate, index) => ({
   vm_id: candidate.vm_id, tier: candidate.tier, status: index === 0 ? 'leased' : index === 4 ? 'maintenance' : 'available',
@@ -661,6 +663,7 @@ function dashboard(): AdminDashboard {
     accounts: { hosted_active: accounts.filter(item => item.value.kind === 'hosted' && item.value.status === 'active').length, rental_active: accounts.filter(item => item.value.kind === 'rental' && item.value.status === 'active').length, failed: accounts.filter(item => item.value.status === 'failed').length },
     rental_pool: { total: pool.length, available: pool.filter(item => item.status === 'available').length, leased: pool.filter(item => item.status === 'leased').length, maintenance: pool.filter(item => item.status === 'maintenance').length },
     vm2api: { ok: true, version: '演示 · 无真实连接', latency_ms: 0, error: null },
+    scope_warnings: { checked_at: iso(-5 * 60_000), items: [] },
   }
 }
 function settingsView(): Settings { return { ...settings, payment: { ...settings.payment, epay: { ...settings.payment.epay, key: epayKeyConfigured ? '***' : '' } } } }
@@ -740,6 +743,7 @@ function adminRequest(path: string, method: string, query: URLSearchParams, inpu
   const rawId = parts[2]
   const action = parts[3]
   if (path === '/admin/dashboard' && method === 'GET') return ok(dashboard())
+  if (path === '/admin/scope/recheck' && method === 'POST') return ok({})
   if (path === '/admin/system/update' && method === 'GET') return ok(mockUpdateStatus())
   if (path === '/admin/system/update' && method === 'POST') {
     if (mockJob) fail(409, 'update_in_progress', '已有更新或回滚正在进行，请稍候')
@@ -842,6 +846,8 @@ function adminRequest(path: string, method: string, query: URLSearchParams, inpu
       if (!Array.isArray(ids) || ids.length === 0 || !ids.every((value: unknown): value is string => typeof value === 'string')) fail(422, 'invalid_vm_ids', '请选择至少一个资源。')
       const note = limitedText(input, 'note', '', 1_000)
       const candidates = ids.map(id => rentalCandidates.find(candidate => candidate.vm_id === id) ?? fail(404, 'not_found', '待入池资源不存在。'))
+      const held = candidates.find(candidate => candidate.foreign_pool)
+      if (held) fail(409, 'vm_in_foreign_pool', `账号 ${held.vm_id} 在 vm2api 账号池「${held.foreign_pool}」里，租出后无法放进用户的账号池；请先在 vm2api 面板把它移出该账号池`)
       if (new Set(ids).size !== ids.length || candidates.some(candidate => pool.some(item => item.vm_id === candidate.vm_id) || vmHasOwner(candidate.vm_id))) fail(409, 'vm_unavailable', '资源已入池或已归属用户。')
       const failedCandidate = candidates.find((candidate) => candidate.vm_id === 'demo-vm-8')
       if (failedCandidate) {

@@ -246,6 +246,8 @@ func (fakeKeys) Delete(ctx context.Context, userID, id int64) error { return nil
 
 type fakeAdmin struct{}
 
+func (fakeAdmin) RecheckScopes(ctx context.Context) error { return nil }
+
 func (fakeAdmin) Dashboard(ctx context.Context) (AdminDashboardDTO, error) {
 	return AdminDashboardDTO{Users: 6}, nil
 }

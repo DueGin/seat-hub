@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"database/sql"
 	"log/slog"
 	"net/http"
 	"runtime"
@@ -19,6 +20,7 @@ import (
 	"github.com/DueGin/seat-hub/internal/gateway"
 	"github.com/DueGin/seat-hub/internal/order"
 	"github.com/DueGin/seat-hub/internal/payment"
+	"github.com/DueGin/seat-hub/internal/provision"
 	"github.com/DueGin/seat-hub/internal/secret"
 	"github.com/DueGin/seat-hub/internal/selfcheck"
 	"github.com/DueGin/seat-hub/internal/store"
@@ -68,7 +70,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	vmClient := vm2api.NewHTTPClient(cfg.VM2APIBaseURL, cfg.VM2APIMasterKey, nil)
 
 	settingsAdv := &settingsAdapter{settings: settings, audit: audit}
-	catalogSvc := catalog.New(db.DB, cachedVMHealth(vmClient))
+	catalogSvc := catalog.New(db.DB, withoutForeignPools(cachedVMHealth(vmClient), foreignPoolProbe(db.DB, vmClient)))
 	orderSvc := order.New(db.DB, catalogSvc, nil)
 	paymentSvc, err := payment.NewService(db.DB, orderSvc, payment.ServiceOptions{
 		Providers: buildProviders(cfg, settingsAdv),
@@ -235,6 +237,44 @@ func cachedVMHealth(client vm2api.Client) catalog.HealthFunc {
 		cache[vmID] = entry{healthy: healthy, expires: now.Add(30 * time.Second)}
 		mu.Unlock()
 		return healthy, fetched
+	}
+}
+
+// foreignPoolProbe reports whether a VM sits in a vm2api pool the portal does
+// not own (provision.ForeignPoolVMs), cached for 30 seconds like the health
+// probe. When the pool list cannot be read it answers false: stock stays as
+// it was, and allocation re-checks with a fresh list anyway.
+func foreignPoolProbe(db *sql.DB, client vm2api.Client) func(vmID string) bool {
+	var (
+		mu      sync.Mutex
+		held    map[string]vm2api.Pool
+		expires time.Time
+	)
+	return func(vmID string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if now := time.Now(); held == nil || now.After(expires) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			foreign, err := provision.ForeignPoolVMs(ctx, db, client)
+			cancel()
+			if err != nil {
+				foreign = map[string]vm2api.Pool{}
+			}
+			held, expires = foreign, now.Add(30*time.Second)
+		}
+		_, ok := held[vmID]
+		return ok
+	}
+}
+
+// withoutForeignPools keeps foreign-pooled VMs out of rental stock: they are
+// skipped at allocation, so selling them would only fail the order.
+func withoutForeignPools(health catalog.HealthFunc, foreign func(string) bool) catalog.HealthFunc {
+	return func(vmID string) (bool, bool) {
+		if foreign(vmID) {
+			return false, true
+		}
+		return health(vmID)
 	}
 }
 

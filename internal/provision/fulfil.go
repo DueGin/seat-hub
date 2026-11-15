@@ -74,7 +74,11 @@ func (service *Service) allocateRental(ctx context.Context, subscriptionID int64
 	}
 	// Lease first, then talk to vm2api: the upstream calls must not run inside
 	// the write transaction, and a failed claim leaves nothing half-created.
-	vmIDs, err := service.claimRental(ctx, userID, subscriptionID, quantity)
+	foreign, err := service.foreignVMIDs(ctx)
+	if err != nil {
+		return err
+	}
+	vmIDs, err := service.claimRental(ctx, userID, subscriptionID, quantity, foreign)
 	if err != nil || len(vmIDs) == 0 {
 		return err
 	}
@@ -108,13 +112,13 @@ func (service *Service) syncAccountIdentity(ctx context.Context, vmID string) {
 }
 
 // claimRental leases the accounts a subscription is missing and commits.
-func (service *Service) claimRental(ctx context.Context, userID, subscriptionID int64, quantity int) ([]string, error) {
+func (service *Service) claimRental(ctx context.Context, userID, subscriptionID int64, quantity int, foreign []string) ([]string, error) {
 	tx, err := service.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin rental allocation: %w", err)
 	}
 	defer tx.Rollback()
-	vmIDs, err := claimRentalTx(ctx, tx, userID, subscriptionID, quantity, service.now())
+	vmIDs, err := claimRentalTx(ctx, tx, userID, subscriptionID, quantity, service.now(), foreign)
 	if err != nil {
 		return nil, err
 	}
@@ -125,8 +129,9 @@ func (service *Service) claimRental(ctx context.Context, userID, subscriptionID 
 }
 
 // claimRental leases up to `quantity` minus the live accounts the subscription
-// already holds.
-func claimRentalTx(ctx context.Context, tx *sql.Tx, userID, subscriptionID int64, quantity int, now time.Time) ([]string, error) {
+// already holds. VMs in `foreign` (held by a vm2api pool the portal does not
+// own) are skipped: they could not be put in the tenant's pool.
+func claimRentalTx(ctx context.Context, tx *sql.Tx, userID, subscriptionID int64, quantity int, now time.Time, foreign []string) ([]string, error) {
 	var held int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM resources WHERE subscription_id=? AND status NOT IN ('released','releasing')`, subscriptionID).Scan(&held); err != nil {
 		return nil, fmt.Errorf("count rented resources: %w", err)
@@ -138,13 +143,16 @@ func claimRentalTx(ctx context.Context, tx *sql.Tx, userID, subscriptionID int64
 	assigned := make([]string, 0, needed)
 	for len(assigned) < needed {
 		var vmID, tier string
-		skip := make([]any, 0, len(assigned))
+		skip := make([]any, 0, len(assigned)+len(foreign))
+		for _, item := range assigned {
+			skip = append(skip, item)
+		}
+		for _, item := range foreign {
+			skip = append(skip, item)
+		}
 		exclude := ""
-		if len(assigned) > 0 {
-			exclude = ` AND vm_id NOT IN (` + strings.TrimSuffix(strings.Repeat("?,", len(assigned)), ",") + `)`
-			for _, item := range assigned {
-				skip = append(skip, item)
-			}
+		if len(skip) > 0 {
+			exclude = ` AND vm_id NOT IN (` + strings.TrimSuffix(strings.Repeat("?,", len(skip)), ",") + `)`
 		}
 		err := tx.QueryRowContext(ctx, `SELECT vm_id,tier FROM rental_pool WHERE status='available' AND selfcheck_state='pass'`+exclude+` ORDER BY vm_id LIMIT 1`, skip...).Scan(&vmID, &tier)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -208,9 +216,13 @@ func (service *Service) fulfilOrder(ctx context.Context, orderID int64) (fulfilE
 		return ErrInvalidState
 	}
 	var owner string
+	var foreign []string
 	if kind == "rental_account" {
 		owner, err = service.ServiceUser(ctx)
 		if err != nil {
+			return err
+		}
+		if foreign, err = service.foreignVMIDs(ctx); err != nil {
 			return err
 		}
 	}
@@ -278,7 +290,7 @@ func (service *Service) fulfilOrder(ctx context.Context, orderID int64) (fulfilE
 		// available list first and leasing afterwards would let two concurrent
 		// fulfillments hand out the same VM; here the loser sees RowsAffected 0
 		// and moves on to the next candidate.
-		claimed, err := claimRentalTx(ctx, tx, userID, subscriptionID, units, now)
+		claimed, err := claimRentalTx(ctx, tx, userID, subscriptionID, units, now, foreign)
 		if err != nil {
 			return err
 		}

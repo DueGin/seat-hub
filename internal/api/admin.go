@@ -21,6 +21,16 @@ func (s *Server) handleAdminDashboard(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, dashboard)
 }
 
+func (s *Server) handleAdminScopeRecheck(w http.ResponseWriter, r *http.Request) {
+	admin, _ := s.currentUser(r)
+	if err := s.Deps.Admin.RecheckScopes(r.Context()); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.Deps.Audit.Write(r.Context(), admin.ID, "scope.recheck", "", nil)
+	writeOK(w, map[string]any{})
+}
+
 func (s *Server) handleAdminListProducts(w http.ResponseWriter, r *http.Request) {
 	items, err := s.Deps.Catalog.All(r.Context())
 	if err != nil {
