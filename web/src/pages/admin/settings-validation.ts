@@ -15,7 +15,7 @@ export const selfcheckNumericSettings = [
 ] as const
 
 const DEFAULT_EPAY = { enabled: false, gateway_url: '', pid: '', key: '', types: ['alipay', 'wxpay'] }
-const DEFAULT_MANUAL = { enabled: false, instructions: '' }
+const DEFAULT_MANUAL = { enabled: true, instructions: '转账后请联系管理员确认收款。' }
 const DEFAULT_NUMBERS = { base_concurrency: 1, concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0, hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0 }
 const DEFAULT_SELFCHECK = { selfcheck_require_dedicated_proxy: true, selfcheck_require_timezone_match: true, selfcheck_max_rebuilds: 3, selfcheck_recheck_minutes: 30 }
 
@@ -34,6 +34,7 @@ export function normalizeSettings(input: Settings | null | undefined): Normalize
   const payment = record(source.payment)
   const epay = record(payment.epay)
   const manual = record(payment.manual)
+  const alipay = record(payment.alipay_f2f)
   const types = Array.isArray(epay.types) ? epay.types.filter((value): value is string => typeof value === 'string') : DEFAULT_EPAY.types
   return {
     site_name: stringOr(source.site_name, ''),
@@ -50,6 +51,9 @@ export function normalizeSettings(input: Settings | null | undefined): Normalize
     selfcheck_recheck_minutes: numberOr(source.selfcheck_recheck_minutes, DEFAULT_SELFCHECK.selfcheck_recheck_minutes),
     hosted_vm_template: Object.keys(record(source.hosted_vm_template)).length ? record(source.hosted_vm_template) : {},
     payment: {
+      active: payment.active === 'epay' || payment.active === 'alipay_f2f' || payment.active === 'manual' ? payment.active
+        : epay.enabled === true && stringOr(epay.gateway_url, '').trim() && stringOr(epay.pid, '').trim() && stringOr(epay.key, '').trim() ? 'epay' : 'manual',
+      alipay_f2f: { app_id: stringOr(alipay.app_id, ''), private_key: stringOr(alipay.private_key, ''), alipay_public_key: stringOr(alipay.alipay_public_key, ''), sandbox: booleanOr(alipay.sandbox, false) },
       epay: {
         enabled: booleanOr(epay.enabled, DEFAULT_EPAY.enabled),
         gateway_url: stringOr(epay.gateway_url, DEFAULT_EPAY.gateway_url),
@@ -65,7 +69,7 @@ export function normalizeSettings(input: Settings | null | undefined): Normalize
   }
 }
 
-export function validateSettings(draft: Settings, templateJSON: string, typesJSON: string, hasExistingKey = false): NormalizedSettings {
+export function validateSettings(draft: Settings, templateJSON: string, typesJSON: string, hasExistingKey = false, hasExistingPrivateKey = false): NormalizedSettings {
   const settings = normalizeSettings(draft)
   if (!settings.site_name.trim()) throw new Error('站点名称不能为空。')
   for (const field of numericSettings) {
@@ -84,20 +88,28 @@ export function validateSettings(draft: Settings, templateJSON: string, typesJSO
   const normalizedTypes = [...new Set(types.map((value: string) => value.trim()))]
   const epay = settings.payment.epay
   const gateway = epay.gateway_url.trim()
-  if (gateway) {
+  if (gateway && settings.payment.active === 'epay') {
     let url: URL
     try { url = new URL(gateway) } catch { throw new Error('支付网关地址不是有效 URL。') }
     if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) throw new Error('支付网关仅支持 HTTP / HTTPS 地址，且不能包含用户名或密码。')
   }
   const key = epay.key.trim()
   const hasKey = key && key !== '***' || hasExistingKey
-  if (epay.enabled && (!gateway || !epay.pid.trim() || !hasKey || !normalizedTypes.length)) throw new Error('启用在线支付前，请填写网关地址、商户编号、支付密钥并选择至少一种支付方式。')
-  if (settings.payment.manual.enabled && !settings.payment.manual.instructions.trim()) throw new Error('启用人工转账前，请填写转账说明。')
+  if (settings.payment.active === 'epay' && (!gateway || !epay.pid.trim() || !hasKey || !normalizedTypes.length)) throw new Error('启用在线支付前，请填写网关地址、商户编号、支付密钥并选择至少一种支付方式。')
+  if (settings.payment.active === 'manual' && !settings.payment.manual.instructions.trim()) throw new Error('启用人工转账前，请填写转账说明。')
+  const alipay = settings.payment.alipay_f2f
+  if (settings.payment.active === 'alipay_f2f') {
+    if (!/^\d+$/.test(alipay.app_id.trim())) throw new Error('请填写有效的支付宝当面付 AppID，只能包含数字。')
+    if ((!alipay.private_key.trim() || alipay.private_key.trim() === '***') && !hasExistingPrivateKey) throw new Error('请填写支付宝当面付应用私钥。')
+    if (!alipay.alipay_public_key.trim() || alipay.alipay_public_key.trim() === '***') throw new Error('请填写支付宝当面付支付宝公钥。')
+  }
   return {
     ...settings,
     site_name: settings.site_name.trim(),
     hosted_vm_template: template as Record<string, unknown>,
     payment: {
+      active: settings.payment.active,
+      alipay_f2f: { ...alipay, app_id: alipay.app_id.trim(), private_key: alipay.private_key.trim(), alipay_public_key: alipay.alipay_public_key.trim() },
       epay: { ...epay, gateway_url: gateway, pid: epay.pid.trim(), key: epay.key.trim(), types: normalizedTypes },
       manual: { ...settings.payment.manual, instructions: settings.payment.manual.instructions.trim() },
     },

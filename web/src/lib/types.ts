@@ -5,7 +5,7 @@ export type UpdateStage = 'downloading' | 'verifying' | 'installing' | 'restarti
 export interface UpdateJob { kind: 'update' | 'rollback'; version: string; stage: UpdateStage; done: number; total: number; error?: string; started_at: string }
 export interface UpdateStatus { current: string; commit: string; build_time: string; supervisor: string; drain_seconds: number; can_update: boolean; reason?: string; latest: ReleaseInfo | null; changelog: ReleaseInfo[]; update_available: boolean; checked_at: string | null; check_error?: string; job: UpdateJob | null; pending: boolean; rollback: { version: string; source: 'download' | 'image' } | null; last_failure: { version: string; error: string; at: string } | null }
 export type ProductKind = 'concurrency' | 'hosted_seat' | 'rental_account'
-export interface Product { id: number; kind: ProductKind; name: string; description: string; unit_quantity: number; duration_days: number; price_cents: number; currency: string; min_qty: number; max_qty: number; enabled: boolean; sort_order: number; badge: string; stock: number | null }
+export interface Product { id: number; kind: ProductKind; name: string; description: string; unit_quantity: number; duration_days: number; price_cents: number; currency: string; min_qty: number; max_qty: number; enabled: boolean; sort_order: number; badge: string; stock: number | null; reservation_only: boolean }
 export interface Subscription { id: number; kind: ProductKind; quantity: number; status: string; starts_at: string; expires_at: string; source_order_no?: string | null; renewable: boolean; renew_product_ids: number[] }
 export interface Spend { requests: number; tokens: number; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_creation_tokens: number; cost_usd: number }
 export interface DailyUsage { date: string; requests: number; tokens: number; cost_usd: number }
@@ -33,21 +33,23 @@ export interface Payment { type: 'redirect' | 'qrcode' | 'manual' | 'mock'; url?
 // whole blocks (notably payment), so readers must not assume the shape is complete.
 export interface EpaySettings { enabled?: boolean; gateway_url?: string; pid?: string; key?: string; types?: string[] }
 export interface ManualSettings { enabled?: boolean; instructions?: string }
-export interface PaymentSettings { epay?: EpaySettings; manual?: ManualSettings }
+export type ActivePayment = 'epay' | 'alipay_f2f' | 'manual'
+export interface AlipayF2FSettings { app_id?: string; private_key?: string; alipay_public_key?: string; sandbox?: boolean }
+export interface PaymentSettings { active?: ActivePayment; epay?: EpaySettings; alipay_f2f?: AlipayF2FSettings; manual?: ManualSettings }
 export interface Settings { site_name?: string; registration_open?: boolean; base_concurrency?: number; concurrency_per_hosted_seat?: number; concurrency_per_rental_account?: number; hosted_grace_hours?: number; rental_grace_hours?: number; gateway_queue_timeout_ms?: number; hosted_vm_template?: Record<string, unknown>; payment?: PaymentSettings; selfcheck_require_dedicated_proxy?: boolean; selfcheck_require_timezone_match?: boolean; selfcheck_max_rebuilds?: number; selfcheck_recheck_minutes?: number }
 // NormalizedSettings is what the settings editor and validateSettings return: the same
 // document with every block filled in, so the form never renders an undefined field.
 export interface NormalizedSettings extends Omit<Settings, 'payment'> {
   site_name: string; registration_open: boolean; base_concurrency: number; concurrency_per_hosted_seat: number; concurrency_per_rental_account: number; hosted_grace_hours: number; rental_grace_hours: number; gateway_queue_timeout_ms: number; hosted_vm_template: Record<string, unknown>
   selfcheck_require_dedicated_proxy: boolean; selfcheck_require_timezone_match: boolean; selfcheck_max_rebuilds: number; selfcheck_recheck_minutes: number
-  payment: { epay: { enabled: boolean; gateway_url: string; pid: string; key: string; types: string[] }; manual: { enabled: boolean; instructions: string } }
+  payment: { active: ActivePayment; epay: { enabled: boolean; gateway_url: string; pid: string; key: string; types: string[] }; alipay_f2f: { app_id: string; private_key: string; alipay_public_key: string; sandbox: boolean }; manual: { enabled: boolean; instructions: string } }
 }
 export interface AdminDashboard { users: number; paying_users: number; revenue_cents_30d: number; orders_pending: number; accounts: { hosted_active: number; rental_active: number; failed: number }; rental_pool: { total: number; available: number; leased: number; maintenance: number }; vm2api: { ok: boolean; version: string; latency_ms: number; error: string | null }; scope_warnings: { checked_at: string; items: ScopeWarning[] } }
 /** An account-scope problem only an admin can fix: a VM held by a vm2api pool seat-hub does not own. */
 export interface ScopeWarning { user_id: number; user_email: string; vm_id: string; pool_id: string; pool_name: string; message: string }
 export interface AdminUser extends User { concurrency_total: number; hosted_used: number; hosted_total: number; rental_used: number; rental_total: number; vm2api_user_id: string | null; vm2api_pool_id: string; note: string; last_login_at: string; last_login_ip: string; active_sessions: number }
 export interface UserSession { created_at: string; expires_at: string; ip: string; user_agent: string }
-export interface UserRecords { orders: number; subscriptions: number; resources: number }
+export interface UserRecords { orders: number; subscriptions: number; resources: number; tickets?: number }
 export interface PoolCandidate { vm_id: string; label: string; email_masked: string; cred_status: string; schedule_state: string; tier: string | null; foreign_pool?: string }
 export interface PoolItem { vm_id: string; tier: string | null; status: 'available' | 'leased' | 'maintenance'; leased_to_user_id?: number | null; leased_to_email?: string | null; note: string; vm: Omit<PoolCandidate, 'vm_id' | 'foreign_pool'> & { five_hour: UsageWindow | null; seven_day: UsageWindow | null }; selfcheck: Selfcheck | null; foreign_pool?: string }
 export interface Job { id: number; type: string; status: string; attempts: number; run_after: string; last_error: string | null; payload: unknown; created_at: string; updated_at: string }

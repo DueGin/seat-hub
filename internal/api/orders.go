@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
 )
@@ -23,6 +24,17 @@ func (s *Server) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.ProductID <= 0 {
 		writeErr(w, http.StatusUnprocessableEntity, "invalid_product", "请选择商品")
+		return
+	}
+	available := false
+	for _, provider := range s.Deps.Payments.Providers(r.Context()) {
+		if provider.ID == body.Provider {
+			available = true
+			break
+		}
+	}
+	if !available {
+		writeErr(w, 422, "payment_provider_unavailable", "当前不支持该收款方式")
 		return
 	}
 	o, err := s.Deps.Orders.Create(r.Context(), u.ID, body.ProductID, body.Quantity, body.Provider, body.RenewSubscriptionID)
@@ -67,6 +79,19 @@ func (s *Server) handleGetOrder(w http.ResponseWriter, r *http.Request) {
 	if o.UserID != 0 && o.UserID != u.ID && u.Role != "admin" {
 		writeErr(w, http.StatusNotFound, "not_found", "订单不存在")
 		return
+	}
+	if o.Status == "pending" && o.Provider == "alipay_f2f" {
+		if query, ok := s.Deps.Payments.(interface {
+			QueryPending(context.Context, OrderDTO) error
+		}); ok {
+			if err := query.QueryPending(r.Context(), o); err != nil {
+				s.Log.Warn("payment query", "order_no", o.OrderNo, "err", err)
+			}
+			updated, err := s.Deps.Orders.Get(r.Context(), o.OrderNo)
+			if err == nil {
+				o = updated
+			}
+		}
 	}
 	writeOK(w, map[string]any{"order": o})
 }

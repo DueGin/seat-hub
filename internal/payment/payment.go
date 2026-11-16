@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 )
 
 var (
@@ -26,6 +27,15 @@ type Provider interface {
 	Notify(r *http.Request) (Notice, error)
 }
 
+// Querier returns only notices authenticated by the provider's response signature.
+type Querier interface {
+	Query(ctx context.Context, orderNo string) (Notice, error)
+}
+
+type Closer interface {
+	Close(ctx context.Context, orderNo string) error
+}
+
 type CreateRequest struct {
 	OrderNo     string
 	ProductName string
@@ -33,6 +43,7 @@ type CreateRequest struct {
 	NotifyURL   string
 	ReturnURL   string
 	PayType     string
+	ExpiresAt   time.Time
 }
 
 type Payment struct {

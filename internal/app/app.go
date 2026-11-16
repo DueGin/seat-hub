@@ -5,6 +5,7 @@ package app
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"net/http"
 	"runtime"
@@ -18,6 +19,7 @@ import (
 	"github.com/DueGin/seat-hub/internal/catalog"
 	"github.com/DueGin/seat-hub/internal/config"
 	"github.com/DueGin/seat-hub/internal/gateway"
+	"github.com/DueGin/seat-hub/internal/mail"
 	"github.com/DueGin/seat-hub/internal/order"
 	"github.com/DueGin/seat-hub/internal/payment"
 	"github.com/DueGin/seat-hub/internal/provision"
@@ -30,6 +32,8 @@ import (
 )
 
 type App struct {
+	stopMail func(context.Context)
+
 	Cfg    config.Config
 	Log    *slog.Logger
 	DB     *store.DB
@@ -80,6 +84,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 	paymentAdv := &paymentAdapter{db: db.DB, marker: orderSvc, settings: settingsAdv, dev: cfg.Dev, callbackBase: callbackBase(cfg)}
+	orderSvc.SetPaymentCloser(paymentAdv.CloseOrder)
 	paymentAdv.svc = paymentSvc
 
 	// Usage/provisioning services are wired by wiring.go; they are the only
@@ -103,6 +108,9 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 			RentalTotal:      ent.RentalAccounts.Total,
 		}, nil
 	}
+
+	mailSvc := mail.New(db.DB, box, logger)
+	features := featureDeps{DB: db.DB, Box: box, Mail: mailSvc, Settings: settings, Audit: audit, Cfg: cfg, Log: logger}
 
 	restart := make(chan struct{})
 	var restartOnce sync.Once
@@ -129,7 +137,11 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		Admin:    prov,
 		System:   &systemAdapter{m: updates, drain: cfg.UpdateDrainSeconds},
 		Site:     siteFunc(settings, cfg.PublicBaseURL),
-		Dev:      cfg.Dev,
+
+		Mail:         newMailAdapter(features),
+		Reservations: newReservationAdapter(features),
+		Tickets:      newTicketAdapter(features),
+		Dev:          cfg.Dev,
 	}
 	apiServer := &api.Server{Deps: deps, Log: logger, Secure: cfg.SecureCookies()}
 
@@ -174,6 +186,23 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 		IdleTimeout:       120 * time.Second,
 	}
 	prov.Attach(app.Server)
+	// The outbox loop is tied to the app's lifetime: Close stops it before the
+	// database closes, so it never polls a closed DB.
+	mailCtx, stopMail := context.WithCancel(context.Background())
+	mailDone := make(chan struct{})
+	go func() {
+		defer close(mailDone)
+		if err := mailSvc.Run(mailCtx); err != nil && !errors.Is(err, context.Canceled) {
+			logger.Error("mail outbox stopped", "err", err)
+		}
+	}()
+	app.stopMail = func(ctx context.Context) {
+		stopMail()
+		select {
+		case <-mailDone:
+		case <-ctx.Done():
+		}
+	}
 	return app, nil
 }
 
@@ -205,6 +234,9 @@ func (a *App) Start() error {
 
 func (a *App) Close(ctx context.Context) error {
 	_ = a.Server.Shutdown(ctx)
+	if a.stopMail != nil {
+		a.stopMail(ctx)
+	}
 	return a.DB.Close()
 }
 

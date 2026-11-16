@@ -19,20 +19,21 @@ type catalogAdapter struct {
 
 func toProductDTO(p catalog.Product) api.ProductDTO {
 	return api.ProductDTO{
-		ID:           p.ID,
-		Kind:         p.Kind,
-		Name:         p.Name,
-		Description:  p.Description,
-		Badge:        p.Badge,
-		UnitQuantity: int(p.UnitQuantity),
-		DurationDays: int(p.DurationDays),
-		PriceCents:   p.PriceCents,
-		Currency:     p.Currency,
-		MinQty:       int(p.MinQty),
-		MaxQty:       int(p.MaxQty),
-		Enabled:      p.Enabled,
-		SortOrder:    int(p.SortOrder),
-		Stock:        stockPtr(p.Stock),
+		ID:              p.ID,
+		Kind:            p.Kind,
+		Name:            p.Name,
+		Description:     p.Description,
+		Badge:           p.Badge,
+		UnitQuantity:    int(p.UnitQuantity),
+		DurationDays:    int(p.DurationDays),
+		PriceCents:      p.PriceCents,
+		Currency:        p.Currency,
+		MinQty:          int(p.MinQty),
+		MaxQty:          int(p.MaxQty),
+		Enabled:         p.Enabled,
+		SortOrder:       int(p.SortOrder),
+		Stock:           stockPtr(p.Stock),
+		ReservationOnly: p.ReservationOnly,
 	}
 }
 
@@ -57,6 +58,9 @@ func fromProductInput(in api.ProductInput, existing catalog.Product) catalog.Pro
 	p.MinQty = int64(in.MinQty)
 	p.MaxQty = int64(in.MaxQty)
 	p.SortOrder = int64(in.SortOrder)
+	if in.ReservationOnly != nil {
+		p.ReservationOnly = *in.ReservationOnly
+	}
 	if in.Enabled != nil {
 		p.Enabled = *in.Enabled
 	}
@@ -85,7 +89,7 @@ func (a *catalogAdapter) withStock(ctx context.Context, items []catalog.Product)
 	out := make([]api.ProductDTO, 0, len(items))
 	for _, p := range items {
 		dto := toProductDTO(p)
-		if p.Kind == catalog.KindRentalAccount {
+		if p.Kind == catalog.KindRentalAccount && !p.ReservationOnly {
 			n, err := a.svc.Stock(ctx, p)
 			if err != nil {
 				return nil, err
@@ -103,7 +107,7 @@ func (a *catalogAdapter) Get(ctx context.Context, id int64) (api.ProductDTO, err
 		return api.ProductDTO{}, mapErr(err, catalog.ErrNotFound, "product_not_found", "商品不存在")
 	}
 	dto := toProductDTO(p)
-	if p.Kind == catalog.KindRentalAccount {
+	if p.Kind == catalog.KindRentalAccount && !p.ReservationOnly {
 		n, err := a.svc.Stock(ctx, p)
 		if err != nil {
 			return api.ProductDTO{}, err
@@ -251,6 +255,8 @@ func (a *orderAdapter) MarkPaidByAdmin(ctx context.Context, orderNo, tradeNo str
 
 func mapOrderErr(err error) error {
 	switch {
+	case errors.Is(err, order.ErrReservationOnly):
+		return api.Err(err, 422, "product_reservation_only", "该商品暂未开售，可以先预约")
 	case errors.Is(err, order.ErrNotFound):
 		return api.Err(err, 404, "order_not_found", "订单不存在")
 	case errors.Is(err, order.ErrInvalidQuantity):

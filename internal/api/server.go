@@ -43,6 +43,10 @@ type Deps struct {
 	Admin    AdminService
 	System   SystemService
 
+	Mail         MailService
+	Reservations ReservationService
+	Tickets      TicketService
+
 	Site func(r *http.Request) SiteConfig
 	Dev  bool
 }
@@ -139,6 +143,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/admin/settings", s.admin(s.handleAdminGetSettings))
 	mux.HandleFunc("PUT /api/admin/settings", s.admin(s.handleAdminPutSettings))
 
+	// Feature routes live next to their handlers (mail.go, reservations.go,
+	// tickets.go) so each feature owns its own file.
+	s.registerMailRoutes(mux)
+	s.registerReservationRoutes(mux)
+	s.registerTicketRoutes(mux)
+
 	return s.middleware(mux)
 }
 
@@ -156,7 +166,10 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 			s.Log.Info("api", "method", r.Method, "path", r.URL.Path, "status", sw.status,
 				"ms", time.Since(start).Milliseconds(), "ip", clientIP(r))
 		}()
-		if needsJSON(r.Method) && !isJSONContentType(r.Header.Get("Content-Type")) &&
+		uploadType, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type"))), ";")
+		ticketUpload := r.Method == http.MethodPost && r.URL.Path == "/api/tickets/attachments" &&
+			strings.TrimSpace(uploadType) == "multipart/form-data" && r.Header.Get("X-Seat-Hub-Upload") == "1"
+		if needsJSON(r.Method) && !isJSONContentType(r.Header.Get("Content-Type")) && !ticketUpload &&
 			!strings.Contains(r.URL.Path, "/notify") && !strings.Contains(r.URL.Path, "/return") {
 			writeErr(sw, http.StatusUnsupportedMediaType, "unsupported_media_type", "请求需为 application/json")
 			return

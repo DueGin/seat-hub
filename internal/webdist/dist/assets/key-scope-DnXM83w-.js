@@ -1,0 +1,1 @@
+function u(e){return["active","needs_reauth","suspended"].includes(e.status)}function a(e,n){return e.mode==="all"||n.some(t=>e.accounts.includes(t.id)&&u(t))}function o(e,n){return{mode:e.mode,accounts:e.mode==="all"?[]:e.accounts.filter(t=>n.some(s=>s.id===t&&u(s)))}}export{a as h,u as i,o as t};

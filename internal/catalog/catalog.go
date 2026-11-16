@@ -21,22 +21,23 @@ var (
 )
 
 type Product struct {
-	ID           int64  `json:"id"`
-	Kind         string `json:"kind"`
-	Name         string `json:"name"`
-	Description  string `json:"description"`
-	Badge        string `json:"badge"`
-	UnitQuantity int64  `json:"unit_quantity"`
-	DurationDays int64  `json:"duration_days"`
-	PriceCents   int64  `json:"price_cents"`
-	Currency     string `json:"currency"`
-	MinQty       int64  `json:"min_qty"`
-	MaxQty       int64  `json:"max_qty"`
-	Enabled      bool   `json:"enabled"`
-	SortOrder    int64  `json:"sort_order"`
-	Stock        *int64 `json:"stock"`
-	CreatedAt    string `json:"created_at"`
-	UpdatedAt    string `json:"updated_at"`
+	ID              int64  `json:"id"`
+	Kind            string `json:"kind"`
+	Name            string `json:"name"`
+	Description     string `json:"description"`
+	Badge           string `json:"badge"`
+	UnitQuantity    int64  `json:"unit_quantity"`
+	DurationDays    int64  `json:"duration_days"`
+	PriceCents      int64  `json:"price_cents"`
+	Currency        string `json:"currency"`
+	MinQty          int64  `json:"min_qty"`
+	MaxQty          int64  `json:"max_qty"`
+	Enabled         bool   `json:"enabled"`
+	ReservationOnly bool   `json:"reservation_only"`
+	SortOrder       int64  `json:"sort_order"`
+	Stock           *int64 `json:"stock"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
 }
 
 func Validate(product Product) error {
@@ -64,13 +65,13 @@ func New(db *sql.DB, health HealthFunc) *Service { return &Service{db: db, healt
 // is assumed healthy: "unknown" must not read as "sold out".
 func (service *Service) SetHealth(health HealthFunc) { service.health = health }
 
-const columns = `id, kind, name, description, badge, unit_quantity, duration_days, price_cents, currency, min_qty, max_qty, enabled, sort_order, created_at, updated_at`
+const columns = `id, kind, name, description, badge, unit_quantity, duration_days, price_cents, currency, min_qty, max_qty, enabled, sort_order, reservation_only, created_at, updated_at`
 
 type scanner interface{ Scan(...any) error }
 
 func scanProduct(row scanner) (Product, error) {
 	var product Product
-	err := row.Scan(&product.ID, &product.Kind, &product.Name, &product.Description, &product.Badge, &product.UnitQuantity, &product.DurationDays, &product.PriceCents, &product.Currency, &product.MinQty, &product.MaxQty, &product.Enabled, &product.SortOrder, &product.CreatedAt, &product.UpdatedAt)
+	err := row.Scan(&product.ID, &product.Kind, &product.Name, &product.Description, &product.Badge, &product.UnitQuantity, &product.DurationDays, &product.PriceCents, &product.Currency, &product.MinQty, &product.MaxQty, &product.Enabled, &product.SortOrder, &product.ReservationOnly, &product.CreatedAt, &product.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Product{}, ErrNotFound
 	}
@@ -92,7 +93,7 @@ func (service *Service) Create(ctx context.Context, product Product) (Product, e
 		product.Currency = "CNY"
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
-	result, err := service.db.ExecContext(ctx, `INSERT INTO products (kind, name, description, badge, unit_quantity, duration_days, price_cents, currency, min_qty, max_qty, enabled, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, product.Kind, product.Name, product.Description, product.Badge, product.UnitQuantity, product.DurationDays, product.PriceCents, product.Currency, product.MinQty, product.MaxQty, product.Enabled, product.SortOrder, now, now)
+	result, err := service.db.ExecContext(ctx, `INSERT INTO products (kind, name, description, badge, unit_quantity, duration_days, price_cents, currency, min_qty, max_qty, enabled, sort_order, reservation_only, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, product.Kind, product.Name, product.Description, product.Badge, product.UnitQuantity, product.DurationDays, product.PriceCents, product.Currency, product.MinQty, product.MaxQty, product.Enabled, product.SortOrder, product.ReservationOnly, now, now)
 	if err != nil {
 		return Product{}, fmt.Errorf("insert product: %w", err)
 	}
@@ -110,7 +111,7 @@ func (service *Service) Update(ctx context.Context, id int64, product Product) (
 	if product.Currency == "" {
 		product.Currency = "CNY"
 	}
-	result, err := service.db.ExecContext(ctx, `UPDATE products SET kind = ?, name = ?, description = ?, badge = ?, unit_quantity = ?, duration_days = ?, price_cents = ?, currency = ?, min_qty = ?, max_qty = ?, enabled = ?, sort_order = ?, updated_at = ? WHERE id = ?`, product.Kind, product.Name, product.Description, product.Badge, product.UnitQuantity, product.DurationDays, product.PriceCents, product.Currency, product.MinQty, product.MaxQty, product.Enabled, product.SortOrder, time.Now().UTC().Format(time.RFC3339), id)
+	result, err := service.db.ExecContext(ctx, `UPDATE products SET kind = ?, name = ?, description = ?, badge = ?, unit_quantity = ?, duration_days = ?, price_cents = ?, currency = ?, min_qty = ?, max_qty = ?, enabled = ?, sort_order = ?, reservation_only = ?, updated_at = ? WHERE id = ?`, product.Kind, product.Name, product.Description, product.Badge, product.UnitQuantity, product.DurationDays, product.PriceCents, product.Currency, product.MinQty, product.MaxQty, product.Enabled, product.SortOrder, product.ReservationOnly, time.Now().UTC().Format(time.RFC3339), id)
 	if err != nil {
 		return Product{}, fmt.Errorf("update product: %w", err)
 	}
@@ -180,7 +181,7 @@ func (service *Service) list(ctx context.Context, public bool) ([]Product, error
 		return nil, fmt.Errorf("close products: %w", err)
 	}
 	for index := range products {
-		if products[index].Kind == KindRentalAccount {
+		if products[index].Kind == KindRentalAccount && !products[index].ReservationOnly {
 			stock, err := service.Stock(ctx, products[index])
 			if err != nil {
 				return nil, err

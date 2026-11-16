@@ -201,7 +201,7 @@ function UserDetails({ user, onClose, onEdit }: { user: AdminUser; onClose: () =
   const data = query.data
   const current = data?.user ?? user
   const self = session.data?.id === user.id
-  const blocked = data ? data.records.orders + data.records.subscriptions + data.records.resources > 0 : true
+  const blocked = data ? data.records.orders + data.records.subscriptions + data.records.resources + (data.records.tickets ?? 0) > 0 : true
   const mutation = useAdminMutation(async (action: Confirm) => {
     switch (action.type) {
       case 'status': return api.patch(`/admin/users/${action.user.id}`, { status: action.user.status === 'active' ? 'disabled' : 'active' })
@@ -235,9 +235,9 @@ function UserDetails({ user, onClose, onEdit }: { user: AdminUser; onClose: () =
           <Button variant="secondary" disabled={self} title={self ? '不能操作自己' : undefined} onClick={() => setReset(true)}><KeyRound size={14} />重置密码</Button>
           <Button variant="secondary" disabled={self || current.active_sessions === 0} title={self ? '不能操作自己' : undefined} onClick={() => open({ type: 'revoke', user: current })}><LogOut size={14} />强制下线</Button>
           <Button variant={current.status === 'active' ? 'danger' : 'secondary'} disabled={self} title={self ? '不能操作自己' : undefined} onClick={() => open({ type: 'status', user: current })}>{current.status === 'active' ? <><UserX size={14} />停用</> : <><UserCheck size={14} />启用</>}</Button>
-          <Button variant="danger" disabled={self || blocked} title={self ? '不能删除自己' : blocked ? '有订单、订阅或资源的用户不能删除，请改为停用' : undefined} onClick={() => open({ type: 'delete', user: current })}><Trash2 size={14} />删除</Button>
+          <Button variant="danger" disabled={self || blocked} title={self ? '不能删除自己' : blocked ? '有订单、订阅、资源或工单记录的用户不能删除，请改为停用' : undefined} onClick={() => open({ type: 'delete', user: current })}><Trash2 size={14} />删除</Button>
         </div>
-        {blocked && !self && <p className="muted small">该用户有 {data.records.orders} 笔订单、{data.records.subscriptions} 个订阅、{data.records.resources} 个账号资源，为保留账务记录不能删除；不再使用请停用。</p>}
+        {blocked && !self && <p className="muted small">该用户有 {data.records.orders} 笔订单、{data.records.subscriptions} 个订阅、{data.records.resources} 个账号资源{data.records.tickets ? `、${data.records.tickets} 条工单记录` : ''}，为保留账务和客服记录不能删除；不再使用请停用。</p>}
 
         <section><h3 className="detail-heading">订阅权益</h3>{data.subscriptions?.length ? <div className="table-wrap"><table className="data-table"><thead><tr><th>订阅</th><th>状态</th><th>生效 / 到期</th><th /></tr></thead><tbody>{data.subscriptions.map((item) => <tr key={item.id}><td>#{item.id} · {kindLabel[item.kind]} × {item.quantity}<p className="muted mono">{item.source_order_no || '—'}</p></td><td><Badge status={item.status}>{({ active: '生效中', expired: '已过期', cancelled: '已取消' } as Record<string, string>)[item.status] ?? item.status}</Badge></td><td>{dateTime(item.starts_at)}<p className="muted">{dateTime(item.expires_at)}</p></td><td><Button variant="ghost" disabled={item.status === 'cancelled'} onClick={() => setSubscription(item)}>调整</Button></td></tr>)}</tbody></table></div> : <p className="muted">暂无订阅。</p>}</section>
 

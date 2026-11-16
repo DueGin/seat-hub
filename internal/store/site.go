@@ -45,10 +45,12 @@ func DefaultSite() Site {
 }
 
 // DefaultPaymentDocument is the payment config a fresh install starts with.
-// The settings page edits this shape directly, so it must always contain both
+// The settings page edits this shape directly, so it must always contain all
 // provider blocks even before anything is configured.
 func DefaultPaymentDocument() json.RawMessage {
 	return json.RawMessage(`{
+  "active": "manual",
+  "alipay_f2f": {"app_id": "", "private_key": "", "alipay_public_key": "", "sandbox": false},
   "epay": {"enabled": false, "gateway_url": "", "pid": "", "key": "", "types": ["alipay", "wxpay"]},
   "manual": {"enabled": true, "instructions": "转账后请联系管理员确认收款。"}
 }`)

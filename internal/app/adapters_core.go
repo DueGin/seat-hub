@@ -215,7 +215,16 @@ func (a *usersAdapter) Delete(ctx context.Context, id int64) error {
 }
 
 func userHasRecords(records store.UserRecords) error {
-	return &api.UserError{Status: http.StatusConflict, Code: "user_has_records", Message: fmt.Sprintf("该用户有 %d 笔订单、%d 个订阅、%d 个账号资源，不能删除，请改为停用", records.Orders, records.Subscriptions, records.Resources)}
+	parts := make([]string, 0, 4)
+	for _, item := range []struct {
+		count int64
+		unit  string
+	}{{records.Orders, "笔订单"}, {records.Subscriptions, "个订阅"}, {records.Resources, "个账号资源"}, {records.Tickets, "条工单记录"}} {
+		if item.count > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", item.count, item.unit))
+		}
+	}
+	return &api.UserError{Status: http.StatusConflict, Code: "user_has_records", Message: "该用户有 " + strings.Join(parts, "、") + "，不能删除，请改为停用"}
 }
 
 func (a *usersAdapter) AdminDetail(ctx context.Context, id int64) (api.AdminUserDTO, error) {
@@ -258,6 +267,10 @@ func (a *settingsAdapter) Get(ctx context.Context) (api.SettingsPayload, error) 
 	if err != nil {
 		return api.SettingsPayload{}, err
 	}
+	site.Payment, err = normalizePayment(site.Payment)
+	if err != nil {
+		return api.SettingsPayload{}, fmt.Errorf("normalize payment settings: %w", err)
+	}
 	return toSettingsPayload(site), nil
 }
 
@@ -269,6 +282,13 @@ func (a *settingsAdapter) Put(ctx context.Context, p api.SettingsPayload, actorI
 	// Payment secrets: a masked or empty value keeps the stored one.
 	merged, err := mergeSecrets(prev.Payment, p.Payment)
 	if err != nil {
+		return err
+	}
+	merged, err = normalizePayment(merged)
+	if err != nil {
+		return fmt.Errorf("normalize payment settings: %w", err)
+	}
+	if err := validatePayment(merged); err != nil {
 		return err
 	}
 	site := store.Site{
@@ -422,6 +442,9 @@ func mergeSecrets(prev, next json.RawMessage) (json.RawMessage, error) {
 	if err := json.Unmarshal(next, &nextDoc); err != nil {
 		return nil, err
 	}
+	if nextDoc == nil {
+		return nil, api.Err(errors.New("invalid payment document"), 422, "invalid_settings", "收款方式配置必须是 JSON 对象")
+	}
 	mergeSecretMap(prevDoc, nextDoc)
 	out, err := json.Marshal(nextDoc)
 	if err != nil {
@@ -431,8 +454,13 @@ func mergeSecrets(prev, next json.RawMessage) (json.RawMessage, error) {
 }
 
 func mergeSecretMap(prev, next map[string]any) {
+	for k, v := range prev {
+		if _, exists := next[k]; !exists {
+			next[k] = v
+		}
+	}
 	for k, v := range next {
-		if str, ok := v.(string); ok && (str == "***" || str == "") {
+		if str, ok := v.(string); ok && (k == "key" || k == "private_key") && (str == "***" || str == "") {
 			if old, ok := prev[k]; ok {
 				next[k] = old
 			}
