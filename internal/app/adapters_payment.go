@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/DueGin/seat-hub/internal/api"
 	"github.com/DueGin/seat-hub/internal/order"
@@ -18,7 +19,7 @@ import (
 
 // paymentAdapter bridges payment.Service to api.PaymentService.
 //
-// Provider enablement is read from the admin settings document on every call so
+// The active provider is read from the admin settings document on every call so
 // changing it takes effect without a restart.
 type paymentAdapter struct {
 	db           *sql.DB
@@ -46,11 +47,11 @@ func (a *paymentAdapter) service(ctx context.Context) (*payment.Service, error) 
 	if a.svc != nil && a.svcHash == hash {
 		return a.svc, nil
 	}
-	providers, err := buildProvidersFrom(a.db, a.rawPayment(ctx), a.dev)
+	providers, err := buildProvidersFrom(a.db, raw, a.dev)
 	if err != nil {
 		return nil, err
 	}
-	svc, err := payment.NewService(a.db, a.marker, payment.ServiceOptions{Providers: providers, Dev: a.dev})
+	svc, err := payment.NewService(a.db, a.marker, payment.ServiceOptions{Providers: providers, Dev: a.dev, Active: activePayment(decodeDoc(raw))})
 	if err != nil {
 		// Keep the previous service rather than breaking charging entirely.
 		if a.svc != nil {
@@ -73,15 +74,14 @@ func (a *paymentAdapter) rawPayment(ctx context.Context) []byte {
 func deepcopyRaw(raw []byte) []byte { return append([]byte(nil), raw...) }
 
 func (a *paymentAdapter) Providers(ctx context.Context) []api.PaymentProviderDTO {
-	cfg := a.paymentConfig(ctx)
+	raw := a.rawPayment(ctx)
+	cfg := decodeDoc(raw)
 	out := []api.PaymentProviderDTO{}
-	if enabled(cfg, "epay") {
-		out = append(out, api.PaymentProviderDTO{ID: "epay", Name: "在线支付"})
-	}
-	if _, raw := cfg["manual"]; !raw || enabled(cfg, "manual") {
-		// Manual is opt-out: it stays available unless the admin explicitly
-		// disables it.
-		out = append(out, api.PaymentProviderDTO{ID: "manual", Name: "人工转账"})
+	active := activePayment(cfg)
+	names := map[string]string{"epay": "易支付", "alipay_f2f": "支付宝当面付", "manual": "人工转账"}
+	providers, _ := buildProvidersFrom(a.db, raw, a.dev)
+	if providers[active] != nil {
+		out = append(out, api.PaymentProviderDTO{ID: active, Name: names[active]})
 	}
 	if a.dev {
 		out = append(out, api.PaymentProviderDTO{ID: "mock", Name: "模拟支付"})
@@ -89,8 +89,7 @@ func (a *paymentAdapter) Providers(ctx context.Context) []api.PaymentProviderDTO
 	return out
 }
 
-// paymentConfig returns the stored payment document, parsing the shape the
-// admin settings page writes ({"epay":{"enabled":…}, "manual":{…}}).
+// decodeDoc tolerates missing documents from older deployments.
 func decodeDoc(raw []byte) map[string]any {
 	if len(raw) == 0 {
 		return map[string]any{}
@@ -100,14 +99,6 @@ func decodeDoc(raw []byte) map[string]any {
 		return map[string]any{}
 	}
 	return doc
-}
-
-func (a *paymentAdapter) paymentConfig(ctx context.Context) map[string]any {
-	site, err := a.settings.Get(ctx)
-	if err != nil || len(site.Payment) == 0 {
-		return map[string]any{}
-	}
-	return decodeDoc(site.Payment)
 }
 
 func enabled(cfg map[string]any, provider string) bool {
@@ -135,6 +126,27 @@ func (a *paymentAdapter) CreatePayment(ctx context.Context, o api.OrderDTO) (api
 		return api.PaymentDTO{}, mapPaymentErr(err)
 	}
 	return api.PaymentDTO{Type: p.Type, URL: p.URL, QR: p.QR, Instructions: p.Instructions}, nil
+}
+
+func (a *paymentAdapter) QueryPending(ctx context.Context, o api.OrderDTO) error {
+	if o.Provider != "alipay_f2f" || o.Status != "pending" {
+		return nil
+	}
+	svc, err := a.service(ctx)
+	if err != nil {
+		return err
+	}
+	return svc.QueryPending(ctx, o.OrderNo)
+}
+
+func (a *paymentAdapter) CloseOrder(ctx context.Context, provider, orderNo string) error {
+	svc, err := a.service(ctx)
+	if err != nil {
+		return err
+	}
+	closeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return svc.Close(closeCtx, provider, orderNo)
 }
 
 func (a *paymentAdapter) Notify(ctx context.Context, provider string, r *http.Request) (int, string, error) {
@@ -183,7 +195,7 @@ func (a *paymentAdapter) returnURL(provider string) string {
 func mapPaymentErr(err error) error {
 	switch {
 	case errors.Is(err, payment.ErrProviderUnavailable):
-		return api.Err(err, 422, "provider_unavailable", "支付方式不可用")
+		return api.Err(err, 422, "payment_provider_unavailable", "当前不支持该收款方式")
 	case errors.Is(err, payment.ErrOrderNotFound):
 		return api.Err(err, 404, "order_not_found", "订单不存在")
 	case errors.Is(err, payment.ErrOrderNotPayable):
@@ -196,6 +208,10 @@ func mapPaymentErr(err error) error {
 		return api.Err(err, 422, "invalid_payment", "支付参数不合法")
 	case errors.Is(err, payment.ErrNotPaid):
 		return api.Err(err, 400, "payment_not_successful", "支付未成功")
+	}
+	var gateway *payment.GatewayError
+	if errors.As(err, &gateway) {
+		return &api.UserError{Status: 422, Code: "payment_gateway_error", Message: gateway.Message}
 	}
 	return err
 }

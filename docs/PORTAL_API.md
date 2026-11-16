@@ -17,11 +17,11 @@
 ### `GET /api/public/config`
 ```json
 {"site_name":"…","base_url":"https://portal.example.com","registration_open":true,
- "payment_providers":[{"id":"epay","name":"在线支付"},{"id":"manual","name":"人工转账"},{"id":"mock","name":"模拟支付"}],
+ "payment_providers":[{"id":"alipay_f2f","name":"支付宝当面付"}],
  "version":"v0.1.0",
  "dev":false}
 ```
-`base_url` 为空时前端用 `location.origin`。
+`base_url` 为空时前端用 `location.origin`。`payment_providers` 只有后台当前启用的那一种收款方式（`epay` / `alipay_f2f` / `manual`），开发模式另加 `mock`。
 
 **脱敏邮箱**：所有接口里的 `email_masked`（Claude 账号邮箱）都只保留邮箱名的前三个字符和域名的最后一段，例如 `fdsiome@protonmail.com` 显示为 `fds***@***.com`。邮箱名较短时最多显示一半（`abcd@x.io` 显示为 `ab***@***.io`）。门面用户自己的登录邮箱不做脱敏。
 
@@ -34,9 +34,13 @@
 {"id":1,"kind":"concurrency|hosted_seat|rental_account","name":"5 路并发 · 30 天","description":"…",
  "unit_quantity":5,"duration_days":30,"price_cents":9900,"currency":"CNY",
  "min_qty":1,"max_qty":20,"enabled":true,"sort_order":0,"badge":"热销",
- "stock":12}
+ "stock":12,"reservation_only":false}
 ```
-`stock` 只有 `rental_account` 有值（整数），其它为 `null`。只返回 `enabled=true`。
+`stock` 只有 `rental_account` 有值（整数），其它为 `null`。只返回 `enabled=true`。`reservation_only=true` 的商品不能购买（下单 422 `product_reservation_only`），`stock` 恒为 `null`，前台显示「预约」。
+
+### `POST /api/public/products/{id}/reservations`
+`{email, note?}` → `{}`。不需要登录；已登录时自动关联用户。邮箱存小写，同一商品同一邮箱只记一次，重复提交也返回成功（不重复发确认邮件）。备注最多 200 字。已配置邮件时给预约人发确认邮件。
+错误：422 `invalid_reservation`（邮箱或备注不合法）、422 `product_not_reservable`（商品不存在、未上架或不是预约商品）、429 `reservation_rate_limited`（每 IP 每小时最多 10 次）。
 
 ## 认证
 
@@ -78,7 +82,8 @@
 
 ### `POST /api/orders`
 请求 `{product_id, quantity, provider, renew_subscription_id?}`。续费时 `quantity` 忽略（按订阅推算）。
-- 库存不足 409 `out_of_stock`；数量越界 422 `invalid_quantity`；续费 kind 不符/不能整除 422 `renew_mismatch`；提供方未启用 422 `provider_unavailable`。
+- 库存不足 409 `out_of_stock`；数量越界 422 `invalid_quantity`；续费 kind 不符/不能整除 422 `renew_mismatch`；不是当前启用的收款方式 422 `payment_provider_unavailable`（「当前不支持该收款方式」）；预约商品 422 `product_reservation_only`；支付宝拒绝下单 422 `payment_gateway_error`。
+- `provider` 为 `alipay_f2f` 时返回 `{"type":"qrcode","qr":"https://qr.alipay.com/…"}`，前端显示二维码。
 - 响应 `{order:Order, payment:Payment}`。`Payment`:
 ```json
 {"type":"redirect|qrcode|manual|mock","url":"https://pay…","qr":"weixin://…","instructions":"转账说明…"}
@@ -95,8 +100,9 @@
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/orders?page&page_size` | 我的订单 |
-| GET | `/api/orders/{order_no}` | `{order:Order}`，前端支付后轮询 |
-| POST | `/api/orders/{order_no}/cancel` | 仅 `pending` |
+| GET | `/api/orders/{order_no}` | `{order:Order}`，前端支付后轮询。未支付的当面付订单会顺带向支付宝查单（每单最多 5 秒一次），已付就按到账处理，防止回调丢失 |
+| POST | `/api/orders/{order_no}/cancel` | 仅 `pending`；当面付订单会尽力关闭支付宝交易 |
+| POST | `/api/payments/alipay_f2f/notify` | 支付宝异步通知（表单），RSA2 验签并核对 `app_id`、订单号、金额、`trade_status`；成功回 `success`，失败 400 `fail`。切换到其他收款方式后，配置完整的当面付仍会接收旧订单的回调 |
 | POST | `/api/orders/{order_no}/mock-pay` | 仅 `PORTAL_DEV=1` 且 provider=mock |
 | GET/POST | `/api/payments/{provider}/notify` | 支付平台异步回调（不走会话、不要求 JSON），按提供方协议回文本 |
 | GET | `/api/payments/{provider}/return` | 同步跳回 → 302 到 `/orders/{order_no}` |
@@ -203,6 +209,29 @@ utilization 为 0–100；窗口缺失为 `null`。
 
 `account_id`（可选，正整数）只看该用户某个托管或租赁账号上的调用，用于「使用记录」页；时间范围自动收窄到该账号的持有期（租赁号被多次租用时只返回本次租期）。账号不属于当前用户返回 404 `not_found`；账号尚未分配槽位时返回空列表；非正整数返回 422 `invalid_request`。
 
+## 工单
+
+`Ticket`: `{id, user_id, user_email?（管理端）, category:"account|billing|api|other", title, status:"open|replied|closed", order_no?, account_id?, created_at, updated_at, last_message_at, last_message_role:"user|admin", unread}`
+`Message`: `{id, ticket_id, author_id, role:"user|admin", body（Markdown）, created_at, attachments:[Attachment]}`
+`Attachment`: `{id, url, name, size, content_type}`
+
+状态：新建和用户回复 → `open`（待处理），管理员回复 → `replied`（已回复），任一方可关闭 → `closed`；用户回复已关闭的工单会重新打开。标题 1–100 字，正文 1–20000 字（Markdown，前端渲染，不渲染原始 HTML，只显示本工单附件里的图片）。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/tickets?status&page&page_size` | 自己的工单 `{items:[Ticket], total, page, page_size}` |
+| POST | `/api/tickets` | `{category, title, body, order_no?, account_id?, attachment_ids?:[…]}` → 201 `{ticket, messages}`；关联的订单、账号必须是自己的 |
+| GET | `/api/tickets/{id}` | `{ticket, messages}`，并标记已读 |
+| POST | `/api/tickets/{id}/messages` | `{body, attachment_ids?}` → 201 `{ticket, messages}` |
+| POST | `/api/tickets/{id}/close` | `{}` → `{ticket}` |
+| GET | `/api/tickets/unread` | `{count}`：有管理员新回复未读的工单数 |
+| POST | `/api/tickets/attachments` | multipart，字段 `file`，**必须带请求头 `X-Seat-Hub-Upload: 1`** → 201 `Attachment`。只收 png/jpeg/gif/webp（按内容识别），单张 ≤ 5 MB，每条消息最多 6 张；24 小时内未绑定到工单的上传会被清理 |
+| GET | `/api/tickets/attachments/{id}` | 图片内容；只有工单所属用户（未绑定时为上传者）和管理员能看 |
+
+错误：403 `ticket_forbidden`（别人的工单、附件或关联的订单/账号）、404 `ticket_not_found`、413 `ticket_image_size`、415 `unsupported_media_type`（上传缺少请求头）、422 `ticket_invalid` / `ticket_attachment_invalid` / `ticket_image_type`。
+
+邮件通知：新工单和用户回复发给管理员通知收件人；管理员回复发给用户的登录邮箱。
+
 ## 站内更新
 
 `UpdateStatus`：
@@ -265,6 +294,17 @@ utilization 为 0–100；窗口缺失为 `null`。
 | GET | `/api/admin/jobs?status=failed|pending|running&page` | `{items:[{id,type,status,attempts,run_after,last_error,payload,created_at,updated_at}]}` |
 | POST | `/api/admin/jobs/{id}/retry` | |
 | GET/PUT | `/api/admin/settings` | `Settings`（PUT 部分更新；密钥字段只写，GET 返回 `"***"` 或空） |
+| GET/PUT | `/api/admin/settings/mail` | `{enabled, host, port, security:"starttls|tls|none", username, password, from_address, from_name, admin_emails:[]}`。`password` 加密存储，GET 返回 `"***"`，PUT 传 `"***"` 保留原值、传空清除。`admin_emails` 为空时管理员通知发给所有启用的管理员。422 `invalid_mail_settings` |
+| POST | `/api/admin/settings/mail/test` | `{to}` → `{}`，同步发送；失败 502 `smtp_error`（message 是 SMTP 原始错误，已遮盖密码）、422 `invalid_email` / `mail_not_configured` |
+| GET | `/api/admin/reservations?product_id&status=waiting|notified&email&page&page_size` | `{items:[{id, product_id, product_name, user_id, email, note, status, ip, created_at, notified_at}], total, page, page_size, counts:[{product_id, product_name, total, waiting, notified}]}`；`counts` 不受筛选影响；筛选参数错误 422 `invalid_filter` |
+| GET | `/api/admin/reservations/export` | 同列表筛选，返回 CSV（UTF-8 带 BOM，Excel 可直接打开） |
+| DELETE | `/api/admin/reservations/{id}` | 删除一条预约；404 `reservation_not_found` |
+| POST | `/api/admin/products/{id}/reservations/notify` | `{subject, body}` → `{count}`：给该商品所有「待通知」的预约各发一封邮件并标记「已通知」。标题 ≤ 200 字且不能换行，正文 ≤ 20000 字，否则 422 `invalid_reservation_notice`；未配置邮件 422 `mail_not_configured` |
+| GET | `/api/admin/tickets?status&category&q&user_id&page&page_size` | `{items:[Ticket], total, page, page_size, counts:{open, replied, closed}}`；`q` 匹配标题、正文、用户邮箱；`counts` 不受 `status` 影响 |
+| GET | `/api/admin/tickets/{id}` | `{ticket, messages}` |
+| POST | `/api/admin/tickets/{id}/messages` | `{body, attachment_ids?}` → 201；工单变为 `replied`，邮件通知用户 |
+| PATCH | `/api/admin/tickets/{id}` | `{status:"open|replied|closed"}` |
+| GET | `/api/admin/tickets/unread` | `{count}`：待处理（`open`）工单数 |
 | GET | `/api/admin/system/update?refresh=1` | 站内更新状态 `UpdateStatus`。默认用服务端缓存（最多 10 分钟查一次 GitHub）；`refresh=1` 强制重查，但 15 秒内重复请求仍用缓存 |
 | POST | `/api/admin/system/update` | `{version}` 更新到指定版本，只能是最新发布且比当前新的版本。返回 202 和 `UpdateJob`，之后轮询状态接口看进度 |
 | POST | `/api/admin/system/rollback` | `{}` 回滚到上一个版本并重启。返回 202 和 `UpdateJob` |
@@ -279,7 +319,7 @@ utilization 为 0–100；窗口缺失为 `null`。
  "created_at":"2026-10-31T00:00:00Z"}
 ```
 
-`Settings`（全新安装也返回完整的 `payment` 两段文档，前端可直接读 `payment.epay.*` / `payment.manual.*`）:
+`Settings`（全新安装也返回完整的 `payment` 文档）：`payment.active` 是当前启用的收款方式（`epay` / `alipay_f2f` / `manual`，同一时间只有一种），三个配置块各自独立保存，切换不丢配置；保存时只要求当前方式配置完整（422 `invalid_settings`，提示到具体字段）。旧数据没有 `active` 时：易支付已启用且配置完整算 `epay`，否则 `manual`。`epay.enabled` / `manual.enabled` 是旧字段，已不起作用。`epay.key`、`alipay_f2f.private_key` 读取为 `"***"`，PUT 传 `"***"` 或空保留原值。当面付只支持公钥模式，私钥接受 PKCS1/PKCS8 PEM 或裸 base64，通知地址固定为 `<base_url>/api/payments/alipay_f2f/notify`:
 ```json
 {"site_name":"AI 工作台","registration_open":true,
  "base_concurrency":1,"concurrency_per_hosted_seat":0,"concurrency_per_rental_account":0,
@@ -287,7 +327,9 @@ utilization 为 0–100；窗口缺失为 `null`。
  "hosted_vm_template":{"runtime_type":"docker"},
  "selfcheck_require_dedicated_proxy":true,"selfcheck_require_timezone_match":true,
  "selfcheck_max_rebuilds":3,"selfcheck_recheck_minutes":30,
- "payment":{"epay":{"enabled":false,"gateway_url":"","pid":"","key":"***","types":["alipay","wxpay"]},
+ "payment":{"active":"alipay_f2f",
+            "alipay_f2f":{"app_id":"2021000000000000","private_key":"***","alipay_public_key":"MIIBIjAN…","sandbox":false},
+            "epay":{"enabled":false,"gateway_url":"","pid":"","key":"***","types":["alipay","wxpay"]},
             "manual":{"enabled":true,"instructions":"转账后请联系管理员确认收款。"}}}
 ```
 

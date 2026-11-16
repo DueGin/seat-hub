@@ -275,6 +275,24 @@ func TestAdminDeletesOnlyUsersWithoutRecords(t *testing.T) {
 	h.mustOK(http.MethodPost, "/api/admin/users/"+strconv.FormatInt(frank.ID, 10)+"/grant", `{"kind":"concurrency","quantity":1,"duration_days":30,"note":"测试"}`, nil)
 	h.expectError(http.MethodDelete, "/api/admin/users/"+strconv.FormatInt(frank.ID, 10), "", http.StatusConflict, "user_has_records")
 
+	// So is a user whose only history is a support ticket: the ticket rows
+	// reference the user, and support history is kept.
+	hana, _ := h.createUser(`{"email":"hana@example.com"}`)
+	if _, err := h.app.DB.Exec(`INSERT INTO tickets(user_id,category,title,status,created_at,updated_at,last_message_at,last_message_role)
+		VALUES (?,'other','求助','open','2026-11-16T00:00:00Z','2026-11-16T00:00:00Z','2026-11-16T00:00:00Z','user')`, hana.ID); err != nil {
+		t.Fatal(err)
+	}
+	h.expectError(http.MethodDelete, "/api/admin/users/"+strconv.FormatInt(hana.ID, 10), "", http.StatusConflict, "user_has_records")
+	var detail struct {
+		Records struct {
+			Tickets int64 `json:"tickets"`
+		} `json:"records"`
+	}
+	h.mustOK(http.MethodGet, "/api/admin/users/"+strconv.FormatInt(hana.ID, 10), "", &detail)
+	if detail.Records.Tickets != 1 {
+		t.Fatalf("ticket records = %d, want 1", detail.Records.Tickets)
+	}
+
 	// The last admin cannot be removed by another path either.
 	other, _ := h.createUser(`{"email":"gina@example.com","role":"admin"}`)
 	h.mustOK(http.MethodPatch, "/api/admin/users/"+strconv.FormatInt(other.ID, 10), `{"role":"user"}`, nil)

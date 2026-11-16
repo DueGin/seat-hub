@@ -89,6 +89,9 @@ type ProductDTO struct {
 	Enabled      bool   `json:"enabled"`
 	SortOrder    int    `json:"sort_order"`
 	Stock        *int   `json:"stock"`
+	// ReservationOnly products cannot be bought; users leave a notification
+	// email instead (docs/FEATURES_V05.md → 预约).
+	ReservationOnly bool `json:"reservation_only"`
 }
 
 type ProductInput struct {
@@ -104,6 +107,8 @@ type ProductInput struct {
 	MaxQty       int    `json:"max_qty"`
 	Enabled      *bool  `json:"enabled"`
 	SortOrder    int    `json:"sort_order"`
+	// ReservationOnly nil leaves the flag unchanged on update; false on create.
+	ReservationOnly *bool `json:"reservation_only"`
 }
 
 type OrderDTO struct {
@@ -378,7 +383,7 @@ type UserStore interface {
 	AdminDetail(ctx context.Context, id int64) (AdminUserDTO, error)
 	SetEmail(ctx context.Context, id int64, email string) error
 	SetNote(ctx context.Context, id int64, note string) error
-	// Records counts orders, subscriptions and resources; any of them blocks Delete.
+	// Records counts orders, subscriptions, resources and ticket history; any of them blocks Delete.
 	Records(ctx context.Context, id int64) (UserRecordsDTO, error)
 	// Delete removes a user without business records, its keys (upstream too) and sessions.
 	Delete(ctx context.Context, id int64) error
@@ -397,6 +402,7 @@ type UserRecordsDTO struct {
 	Orders        int64 `json:"orders"`
 	Subscriptions int64 `json:"subscriptions"`
 	Resources     int64 `json:"resources"`
+	Tickets       int64 `json:"tickets"` // tickets opened, messages written, files uploaded
 }
 
 type SessionDTO struct {

@@ -7,6 +7,9 @@ import type {
   SelfcheckReport, KeyScope,
 } from './types'
 import { hasUsableKeyScope } from './key-scope.ts'
+import { ticketMock } from './mock-tickets.ts'
+import { reservationMock, setReservationProducts } from './mock-reservations.ts'
+import type { MockKit } from './mock-kit'
 
 type Owned<T> = { userId: number; value: T }
 type Input = Record<string, unknown>
@@ -48,18 +51,22 @@ let settings: NormalizedSettings = {
   selfcheck_require_dedicated_proxy: true, selfcheck_require_timezone_match: true,
   selfcheck_max_rebuilds: 3, selfcheck_recheck_minutes: 30,
   payment: {
+    active: 'manual',
+    alipay_f2f: { app_id: '', private_key: '', alipay_public_key: '', sandbox: false },
     epay: { enabled: false, gateway_url: 'https://payment.invalid.example/', pid: '', key: '', types: ['alipay', 'wxpay'] },
     manual: { enabled: true, instructions: '演示环境，无需真实转账；管理员可在订单中模拟确认收款。' },
   },
 }
 let epayKeyConfigured = false
 const products: Product[] = [
-  { id: 1, kind: 'concurrency', name: '5 路并发 · 30 天', description: '为工作流增加 5 路独立并发。', unit_quantity: 5, duration_days: 30, price_cents: 9900, currency: 'CNY', min_qty: 1, max_qty: 20, enabled: true, sort_order: 0, badge: '热销', stock: null },
-  { id: 2, kind: 'hosted_seat', name: '托管席位 · 30 天', description: '使用你自己的账号，通过 OAuth 安全授权。', unit_quantity: 1, duration_days: 30, price_cents: 4900, currency: 'CNY', min_qty: 1, max_qty: 10, enabled: true, sort_order: 1, badge: '自有账号', stock: null },
-  { id: 3, kind: 'rental_account', name: 'Max 成品账号 · 30 天', description: '即开即用的独享租赁账号。', unit_quantity: 1, duration_days: 30, price_cents: 19900, currency: 'CNY', min_qty: 1, max_qty: 5, enabled: true, sort_order: 2, badge: '限量', stock: 0 },
-  { id: 4, kind: 'concurrency', name: '1 路并发 · 90 天', description: '适合长期稳定使用。', unit_quantity: 1, duration_days: 90, price_cents: 5900, currency: 'CNY', min_qty: 1, max_qty: 50, enabled: true, sort_order: 3, badge: '', stock: null },
-  { id: 5, kind: 'hosted_seat', name: '双席位 · 90 天', description: '团队托管方案，暂未上架。', unit_quantity: 2, duration_days: 90, price_cents: 24900, currency: 'CNY', min_qty: 1, max_qty: 10, enabled: false, sort_order: 4, badge: '', stock: null },
+  { id: 1, kind: 'concurrency', name: '5 路并发 · 30 天', description: '为工作流增加 5 路独立并发。', unit_quantity: 5, duration_days: 30, price_cents: 9900, currency: 'CNY', min_qty: 1, max_qty: 20, enabled: true, sort_order: 0, badge: '热销', stock: null, reservation_only: false },
+  { id: 2, kind: 'hosted_seat', name: '托管席位 · 30 天', description: '使用你自己的账号，通过 OAuth 安全授权。', unit_quantity: 1, duration_days: 30, price_cents: 4900, currency: 'CNY', min_qty: 1, max_qty: 10, enabled: true, sort_order: 1, badge: '自有账号', stock: null, reservation_only: false },
+  { id: 3, kind: 'rental_account', name: 'Max 成品账号 · 30 天', description: '即开即用的独享租赁账号。', unit_quantity: 1, duration_days: 30, price_cents: 19900, currency: 'CNY', min_qty: 1, max_qty: 5, enabled: true, sort_order: 2, badge: '限量', stock: 0, reservation_only: false },
+  { id: 4, kind: 'concurrency', name: '1 路并发 · 90 天', description: '适合长期稳定使用。', unit_quantity: 1, duration_days: 90, price_cents: 5900, currency: 'CNY', min_qty: 1, max_qty: 50, enabled: true, sort_order: 3, badge: '', stock: null, reservation_only: false },
+  { id: 5, kind: 'hosted_seat', name: '双席位 · 90 天', description: '团队托管方案，暂未上架。', unit_quantity: 2, duration_days: 90, price_cents: 24900, currency: 'CNY', min_qty: 1, max_qty: 10, enabled: false, sort_order: 4, badge: '', stock: null, reservation_only: false },
+  { id: 6, kind: 'rental_account', name: '团队专享账号 · 预约', description: '新方案筹备中，预约后开售时邮件通知。', unit_quantity: 1, duration_days: 30, price_cents: 29900, currency: 'CNY', min_qty: 1, max_qty: 5, enabled: true, sort_order: 5, badge: '', stock: null, reservation_only: true },
 ]
+setReservationProducts(() => products)
 const subscriptions: Owned<Subscription>[] = [
   { userId: 1, value: { id: 1, kind: 'concurrency', quantity: 5, status: 'active', starts_at: iso(-27 * DAY), expires_at: iso(3 * DAY), source_order_no: 'PT202610010001', renewable: true, renew_product_ids: [1, 4] } },
   { userId: 1, value: { id: 2, kind: 'hosted_seat', quantity: 4, status: 'active', starts_at: iso(-12 * DAY), expires_at: iso(18 * DAY), source_order_no: 'PT202610020001', renewable: true, renew_product_ids: [2] } },
@@ -297,18 +304,17 @@ function publicConfig(): PublicConfig {
     version: mockVersion(),
     site_name: settings.site_name, base_url: '', registration_open: settings.registration_open, dev: true,
     payment_providers: [
-      ...(settings.payment.epay.enabled ? [{ id: 'epay', name: '在线支付（演示）' }] : []),
-      ...(settings.payment.manual.enabled ? [{ id: 'manual', name: '人工转账（演示）' }] : []),
+      { id: settings.payment.active, name: { epay: '易支付（演示）', alipay_f2f: '支付宝当面付（演示）', manual: '人工转账（演示）' }[settings.payment.active] },
       { id: 'mock', name: '模拟支付' },
     ],
   }
 }
 function productView(product: Product): Product {
   const reserved = orders.filter(item => item.value.kind === 'rental_account' && ['pending', 'paid'].includes(item.value.status)).reduce((sum, item) => sum + rentalNeeded(item.value), 0)
-  return { ...product, stock: product.kind === 'rental_account' ? Math.max(0, pool.filter(item => item.status === 'available').length - reserved) : null }
+  return { ...product, stock: product.kind === 'rental_account' && !product.reservation_only ? Math.max(0, pool.filter(item => item.status === 'available').length - reserved) : null }
 }
 function subscriptionView(subscription: Subscription): Subscription {
-  const ids = products.filter(product => product.enabled && product.kind === subscription.kind && subscription.quantity % product.unit_quantity === 0).map(product => product.id)
+  const ids = products.filter(product => product.enabled && !product.reservation_only && product.kind === subscription.kind && subscription.quantity % product.unit_quantity === 0).map(product => product.id)
   return { ...subscription, renewable: subscription.status !== 'cancelled' && ids.length > 0, renew_product_ids: ids }
 }
 function liveAccount(account: Account): boolean { return !['released', 'releasing'].includes(account.status) }
@@ -488,14 +494,16 @@ function orderEntry(orderNo: string, userId?: number): Owned<Order> {
   return orders.find(item => item.value.order_no === orderNo && (userId === undefined || item.userId === userId)) ?? fail(404, 'not_found', '订单不存在。')
 }
 function paymentFor(order: Order): Payment {
+  if (order.provider === 'alipay_f2f') return { type: 'qrcode', qr: `https://qr.alipay.com/demo${encodeURIComponent(order.order_no)}` }
   if (order.provider === 'manual') return { type: 'manual', instructions: settings.payment.manual.instructions }
   if (order.provider === 'epay') return { type: 'redirect', url: `https://payment.invalid.example/checkout?order_no=${encodeURIComponent(order.order_no)}&demo=true` }
   return { type: 'mock', instructions: '这是开发期模拟订单，不会产生真实扣款。点击模拟支付后轮询订单即可完成履约。' }
 }
 function createOrder(userId: number, input: Input): Owned<Order> {
   const product = products.find(item => item.id === integer(input, 'product_id', 1) && item.enabled) ?? fail(404, 'not_found', '商品不存在或已下架。')
+  if (product.reservation_only) fail(422, 'product_reservation_only', '该商品暂未开售，可以先预约')
   const provider = text(input, 'provider')
-  if (!publicConfig().payment_providers.some(item => item.id === provider)) fail(422, 'provider_unavailable', '该支付方式当前不可用。')
+  if (!publicConfig().payment_providers.some(item => item.id === provider)) fail(422, 'payment_provider_unavailable', '当前不支持该收款方式')
   const renewId = input.renew_subscription_id === undefined || input.renew_subscription_id === null ? null : integer(input, 'renew_subscription_id', 1)
   let quantity: number
   if (renewId !== null) {
@@ -638,7 +646,7 @@ function productInput(input: Input, existing?: Product): Product {
     price_cents: integer(input, 'price_cents', 0, existing?.price_cents), currency: text(input, 'currency', existing?.currency ?? 'CNY'),
     min_qty: integer(input, 'min_qty', 1, existing?.min_qty ?? 1), max_qty: integer(input, 'max_qty', 1, existing?.max_qty ?? 20),
     enabled: boolean(input, 'enabled', existing?.enabled ?? true), sort_order: integer(input, 'sort_order', Number.MIN_SAFE_INTEGER, existing?.sort_order ?? 0),
-    badge: limitedText(input, 'badge', existing?.badge ?? '', 40), stock: null,
+    badge: limitedText(input, 'badge', existing?.badge ?? '', 40), stock: null, reservation_only: boolean(input, 'reservation_only', existing?.reservation_only ?? false),
   }
   if (!product.name || product.currency !== 'CNY' || product.min_qty > product.max_qty || product.duration_days > 3_650) fail(422, 'invalid_product', '请检查商品名称、金额、数量和有效天数。')
   return product
@@ -666,7 +674,7 @@ function dashboard(): AdminDashboard {
     scope_warnings: { checked_at: iso(-5 * 60_000), items: [] },
   }
 }
-function settingsView(): Settings { return { ...settings, payment: { ...settings.payment, epay: { ...settings.payment.epay, key: epayKeyConfigured ? '***' : '' } } } }
+function settingsView(): Settings { return { ...settings, payment: { ...settings.payment, epay: { ...settings.payment.epay, key: epayKeyConfigured ? '***' : '' }, alipay_f2f: { ...settings.payment.alipay_f2f, private_key: settings.payment.alipay_f2f.private_key ? '***' : '' } } } }
 function patchSettings(input: Input) {
   const updated: NormalizedSettings = structuredClone(settings)
   if (input.site_name !== undefined) updated.site_name = limitedText(input, 'site_name', '', 120)
@@ -683,6 +691,15 @@ function patchSettings(input: Input) {
   let configured = epayKeyConfigured
   if (input.payment !== undefined) {
     const payment = record(input.payment)
+    if (payment.active !== undefined) updated.payment.active = oneOf(payment.active, ['epay', 'alipay_f2f', 'manual'] as const, 'invalid_settings')
+    if (payment.alipay_f2f !== undefined) {
+      const incoming = record(payment.alipay_f2f)
+      const alipay = updated.payment.alipay_f2f
+      if (incoming.app_id !== undefined) alipay.app_id = text(incoming, 'app_id')
+      if (incoming.private_key !== undefined) { const value = text(incoming, 'private_key'); if (value && value !== '***') alipay.private_key = value }
+      if (incoming.alipay_public_key !== undefined) alipay.alipay_public_key = text(incoming, 'alipay_public_key')
+      if (incoming.sandbox !== undefined) alipay.sandbox = boolean(incoming, 'sandbox', false)
+    }
     const epay = updated.payment.epay
     const manual = updated.payment.manual
     if (payment.manual !== undefined) {
@@ -694,20 +711,29 @@ function patchSettings(input: Input) {
       const epayInput = record(payment.epay)
       if (epayInput.enabled !== undefined) epay.enabled = boolean(epayInput, 'enabled', false)
       if (epayInput.gateway_url !== undefined) {
-        const gateway = text(epayInput, 'gateway_url')
-        let url: URL
-        try { url = new URL(gateway) } catch { return fail(422, 'invalid_gateway_url', '请输入有效的 HTTPS 支付地址。') }
-        if (url.protocol !== 'https:') fail(422, 'invalid_gateway_url', '支付地址必须使用 HTTPS。')
-        epay.gateway_url = gateway
+        epay.gateway_url = text(epayInput, 'gateway_url')
       }
       if (epayInput.pid !== undefined) epay.pid = text(epayInput, 'pid')
-      if (epayInput.key !== undefined) { const key = text(epayInput, 'key'); if (key !== '***') configured = key.length > 0 }
+      if (epayInput.key !== undefined) { const key = text(epayInput, 'key'); if (key && key !== '***') configured = true }
       if (epayInput.types !== undefined) {
         const types = epayInput.types
         if (!Array.isArray(types) || !types.every((value: unknown): value is string => typeof value === 'string')) fail(422, 'invalid_types', '支付类型必须是文本数组。')
         epay.types = [...types]
       }
     }
+  }
+  if (updated.payment.active === 'epay' && (!updated.payment.epay.gateway_url || !updated.payment.epay.pid || !configured || !updated.payment.epay.types.length)) fail(422, 'invalid_settings', '请完整填写易支付配置。')
+  if (updated.payment.active === 'epay') {
+    let url: URL
+    try { url = new URL(updated.payment.epay.gateway_url) } catch { return fail(422, 'invalid_settings', '请输入有效的易支付网关地址。') }
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) fail(422, 'invalid_settings', '易支付网关地址格式无效。')
+  }
+  if (updated.payment.active === 'manual' && !updated.payment.manual.instructions.trim()) fail(422, 'invalid_settings', '请填写人工转账说明。')
+  if (updated.payment.active === 'alipay_f2f') {
+    const alipay = updated.payment.alipay_f2f
+    if (!/^\d+$/.test(alipay.app_id)) fail(422, 'invalid_settings', '请填写有效的支付宝当面付 AppID。')
+    if (!alipay.private_key) fail(422, 'invalid_settings', '请填写支付宝当面付应用私钥。')
+    if (!alipay.alipay_public_key) fail(422, 'invalid_settings', '请填写支付宝当面付支付宝公钥。')
   }
   settings = updated; epayKeyConfigured = configured
 }
@@ -906,7 +932,7 @@ function adminRequest(path: string, method: string, query: URLSearchParams, inpu
 function paymentRequest(path: string, method: string, query: URLSearchParams, input: Input): Response | undefined {
   const match = /^\/payments\/([^/]+)\/(notify|return)$/.exec(path)
   if (!match || (match[2] === 'notify' ? !['GET', 'POST'].includes(method) : method !== 'GET')) return undefined
-  if (!['mock', 'manual', 'epay'].includes(match[1])) fail(404, 'not_found', '支付提供方不存在。')
+  if (!['mock', 'manual', 'epay', 'alipay_f2f'].includes(match[1])) fail(404, 'not_found', '支付提供方不存在。')
   const orderNo = query.get('order_no') || query.get('out_trade_no') || (typeof input.order_no === 'string' ? input.order_no : typeof input.out_trade_no === 'string' ? input.out_trade_no : '')
   if (match[2] === 'return') {
     const order = orders.find(item => item.value.order_no === orderNo && item.value.provider === match[1])
@@ -1100,6 +1126,12 @@ async function adminUserRequest(path: string, method: string, query: URLSearchPa
   return undefined
 }
 
+const mockKit: MockKit = {
+  ok, fail: (status, code, message) => fail(status, code, message), currentUser,
+  optionalUser: () => users.find(item => item.id === sessionUserId && item.status !== 'disabled') ?? null,
+  users: () => users, iso,
+}
+
 export async function mockRequest(path: string, method: string, body?: unknown): Promise<Response> {
   try {
     await seedPasswords
@@ -1112,6 +1144,10 @@ export async function mockRequest(path: string, method: string, body?: unknown):
     if (normalized === '/public/products' && verb === 'GET') return ok({ items: [...products].filter(product => product.enabled).sort((a, b) => a.sort_order - b.sort_order).map(productView) })
     const payment = paymentRequest(normalized, verb, url.searchParams, input)
     if (payment) return payment
+    // Feature modules own their demo routes (mock-kit.ts). Reservations come
+    // first: their public route works signed out.
+    const feature = (await reservationMock(normalized, verb, url.searchParams, input, mockKit)) ?? (await ticketMock(normalized, verb, url.searchParams, input, mockKit))
+    if (feature) return feature
     if (normalized.startsWith('/auth/')) {
       const response = await authRequest(normalized, verb, input)
       return response ?? fail(404, 'not_found', '此演示接口不存在。')

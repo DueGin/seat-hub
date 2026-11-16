@@ -15,6 +15,7 @@ type ServiceOptions struct {
 	Providers map[string]Provider
 	Dev       bool
 	Now       func() time.Time
+	Active    string
 }
 
 type Service struct {
@@ -24,6 +25,8 @@ type Service struct {
 	dev       bool
 	now       func() time.Time
 	mu        sync.Mutex
+	active    string
+	queries   map[string]time.Time
 }
 
 func NewService(db *sql.DB, marker PaidMarker, opts ServiceOptions) (*Service, error) {
@@ -32,7 +35,7 @@ func NewService(db *sql.DB, marker PaidMarker, opts ServiceOptions) (*Service, e
 	}
 	providers := make(map[string]Provider, len(opts.Providers))
 	for name, provider := range opts.Providers {
-		if name != "epay" && name != "manual" && name != "mock" {
+		if name != "epay" && name != "alipay_f2f" && name != "manual" && name != "mock" {
 			return nil, fmt.Errorf("unknown provider %q: %w", name, ErrProviderUnavailable)
 		}
 		if provider == nil || (name == "mock" && !opts.Dev) {
@@ -44,12 +47,12 @@ func NewService(db *sql.DB, marker PaidMarker, opts ServiceOptions) (*Service, e
 	if now == nil {
 		now = time.Now
 	}
-	return &Service{db: db, marker: marker, providers: providers, dev: opts.Dev, now: now}, nil
+	return &Service{db: db, marker: marker, providers: providers, dev: opts.Dev, now: now, active: opts.Active, queries: make(map[string]time.Time)}, nil
 }
 
 func (s *Service) Create(ctx context.Context, provider string, req CreateRequest) (Payment, error) {
 	p, ok := s.providers[provider]
-	if !ok {
+	if !ok || (s.active != "" && provider != s.active && !(provider == "mock" && s.dev)) {
 		return Payment{}, ErrProviderUnavailable
 	}
 	if err := validateCreate(req); err != nil {
@@ -68,7 +71,56 @@ func (s *Service) Create(ctx context.Context, provider string, req CreateRequest
 	if err := s.payable(order); err != nil {
 		return Payment{}, err
 	}
+	req.ExpiresAt, err = time.Parse(time.RFC3339, order.expires)
+	if err != nil {
+		return Payment{}, fmt.Errorf("parse payment expiry: %w", err)
+	}
 	return p.Create(ctx, req)
+}
+
+// QueryPending throttles even failed queries, while settlement shares the notify lock.
+func (s *Service) QueryPending(ctx context.Context, orderNo string) error {
+	order, err := s.findOrder(ctx, orderNo)
+	if err != nil {
+		return err
+	}
+	if order.status != "pending" {
+		return nil
+	}
+	querier, ok := s.providers[order.provider].(Querier)
+	if !ok {
+		return nil
+	}
+	s.mu.Lock()
+	now := s.now()
+	if last, ok := s.queries[orderNo]; ok && now.Sub(last) < 5*time.Second {
+		s.mu.Unlock()
+		return nil
+	}
+	for key, last := range s.queries {
+		if now.Sub(last) > time.Hour {
+			delete(s.queries, key)
+		}
+	}
+	s.queries[orderNo] = now
+	s.mu.Unlock()
+	notice, err := querier.Query(ctx, orderNo)
+	if err != nil {
+		return err
+	}
+	if !notice.verified || notice.OrderNo != orderNo {
+		return ErrInvalidNotice
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.apply(ctx, order.provider, notice)
+}
+
+func (s *Service) Close(ctx context.Context, provider, orderNo string) error {
+	if closer, ok := s.providers[provider].(Closer); ok {
+		return closer.Close(ctx, orderNo)
+	}
+	return nil
 }
 
 // Notify is the public callback entry point. A nil error must be acknowledged

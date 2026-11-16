@@ -4,7 +4,7 @@ import type { NormalizedSettings } from '@/lib/types'
 import { normalizeSettings, validateSettings } from './settings-validation.ts'
 
 function settings(): NormalizedSettings {
-  return { site_name: '测试站点', registration_open: true, base_concurrency: 1, concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0, hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0, selfcheck_require_dedicated_proxy: true, selfcheck_require_timezone_match: true, selfcheck_max_rebuilds: 3, selfcheck_recheck_minutes: 30, hosted_vm_template: {}, payment: { epay: { enabled: false, gateway_url: '', pid: '', key: '', types: [] }, manual: { enabled: false, instructions: '' } } }
+  return { site_name: '测试站点', registration_open: true, base_concurrency: 1, concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0, hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0, selfcheck_require_dedicated_proxy: true, selfcheck_require_timezone_match: true, selfcheck_max_rebuilds: 3, selfcheck_recheck_minutes: 30, hosted_vm_template: {}, payment: { active: 'manual', alipay_f2f: { app_id: '', private_key: '', alipay_public_key: '', sandbox: false }, epay: { enabled: false, gateway_url: '', pid: '', key: '', types: [] }, manual: { enabled: true, instructions: '转账后请联系管理员确认收款。' } } }
 }
 
 test('保留所有设置字段并解析模板及支付方式', () => {
@@ -38,12 +38,12 @@ test('权益与时间设置拒绝负数、小数、NaN 与不安全整数', () =
 test('站点名称和人工转账说明不能为空', () => {
   const draft = settings(); draft.site_name = ' '
   assert.throws(() => validateSettings(draft, '{}', '[]'), /站点名称/)
-  draft.site_name = '测试站点'; draft.payment.manual.enabled = true
+  draft.site_name = '测试站点'; draft.payment.manual.instructions = ''
   assert.throws(() => validateSettings(draft, '{}', '[]'), /转账说明/)
 })
 
 test('在线支付启用前必须完整配置且不能伪造已有密钥', () => {
-  const draft = settings(); draft.payment.epay.enabled = true
+  const draft = settings(); draft.payment.active = 'epay'; draft.payment.epay.enabled = true
   assert.throws(() => validateSettings(draft, '{}', '[]'), /启用在线支付前/)
   Object.assign(draft.payment.epay, { gateway_url: 'https://pay.example.com/', pid: '1001', key: '***' })
   assert.throws(() => validateSettings(draft, '{}', '["alipay"]'), /支付密钥/)
@@ -51,7 +51,7 @@ test('在线支付启用前必须完整配置且不能伪造已有密钥', () =>
 
 test('已有密钥的 *** 和留空均保持原值语义，不覆盖其他支付字段', () => {
   for (const key of ['***', '']) {
-    const draft = settings()
+    const draft = settings(); draft.payment.active = 'epay'
     draft.payment.epay = { enabled: true, gateway_url: 'https://pay.example.com/', pid: '1001', key, types: ['alipay'] }
     const result = validateSettings(draft, '{}', '["alipay"]', true)
     assert.equal(result.payment.epay.key, key)
@@ -60,14 +60,14 @@ test('已有密钥的 *** 和留空均保持原值语义，不覆盖其他支付
 })
 
 test('新密钥按输入提交，不把掩码当作真实密钥', () => {
-  const draft = settings()
+  const draft = settings(); draft.payment.active = 'epay'
   draft.payment.epay = { enabled: true, gateway_url: 'https://pay.example.com/', pid: '1001', key: 'new-secret', types: ['alipay'] }
   assert.equal(validateSettings(draft, '{}', '["alipay"]').payment.epay.key, 'new-secret')
 })
 
 test('支付网关拒绝非 HTTP 协议和带凭证 URL', () => {
   for (const gateway_url of ['not-a-url', 'javascript:alert(1)', 'ftp://example.com/', 'https://admin:secret@example.com/']) {
-    const draft = settings(); draft.payment.epay.gateway_url = gateway_url
+    const draft = settings(); draft.payment.active = 'epay'; draft.payment.epay.gateway_url = gateway_url
     assert.throws(() => validateSettings(draft, '{}', '[]'), /网关/)
   }
 })
@@ -76,14 +76,14 @@ test('payment 缺失、为空对象或只有一个支付方时也能渲染与校
   const fresh = { site_name: '全新部署', registration_open: true } as unknown as Parameters<typeof normalizeSettings>[0]
   const normalized = normalizeSettings(fresh)
   assert.deepEqual(normalized.payment.epay, { enabled: false, gateway_url: '', pid: '', key: '', types: ['alipay', 'wxpay'] })
-  assert.deepEqual(normalized.payment.manual, { enabled: false, instructions: '' })
+  assert.deepEqual(normalized.payment.manual, { enabled: true, instructions: '转账后请联系管理员确认收款。' })
   assert.equal(normalized.base_concurrency, 1)
   assert.deepEqual(normalizeSettings({ payment: {} }).payment.epay.types, ['alipay', 'wxpay'])
   const partial = normalizeSettings({ payment: { epay: { enabled: true } } })
   assert.equal(partial.payment.epay.enabled, true)
-  assert.equal(partial.payment.manual.enabled, false)
+  assert.equal(partial.payment.manual.enabled, true)
   const result = validateSettings({ site_name: '全新部署', hosted_vm_template: {}, base_concurrency: 1, concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0, hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0 } as never, '{}', '[]')
-  assert.deepEqual(result.payment.manual, { enabled: false, instructions: '' })
+  assert.deepEqual(result.payment.manual, { enabled: true, instructions: '转账后请联系管理员确认收款。' })
   assert.equal(result.selfcheck_require_dedicated_proxy, true)
   assert.equal(result.selfcheck_require_timezone_match, true)
   assert.equal(result.selfcheck_max_rebuilds, 3)
@@ -101,4 +101,36 @@ test('自检设置校验重建次数与复检间隔边界', () => {
   }
   const boundary = settings(); boundary.selfcheck_max_rebuilds = 0; boundary.selfcheck_recheck_minutes = 1440
   assert.equal(validateSettings(boundary, '{}', '[]').selfcheck_max_rebuilds, 0)
+})
+
+
+test('旧配置迁移只选择已启用且完整的易支付，否则选择人工转账', () => {
+  assert.equal(normalizeSettings({ payment: { epay: { enabled: true } } }).payment.active, 'manual')
+  assert.equal(normalizeSettings({ payment: { epay: { enabled: true, gateway_url: 'https://pay.example.com', pid: '1001', key: '***' } } }).payment.active, 'epay')
+  assert.equal(normalizeSettings({ payment: { active: 'manual', epay: { enabled: true, gateway_url: 'https://pay.example.com', pid: '1001', key: '***' } } }).payment.active, 'manual')
+})
+
+test('仅当前收款方式必须完整，切换保留其他方式的配置', () => {
+  const draft = settings()
+  draft.payment.epay = { enabled: true, gateway_url: 'invalid', pid: '', key: '', types: [] }
+  draft.payment.alipay_f2f = { app_id: '', private_key: '', alipay_public_key: '', sandbox: true }
+  const result = validateSettings(draft, '{}', '[]')
+  assert.equal(result.payment.active, 'manual')
+  assert.equal(result.payment.epay.gateway_url, 'invalid')
+  assert.equal(result.payment.alipay_f2f.sandbox, true)
+})
+
+test('当面付校验 AppID、应用私钥和支付宝公钥，已有私钥支持掩码和留空', () => {
+  const draft = settings(); draft.payment.active = 'alipay_f2f'
+  assert.throws(() => validateSettings(draft, '{}', '[]'), /AppID/)
+  draft.payment.alipay_f2f.app_id = '202611160001'
+  assert.throws(() => validateSettings(draft, '{}', '[]'), /应用私钥/)
+  draft.payment.alipay_f2f.private_key = '***'
+  assert.throws(() => validateSettings(draft, '{}', '[]'), /应用私钥/)
+  assert.throws(() => validateSettings(draft, '{}', '[]', false, true), /支付宝公钥/)
+  draft.payment.alipay_f2f.alipay_public_key = 'public-key'
+  for (const private_key of ['***', '']) {
+    draft.payment.alipay_f2f.private_key = private_key
+    assert.equal(validateSettings(draft, '{}', '[]', false, true).payment.alipay_f2f.private_key, private_key)
+  }
 })

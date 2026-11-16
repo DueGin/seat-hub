@@ -27,6 +27,7 @@ const (
 
 var (
 	ErrNotFound            = errors.New("order not found")
+	ErrReservationOnly     = errors.New("product reservation only")
 	ErrProductUnavailable  = errors.New("product unavailable")
 	ErrInvalidQuantity     = errors.New("invalid quantity")
 	ErrRenewMismatch       = errors.New("renew mismatch")
@@ -87,9 +88,10 @@ type CreateRequest struct {
 }
 
 type Service struct {
-	db        *sql.DB
-	catalog   Catalog
-	fulfiller Fulfiller
+	db           *sql.DB
+	catalog      Catalog
+	fulfiller    Fulfiller
+	closePayment func(context.Context, string, string) error
 }
 
 func New(db *sql.DB, products Catalog, fulfiller Fulfiller) *Service {
@@ -97,6 +99,10 @@ func New(db *sql.DB, products Catalog, fulfiller Fulfiller) *Service {
 }
 
 func (service *Service) SetFulfiller(fulfiller Fulfiller) { service.fulfiller = fulfiller }
+
+func (service *Service) SetPaymentCloser(closePayment func(context.Context, string, string) error) {
+	service.closePayment = closePayment
+}
 
 const columns = `id, order_no, user_id, product_id, product_snapshot, kind, quantity, units, duration_days, amount_cents, currency, provider, provider_trade_no, status, renew_subscription_id, fulfil_error, created_at, expires_at, paid_at, fulfilled_at, updated_at`
 
@@ -151,7 +157,7 @@ func (service *Service) Create(ctx context.Context, request CreateRequest) (Orde
 	if request.UserID <= 0 {
 		return Order{}, ErrInvalidUser
 	}
-	if request.Provider != "epay" && request.Provider != "manual" && request.Provider != "mock" {
+	if request.Provider != "epay" && request.Provider != "alipay_f2f" && request.Provider != "manual" && request.Provider != "mock" {
 		return Order{}, ErrProviderUnavailable
 	}
 	product, err := service.catalog.Get(ctx, request.ProductID)
@@ -163,6 +169,9 @@ func (service *Service) Create(ctx context.Context, request CreateRequest) (Orde
 	}
 	if !product.Enabled {
 		return Order{}, ErrProductUnavailable
+	}
+	if product.ReservationOnly {
+		return Order{}, ErrReservationOnly
 	}
 	if err := product.Validate(); err != nil {
 		return Order{}, fmt.Errorf("validate product: %w", err)
@@ -405,7 +414,13 @@ func (service *Service) Cancel(ctx context.Context, userID int64, orderNo string
 	if err != nil {
 		return fmt.Errorf("cancel order: %w", err)
 	}
-	return service.requireChanged(ctx, result, purchase.ID, StatusCancelled)
+	if err := service.requireChanged(ctx, result, purchase.ID, StatusCancelled); err != nil {
+		return err
+	}
+	if service.closePayment != nil {
+		_ = service.closePayment(ctx, purchase.Provider, purchase.OrderNo)
+	}
+	return nil
 }
 
 func (service *Service) requireChanged(ctx context.Context, result sql.Result, orderID int64, idempotentStatus string) error {
@@ -449,6 +464,26 @@ func (service *Service) requireChangedTx(ctx context.Context, tx *sql.Tx, result
 
 func (service *Service) ExpireStale(ctx context.Context) (int64, error) {
 	now := time.Now().UTC().Format(time.RFC3339)
+	var stale []Order
+	if service.closePayment != nil {
+		rows, err := service.db.QueryContext(ctx, `SELECT `+columns+` FROM orders WHERE status = 'pending' AND julianday(expires_at) <= julianday(?)`, now)
+		if err != nil {
+			return 0, fmt.Errorf("list expiring orders: %w", err)
+		}
+		for rows.Next() {
+			purchase, err := scanOrder(rows)
+			if err != nil {
+				rows.Close()
+				return 0, err
+			}
+			stale = append(stale, purchase)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("read expiring orders: %w", err)
+		}
+		rows.Close()
+	}
 	result, err := service.db.ExecContext(ctx, `UPDATE orders SET status = 'expired', updated_at = ? WHERE status = 'pending' AND julianday(expires_at) <= julianday(?)`, now, now)
 	if err != nil {
 		return 0, fmt.Errorf("expire unpaid orders: %w", err)
@@ -456,6 +491,12 @@ func (service *Service) ExpireStale(ctx context.Context) (int64, error) {
 	count, err := result.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("count expired orders: %w", err)
+	}
+	for _, purchase := range stale {
+		current, err := service.Get(ctx, purchase.ID)
+		if err == nil && current.Status == StatusExpired {
+			_ = service.closePayment(ctx, purchase.Provider, purchase.OrderNo)
+		}
 	}
 	return count, nil
 }

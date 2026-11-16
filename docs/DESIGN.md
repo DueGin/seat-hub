@@ -106,7 +106,8 @@ active ──凭证失效（vm2api 不可调度 oauth_*）──▶ needs_reauth
 商品页点「购买」→ 建订单 → 跳支付 → 回调/轮询到 `paid` → `provision` 履约 → `fulfilled`。
 
 - 支付提供方插件接口：`Create(order) → {type: redirect|qrcode|manual, url, qr, instructions}`；`Notify(req) → {order_no, trade_no, amount_cents, paid}`，验签 + 金额校验 + 幂等。
-- 内置：`epay`（易支付 v1：`submit.php` 跳转、MD5 签名、异步通知 `notify_url` 回 `success`）、`manual`（展示后台配置的收款说明，管理员在后台「标记已支付」）、`mock`（仅 `PORTAL_DEV=1`，下单即可点「模拟支付」）。
+- 内置：`epay`（易支付 v1：`submit.php` 跳转、MD5 签名、异步通知 `notify_url` 回 `success`）、`alipay_f2f`（支付宝当面付：`alipay.trade.precreate` 出二维码、RSA2 公钥模式验签、`alipay.trade.query` 查单兜底、取消或过期时 `alipay.trade.close`）、`manual`（展示后台配置的收款说明，管理员在后台「标记已支付」）、`mock`（仅 `PORTAL_DEV=1`，下单即可点「模拟支付」）。
+- 收款方式单选：`payment.active` 决定下单页提供哪一种；所有配置完整的方式都继续接收回调，保证切换前的未付订单还能到账。
 - 订单状态：`pending → paid → fulfilled`；`pending → cancelled | expired`（30 分钟未支付）；`paid → fulfill_failed`（后台「重新履约」可重试）。
 - 「30 分钟」只是**发起支付**的窗口，不是**入账**的门槛：易支付回调延迟、人工转账晚到，只要订单仍是 `pending`（含已过期 `pending`）都能入账；管理员也可对 `expired` 订单人工确认收款补单。
 - `paid → fulfilled` 由持久任务 `fulfil_order:<订单ID>` 完成（dedupe 保证不重复履约），任务用独立 context 执行：支付回调断开或进程重启不会留下「已付款永不履约」的订单。

@@ -137,7 +137,7 @@ export function OrderDetailPage() {
   const canMockPay = configQuery.data?.dev === true && order?.provider === 'mock' && order?.status === 'pending'
   const redirectUrl = safeExternalUrl(payment?.url)
   const providerName = configQuery.data?.payment_providers.find((provider) => provider.id === order?.provider)?.name
-    ?? (order?.provider === 'mock' ? '模拟支付' : order?.provider === 'manual' ? '人工转账' : order?.provider === 'grant' ? '管理员赠送' : '在线支付')
+    ?? (order?.provider === 'mock' ? '模拟支付' : order?.provider === 'alipay_f2f' ? '支付宝当面付' : order?.provider === 'manual' ? '人工转账' : order?.provider === 'grant' ? '管理员赠送' : '在线支付')
 
   if (!orderNo) return <Card><EmptyState title="缺少订单号" description="请从订单列表重新进入订单详情。" action={<Link className="button button-primary" to="/orders">返回订单列表</Link>} /></Card>
 
@@ -182,7 +182,7 @@ export function OrderDetailPage() {
 
             {payment?.type === 'redirect' && (redirectUrl ? <div className="stack"><p className="muted">在支付平台完成付款后，返回本页即可查看开通进度。</p><a className="button button-primary" href={redirectUrl} target="_blank" rel="noopener noreferrer">打开支付页面<ArrowUpRight size={16} /></a>{payment.instructions && <p style={{ whiteSpace: 'pre-wrap' }}>{payment.instructions}</p>}</div> : <Notice>支付链接缺失或无效，请联系管理员并提供订单号，或查看原支付窗口。</Notice>)}
 
-            {payment?.type === 'qrcode' && (payment.qr?.trim() ? <div className="stack"><p>请使用对应支付应用扫描二维码。</p><div className="row"><QRCodeSVG value={payment.qr} size={208} marginSize={4} level="M" title="订单支付二维码" style={{ maxWidth: '100%', height: 'auto' }} /></div>{payment.instructions && <p style={{ whiteSpace: 'pre-wrap' }}>{payment.instructions}</p>}<p className="muted">付款后请等待状态同步，二维码仍显示不代表需要再次支付。</p></div> : <Notice>支付二维码暂不可用，请查看原支付窗口或联系管理员。</Notice>)}
+            {payment?.type === 'qrcode' && (payment.qr?.trim() ? <div className="stack"><p>{order.provider === 'alipay_f2f' ? '请使用支付宝扫码支付' : '请使用对应支付应用扫描二维码。'}</p><div className="row"><QRCodeSVG value={payment.qr} size={208} marginSize={4} level="M" title="订单支付二维码" style={{ maxWidth: '100%', height: 'auto' }} /></div>{payment.instructions && <p style={{ whiteSpace: 'pre-wrap' }}>{payment.instructions}</p>}<p className="muted">付款后请等待状态同步，二维码仍显示不代表需要再次支付。</p></div> : <Notice>支付二维码暂不可用，请查看原支付窗口或联系管理员。</Notice>)}
 
             {payment?.type === 'manual' && <div className="stack">{payment.instructions?.trim() ? <><h3>转账说明</h3><p style={{ whiteSpace: 'pre-wrap' }}>{payment.instructions}</p><CopyButton value={payment.instructions} label="复制转账说明" /></> : <Notice>此订单使用人工转账，当前没有转账说明。请联系管理员确认收款信息后付款。</Notice>}<p className="muted">转账后请向管理员提供订单号和付款凭证。管理员确认收款后，页面会自动更新。</p></div>}
 

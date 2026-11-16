@@ -202,25 +202,36 @@ type UserRecords struct {
 	Orders        int64 `json:"orders"`
 	Subscriptions int64 `json:"subscriptions"`
 	Resources     int64 `json:"resources"`
+	// Tickets counts tickets the user opened, ticket messages they wrote
+	// (admin replies included) and files they uploaded: support history is
+	// kept, so such a user is disabled rather than deleted.
+	Tickets int64 `json:"tickets"`
 }
 
 func (records UserRecords) Any() bool {
-	return records.Orders > 0 || records.Subscriptions > 0 || records.Resources > 0
+	return records.Orders > 0 || records.Subscriptions > 0 || records.Resources > 0 || records.Tickets > 0
 }
+
+// userRecordsQuery counts every row that blocks deleting user ? (the id is
+// bound six times).
+const userRecordsQuery = `SELECT
+		(SELECT COUNT(1) FROM orders WHERE user_id = ?),
+		(SELECT COUNT(1) FROM subscriptions WHERE user_id = ?),
+		(SELECT COUNT(1) FROM resources WHERE user_id = ?),
+		(SELECT COUNT(1) FROM tickets WHERE user_id = ?)
+		+ (SELECT COUNT(1) FROM ticket_messages WHERE author_id = ?)
+		+ (SELECT COUNT(1) FROM ticket_attachments WHERE uploader_id = ?)`
 
 func (r *Users) Records(ctx context.Context, id int64) (UserRecords, error) {
 	var out UserRecords
-	err := r.db.QueryRowContext(ctx, `SELECT
-		(SELECT COUNT(1) FROM orders WHERE user_id = ?),
-		(SELECT COUNT(1) FROM subscriptions WHERE user_id = ?),
-		(SELECT COUNT(1) FROM resources WHERE user_id = ?)`, id, id, id).Scan(&out.Orders, &out.Subscriptions, &out.Resources)
+	err := r.db.QueryRowContext(ctx, userRecordsQuery, id, id, id, id, id, id).Scan(&out.Orders, &out.Subscriptions, &out.Resources, &out.Tickets)
 	if err != nil {
 		return out, fmt.Errorf("count user records: %w", err)
 	}
 	return out, nil
 }
 
-// ErrUserHasRecords blocks deleting a user with orders, subscriptions or resources.
+// ErrUserHasRecords blocks deleting a user with orders, subscriptions, resources or ticket history.
 var ErrUserHasRecords = errors.New("user has business records")
 
 // Delete removes a user with no business records, with its API key rows and
@@ -232,10 +243,7 @@ func (r *Users) Delete(ctx context.Context, id int64) error {
 	}
 	defer tx.Rollback()
 	var records UserRecords
-	if err := tx.QueryRowContext(ctx, `SELECT
-		(SELECT COUNT(1) FROM orders WHERE user_id = ?),
-		(SELECT COUNT(1) FROM subscriptions WHERE user_id = ?),
-		(SELECT COUNT(1) FROM resources WHERE user_id = ?)`, id, id, id).Scan(&records.Orders, &records.Subscriptions, &records.Resources); err != nil {
+	if err := tx.QueryRowContext(ctx, userRecordsQuery, id, id, id, id, id, id).Scan(&records.Orders, &records.Subscriptions, &records.Resources, &records.Tickets); err != nil {
 		return fmt.Errorf("count user records: %w", err)
 	}
 	if records.Any() {

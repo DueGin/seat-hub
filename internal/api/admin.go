@@ -72,7 +72,7 @@ func (s *Server) handleAdminPatchProduct(w http.ResponseWriter, r *http.Request)
 		Badge: product.Badge, UnitQuantity: product.UnitQuantity,
 		DurationDays: product.DurationDays, PriceCents: product.PriceCents,
 		Currency: product.Currency, MinQty: product.MinQty, MaxQty: product.MaxQty,
-		Enabled: &product.Enabled, SortOrder: product.SortOrder,
+		Enabled: &product.Enabled, SortOrder: product.SortOrder, ReservationOnly: &product.ReservationOnly,
 	}
 	if err := readJSON(r, &body); err != nil {
 		s.fail(w, r, err)
@@ -638,24 +638,36 @@ func adminPageEnvelope[Item any](items []Item, total int64, page, size int) map[
 	return map[string]any{"items": items, "total": total, "page": page, "page_size": size}
 }
 
-func adminPaymentFields(raw json.RawMessage) (map[string]map[string]json.RawMessage, error) {
-	providers := map[string]map[string]json.RawMessage{}
+func adminPaymentFields(raw json.RawMessage) (map[string]json.RawMessage, error) {
+	doc := map[string]json.RawMessage{}
 	if len(raw) == 0 {
-		return providers, nil
+		return doc, nil
 	}
-	if err := json.Unmarshal(raw, &providers); err != nil || providers == nil {
-		return nil, bad("invalid_settings", "payment 必须是支付提供方配置对象")
+	if err := json.Unmarshal(raw, &doc); err != nil || doc == nil {
+		return nil, bad("invalid_settings", "payment 必须是收款方式配置对象")
 	}
-	for _, fields := range providers {
-		if fields == nil {
-			return nil, bad("invalid_settings", "支付提供方配置必须是 JSON 对象")
+	for name, value := range doc {
+		if name == "active" {
+			var active string
+			if json.Unmarshal(value, &active) != nil || (active != "epay" && active != "alipay_f2f" && active != "manual") {
+				return nil, bad("invalid_settings", "请选择有效的收款方式")
+			}
+			continue
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal(value, &fields) != nil || fields == nil {
+			return nil, bad("invalid_settings", "收款方式配置必须是 JSON 对象")
 		}
 	}
-	return providers, nil
+	return doc, nil
+}
+
+func paymentSecret(provider, name string) bool {
+	return provider == "epay" && name == "key" || provider == "alipay_f2f" && name == "private_key"
 }
 
 func adminMergePayment(previous, patch json.RawMessage) (json.RawMessage, error) {
-	providers, err := adminPaymentFields(previous)
+	doc, err := adminPaymentFields(previous)
 	if err != nil {
 		return nil, fmt.Errorf("decode stored payment settings: %w", err)
 	}
@@ -663,27 +675,35 @@ func adminMergePayment(previous, patch json.RawMessage) (json.RawMessage, error)
 	if err != nil {
 		return nil, err
 	}
-	for provider, fields := range updates {
-		if providers[provider] == nil {
-			providers[provider] = map[string]json.RawMessage{}
+	for provider, raw := range updates {
+		if provider == "active" {
+			doc[provider] = raw
+			continue
 		}
-		for name, value := range fields {
-			if name == "key" {
+		fields := map[string]json.RawMessage{}
+		if old := doc[provider]; len(old) > 0 {
+			_ = json.Unmarshal(old, &fields)
+		}
+		var incoming map[string]json.RawMessage
+		_ = json.Unmarshal(raw, &incoming)
+		for name, value := range incoming {
+			if paymentSecret(provider, name) {
 				var secret *string
-				if err := json.Unmarshal(value, &secret); err != nil || secret == nil {
+				if json.Unmarshal(value, &secret) != nil || secret == nil {
 					return nil, bad("invalid_settings", "支付密钥必须是字符串")
 				}
 				if *secret == "" || *secret == "***" {
-					if _, exists := providers[provider][name]; !exists {
-						providers[provider][name] = json.RawMessage(`""`)
-					}
 					continue
 				}
 			}
-			providers[provider][name] = value
+			fields[name] = value
+		}
+		doc[provider], err = json.Marshal(fields)
+		if err != nil {
+			return nil, fmt.Errorf("encode payment provider settings: %w", err)
 		}
 	}
-	merged, err := json.Marshal(providers)
+	merged, err := json.Marshal(doc)
 	if err != nil {
 		return nil, fmt.Errorf("encode payment settings: %w", err)
 	}
@@ -691,24 +711,34 @@ func adminMergePayment(previous, patch json.RawMessage) (json.RawMessage, error)
 }
 
 func adminMaskPayment(raw json.RawMessage) (json.RawMessage, error) {
-	providers, err := adminPaymentFields(raw)
+	doc, err := adminPaymentFields(raw)
 	if err != nil {
 		return nil, err
 	}
-	for _, fields := range providers {
-		value, exists := fields["key"]
-		if !exists {
+	for provider, raw := range doc {
+		if provider == "active" {
 			continue
 		}
-		var secret *string
-		if err := json.Unmarshal(value, &secret); err != nil || secret == nil {
-			return nil, bad("invalid_settings", "支付密钥必须是字符串")
+		var fields map[string]json.RawMessage
+		_ = json.Unmarshal(raw, &fields)
+		for name, value := range fields {
+			if !paymentSecret(provider, name) {
+				continue
+			}
+			var secret *string
+			if json.Unmarshal(value, &secret) != nil || secret == nil {
+				return nil, bad("invalid_settings", "支付密钥必须是字符串")
+			}
+			if *secret != "" {
+				fields[name] = json.RawMessage(`"***"`)
+			}
 		}
-		if *secret != "" {
-			fields["key"] = json.RawMessage(`"***"`)
+		doc[provider], err = json.Marshal(fields)
+		if err != nil {
+			return nil, fmt.Errorf("encode masked provider settings: %w", err)
 		}
 	}
-	masked, err := json.Marshal(providers)
+	masked, err := json.Marshal(doc)
 	if err != nil {
 		return nil, fmt.Errorf("encode masked payment settings: %w", err)
 	}
