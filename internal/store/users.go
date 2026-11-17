@@ -44,8 +44,22 @@ func scanUser(row interface{ Scan(...any) error }) (User, error) {
 }
 
 func (r *Users) Create(ctx context.Context, email, passwordHash, role string) (User, error) {
+	return createUser(ctx, r.db.DB, email, passwordHash, role)
+}
+
+// CreateTx inserts a user inside the caller transaction.
+func (r *Users) CreateTx(ctx context.Context, tx *sql.Tx, email, passwordHash, role string) (User, error) {
+	return createUser(ctx, tx, email, passwordHash, role)
+}
+
+type userWriter interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func createUser(ctx context.Context, q userWriter, email, passwordHash, role string) (User, error) {
 	now := Now()
-	res, err := r.db.ExecContext(ctx, `INSERT INTO users (email, password_hash, role, status, created_at, updated_at)
+	res, err := q.ExecContext(ctx, `INSERT INTO users (email, password_hash, role, status, created_at, updated_at)
 		VALUES (?, ?, ?, 'active', ?, ?)`, strings.ToLower(strings.TrimSpace(email)), passwordHash, role, now, now)
 	if err != nil {
 		if strings.Contains(err.Error(), "UNIQUE") {
@@ -54,7 +68,7 @@ func (r *Users) Create(ctx context.Context, email, passwordHash, role string) (U
 		return User{}, fmt.Errorf("create user: %w", err)
 	}
 	id, _ := res.LastInsertId()
-	return r.GetByID(ctx, id)
+	return scanUser(q.QueryRowContext(ctx, `SELECT `+userColumns+` FROM users WHERE id = ?`, id))
 }
 
 var ErrEmailTaken = errors.New("email already registered")

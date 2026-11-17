@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/DueGin/seat-hub/internal/signup"
 	"net/http"
 	"strconv"
 	"strings"
@@ -579,6 +580,11 @@ func (s *Server) handleAdminPutSettings(w http.ResponseWriter, r *http.Request) 
 	settings.Payment, err = adminMergePayment(previousPayment, settings.Payment)
 	if err != nil {
 		s.fail(w, r, err)
+		return
+	}
+	settings.RegisterEmailWhitelist, err = signup.NormalizeWhitelist(settings.RegisterEmailWhitelist)
+	if err != nil {
+		writeErr(w, 422, "invalid_settings", err.Error())
 		return
 	}
 	masked := settings

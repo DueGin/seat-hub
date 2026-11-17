@@ -9,16 +9,18 @@ import (
 // Every package that needs these numbers reads them through Site.Load so the
 // defaults and the JSON shape live in exactly one place.
 type Site struct {
-	SiteName                 string          `json:"site_name"`
-	RegistrationOpen         bool            `json:"registration_open"`
-	BaseConcurrency          int             `json:"base_concurrency"`
-	ConcurrencyPerHostedSeat int             `json:"concurrency_per_hosted_seat"`
-	ConcurrencyPerRental     int             `json:"concurrency_per_rental_account"`
-	HostedGraceHours         int             `json:"hosted_grace_hours"`
-	RentalGraceHours         int             `json:"rental_grace_hours"`
-	GatewayQueueTimeoutMS    int             `json:"gateway_queue_timeout_ms"`
-	HostedVMTemplate         json.RawMessage `json:"hosted_vm_template"`
-	Payment                  json.RawMessage `json:"payment"`
+	SiteName                  string          `json:"site_name"`
+	RegisterEmailVerification bool            `json:"register_email_verification"`
+	RegisterEmailWhitelist    []string        `json:"register_email_whitelist"`
+	RegistrationOpen          bool            `json:"registration_open"`
+	BaseConcurrency           int             `json:"base_concurrency"`
+	ConcurrencyPerHostedSeat  int             `json:"concurrency_per_hosted_seat"`
+	ConcurrencyPerRental      int             `json:"concurrency_per_rental_account"`
+	HostedGraceHours          int             `json:"hosted_grace_hours"`
+	RentalGraceHours          int             `json:"rental_grace_hours"`
+	GatewayQueueTimeoutMS     int             `json:"gateway_queue_timeout_ms"`
+	HostedVMTemplate          json.RawMessage `json:"hosted_vm_template"`
+	Payment                   json.RawMessage `json:"payment"`
 
 	// Slot self-check (see docs/SELFCHECK.md).
 	SelfcheckRequireDedicatedProxy bool `json:"selfcheck_require_dedicated_proxy"`
@@ -29,13 +31,14 @@ type Site struct {
 
 func DefaultSite() Site {
 	return Site{
-		SiteName:         "AI 工作台",
-		RegistrationOpen: true,
-		BaseConcurrency:  1,
-		HostedGraceHours: 24,
-		RentalGraceHours: 0,
-		HostedVMTemplate: json.RawMessage(`{"runtime_type":"docker"}`),
-		Payment:          DefaultPaymentDocument(),
+		SiteName:               "AI 工作台",
+		RegistrationOpen:       true,
+		RegisterEmailWhitelist: []string{},
+		BaseConcurrency:        1,
+		HostedGraceHours:       24,
+		RentalGraceHours:       0,
+		HostedVMTemplate:       json.RawMessage(`{"runtime_type":"docker"}`),
+		Payment:                DefaultPaymentDocument(),
 
 		SelfcheckRequireDedicatedProxy: true,
 		SelfcheckRequireTimezoneMatch:  true,
@@ -61,6 +64,9 @@ func LoadSite(ctx context.Context, s *Settings) (Site, error) {
 	site := DefaultSite()
 	if _, err := s.Get(ctx, "site", &site); err != nil {
 		return site, err
+	}
+	if site.RegisterEmailWhitelist == nil {
+		site.RegisterEmailWhitelist = []string{}
 	}
 	return site, nil
 }

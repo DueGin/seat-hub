@@ -1,5 +1,5 @@
 import { useId, useState } from 'react'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { Button, Card, Field, FieldInput, Notice, QueryState } from '@/components/ui'
@@ -9,17 +9,18 @@ export interface MailConfig { enabled: boolean; host: string; port: number; secu
 
 export function MailSettings() {
   const query = useQuery({ queryKey: ['admin', 'mail'], queryFn: () => api.get<MailConfig>('/admin/settings/mail') })
-  return <Card><h2>邮件发送（SMTP）</h2><p className="muted">发送预约确认、开售通知和工单消息。</p><QueryState query={query}>{query.data && <MailForm key={query.dataUpdatedAt} initial={query.data} />}</QueryState></Card>
+  return <div id="mail-settings"><Card><h2>邮件发送（SMTP）</h2><p className="muted">发送注册验证码、预约确认、开售通知和工单消息。</p><QueryState query={query}>{query.data && <MailForm key={query.dataUpdatedAt} initial={query.data} />}</QueryState></Card></div>
 }
 
 function MailForm({ initial }: { initial: MailConfig }) {
+  const client = useQueryClient()
   const id = useId()
   const [form, setForm] = useState(initial)
   const [admins, setAdmins] = useState(initial.admin_emails.join('\n'))
   const [to, setTo] = useState('')
   const [dirty, setDirty] = useState(false)
   function update<K extends keyof MailConfig>(key: K, value: MailConfig[K]) { setDirty(true); setForm(current => ({ ...current, [key]: value })) }
-  const save = useMutation({ mutationFn: () => api.put<MailConfig>('/admin/settings/mail', { ...form, admin_emails: admins.split(/[\s,，;；]+/).filter(Boolean) }), onSuccess: data => { setForm(data); setDirty(false); toast.success('邮件设置已保存') } })
+  const save = useMutation({ mutationFn: () => api.put<MailConfig>('/admin/settings/mail', { ...form, admin_emails: admins.split(/[\s,，;；]+/).filter(Boolean) }), onSuccess: data => { setForm(data); setDirty(false); client.setQueryData(['admin', 'mail'], data); toast.success('邮件设置已保存') } })
   const test = useMutation({ mutationFn: () => api.post('/admin/settings/mail/test', { to }), onSuccess: () => toast.success('测试邮件已发送') })
   return <div className="stack">
     <form id={id} className="stack" onSubmit={event => { event.preventDefault(); save.mutate() }}>

@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/DueGin/seat-hub/internal/auth"
+	"github.com/DueGin/seat-hub/internal/signup"
 	"github.com/DueGin/seat-hub/internal/store"
 )
 
@@ -32,14 +33,23 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Email    string `json:"email"`
 		Password string `json:"password"`
+		Code     string `json:"code"`
 	}
 	if err := readJSON(r, &body); err != nil {
 		s.fail(w, r, err)
 		return
 	}
 	email := strings.ToLower(strings.TrimSpace(body.Email))
-	if !strings.Contains(email, "@") || len(email) > 254 {
+	if !signup.Email(email) {
 		writeErr(w, http.StatusUnprocessableEntity, "invalid_email", "请输入有效邮箱")
+		return
+	}
+	if !signup.Allowed(email, site.RegisterEmailWhitelist) {
+		writeErr(w, 422, "email_not_allowed", "该邮箱暂不支持注册")
+		return
+	}
+	if site.RegisterEmailVerification && strings.TrimSpace(body.Code) == "" {
+		writeErr(w, 422, "code_required", "请输入邮箱验证码")
 		return
 	}
 	hash, err := s.Deps.Auth.HashPassword(body.Password)
@@ -55,7 +65,12 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if n, err := s.Deps.Users.Count(r.Context()); err == nil && n == 0 {
 		role = "admin"
 	}
-	u, err := s.Deps.Users.Create(r.Context(), email, hash, role)
+	var u UserDTO
+	if site.RegisterEmailVerification {
+		u, err = s.Deps.Registration.Register(r.Context(), email, hash, role, strings.TrimSpace(body.Code))
+	} else {
+		u, err = s.Deps.Users.Create(r.Context(), email, hash, role)
+	}
 	firstUserMu.Unlock()
 	if err != nil {
 		out := ErrEmailTaken
@@ -173,4 +188,37 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 // verifyPassword checks the current password through the auth service.
 func verifyPassword(s *Server, userID int64, password string) bool {
 	return s.Deps.Auth.VerifyPassword(userID, password)
+}
+
+func (s *Server) handleRegisterCode(w http.ResponseWriter, r *http.Request) {
+	site := s.Deps.Site(r)
+	if !site.RegistrationOpen {
+		writeErr(w, 403, "registration_closed", "当前未开放注册")
+		return
+	}
+	if !site.RegisterEmailVerification {
+		writeErr(w, 409, "verification_disabled", "当前未开启注册邮箱验证")
+		return
+	}
+	var body struct {
+		Email string `json:"email"`
+	}
+	if err := readJSON(r, &body); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	email := strings.ToLower(strings.TrimSpace(body.Email))
+	if !signup.Email(email) {
+		writeErr(w, 422, "invalid_email", "请输入有效邮箱")
+		return
+	}
+	if !signup.Allowed(email, site.RegisterEmailWhitelist) {
+		writeErr(w, 422, "email_not_allowed", "该邮箱暂不支持注册")
+		return
+	}
+	if err := s.Deps.Registration.Issue(r.Context(), email, clientIP(r), site.SiteName); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeOK(w, map[string]any{"cooldown_seconds": 60})
 }

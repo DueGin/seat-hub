@@ -25,6 +25,7 @@ import (
 	"github.com/DueGin/seat-hub/internal/provision"
 	"github.com/DueGin/seat-hub/internal/secret"
 	"github.com/DueGin/seat-hub/internal/selfcheck"
+	"github.com/DueGin/seat-hub/internal/signup"
 	"github.com/DueGin/seat-hub/internal/store"
 	"github.com/DueGin/seat-hub/internal/update"
 	"github.com/DueGin/seat-hub/internal/vm2api"
@@ -110,6 +111,8 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	}
 
 	mailSvc := mail.New(db.DB, box, logger)
+	settingsAdv.mail = mailSvc
+	registrationSvc := &signup.Service{DB: db.DB, Users: users, Box: box, Mail: mailSvc}
 	features := featureDeps{DB: db.DB, Box: box, Mail: mailSvc, Settings: settings, Audit: audit, Cfg: cfg, Log: logger}
 
 	restart := make(chan struct{})
@@ -124,19 +127,20 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	})
 
 	deps := api.Deps{
-		Users:    usersAdv,
-		Settings: settingsAdv,
-		Audit:    audit,
-		Auth:     authAdv,
-		Catalog:  &catalogAdapter{svc: catalogSvc},
-		Orders:   &orderAdapter{svc: orderSvc},
-		Payments: paymentAdv,
-		Accounts: prov,
-		Usage:    prov,
-		Keys:     &keyAdapter{inner: prov.keys},
-		Admin:    prov,
-		System:   &systemAdapter{m: updates, drain: cfg.UpdateDrainSeconds},
-		Site:     siteFunc(settings, cfg.PublicBaseURL),
+		Users:        usersAdv,
+		Settings:     settingsAdv,
+		Audit:        audit,
+		Auth:         authAdv,
+		Registration: &registrationAdapter{svc: registrationSvc},
+		Catalog:      &catalogAdapter{svc: catalogSvc},
+		Orders:       &orderAdapter{svc: orderSvc},
+		Payments:     paymentAdv,
+		Accounts:     prov,
+		Usage:        prov,
+		Keys:         &keyAdapter{inner: prov.keys},
+		Admin:        prov,
+		System:       &systemAdapter{m: updates, drain: cfg.UpdateDrainSeconds},
+		Site:         siteFunc(settings, cfg.PublicBaseURL),
 
 		Mail:         newMailAdapter(features),
 		Reservations: newReservationAdapter(features),
@@ -324,9 +328,12 @@ func siteFunc(settings *store.Settings, publicBaseURL string) func(r *http.Reque
 			base = baseURLFor(r)
 		}
 		return api.SiteConfig{
-			SiteName:         site.SiteName,
-			BaseURL:          base,
-			RegistrationOpen: site.RegistrationOpen,
+			SiteName:                  site.SiteName,
+			BaseURL:                   base,
+			RegistrationOpen:          site.RegistrationOpen,
+			RegisterEmailVerification: site.RegisterEmailVerification,
+			RegisterEmailWhitelist:    site.RegisterEmailWhitelist,
+			RegisterEmailDomains:      signup.Domains(site.RegisterEmailWhitelist),
 		}
 	}
 }

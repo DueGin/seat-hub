@@ -7,7 +7,7 @@ import { useConfig } from '@/lib/session'
 import type { NormalizedSettings, Settings as SiteSettings } from '@/lib/types'
 import { MutationError, Textarea } from './shared'
 import { normalizeSettings, numericSettings, selfcheckNumericSettings, validateSettings } from './settings-validation'
-import { MailSettings } from './MailSettings'
+import { MailSettings, type MailConfig } from './MailSettings'
 
 export function Settings() {
   const query = useQuery({ queryKey: ['admin', 'settings'], queryFn: () => api.get<SiteSettings>('/admin/settings'), refetchOnWindowFocus: false })
@@ -25,6 +25,8 @@ function SettingsEditor({ initial }: { initial: SiteSettings }) {
   const [dirty, setDirty] = useState(false)
   const hasExistingKey = Boolean(normalized.payment.epay.key)
   const hasExistingPrivateKey = Boolean(normalized.payment.alipay_f2f.private_key)
+  const mail = useQuery({ queryKey: ['admin', 'mail'], queryFn: () => api.get<MailConfig>('/admin/settings/mail') })
+  const smtpReady = Boolean(mail.data?.enabled && mail.data.host && mail.data.port > 0 && mail.data.from_address && (!mail.data.username || mail.data.password))
   const config = useConfig()
   const notifyURL = `${(config.data?.base_url || window.location.origin).replace(/\/$/, '')}/api/payments/alipay_f2f/notify`
   const client = useQueryClient()
@@ -55,6 +57,11 @@ function SettingsEditor({ initial }: { initial: SiteSettings }) {
   }}>
     <fieldset disabled={mutation.isPending} className="stack">
       <Card><h2>站点信息</h2><div className="form-grid"><Field label="站点名称"><FieldInput required maxLength={200} value={draft.site_name} onChange={(event) => change('site_name', event.target.value)} /></Field><label className="row"><input type="checkbox" checked={draft.registration_open} onChange={(event) => change('registration_open', event.target.checked)} />开放新用户注册</label></div></Card>
+      <Card><h2>注册</h2><div className="stack">
+        <label className="switch-field"><input type="checkbox" role="switch" checked={draft.register_email_verification} disabled={!smtpReady && !draft.register_email_verification} onChange={event => change('register_email_verification', event.target.checked)} /><span><strong>注册需验证邮箱</strong><small>新用户填写邮件中的 6 位验证码后完成注册。</small></span></label>
+        {!smtpReady && <p className="muted">请先配置并启用 <a href="#mail-settings">邮件发送（SMTP）</a>，再开启注册邮箱验证。</p>}
+        <Textarea label="注册邮箱白名单" rows={5} placeholder={'qq.com\n*.edu.cn\nsomeone@gmail.com'} hint="每行一项，留空表示不限制。域名只匹配自身，*. 匹配子域名，也可填写完整邮箱。仅影响自助注册。" value={draft.register_email_whitelist.join('\n')} onChange={event => change('register_email_whitelist', event.target.value.split('\n'))} />
+      </div></Card>
       <Card><h2>权益与资源回收</h2><div className="form-grid">{numericSettings.map((field) => <Field key={field.key} label={field.label} hint={field.hint}><FieldInput required type="number" min={0} step={1} value={Number.isNaN(draft[field.key]) ? '' : draft[field.key]} onChange={(event) => change(field.key, event.target.value === '' ? Number.NaN : Number(event.target.value))} /></Field>)}</div></Card>
       <Card><h2>槽位环境自检</h2><div className="stack"><div className="form-grid"><label className="row"><input type="checkbox" checked={draft.selfcheck_require_dedicated_proxy} onChange={(event) => change('selfcheck_require_dedicated_proxy', event.target.checked)} />要求独享 SOCKS5 出口</label><label className="row"><input type="checkbox" checked={draft.selfcheck_require_timezone_match} onChange={(event) => change('selfcheck_require_timezone_match', event.target.checked)} />要求时区与出口一致</label></div><div className="form-grid">{selfcheckNumericSettings.map((field) => <Field key={field.key} label={field.label} hint={field.hint}><FieldInput required type="number" min={field.min} max={field.max} step={1} value={Number.isNaN(draft[field.key]) ? '' : draft[field.key]} onChange={(event) => change(field.key, event.target.value === '' ? Number.NaN : Number(event.target.value))} /></Field>)}</div><Notice>请同时在 vm2api 将代理池 bind_limit 设为 1；门面会通过 proxy_exclusive 检查兜底，不会自动修改上游配置。</Notice></div></Card>
       <Card><div className="section-heading"><h2>托管 VM 模板</h2><Button type="button" variant="secondary" onClick={formatJSON}>校验并格式化 JSON</Button></div><Textarea label="创建模板（JSON 对象）" hint="保留上游所需模板字段；只接受有效 JSON 对象，不接受数组或 null。" rows={9} spellCheck={false} className="input mono" value={templateJSON} onChange={(event) => { setDirty(true); setTemplateJSON(event.target.value) }} /></Card>

@@ -17,10 +17,13 @@
 ### `GET /api/public/config`
 ```json
 {"site_name":"…","base_url":"https://portal.example.com","registration_open":true,
+ "register_email_verification":false,"register_email_domains":[],
  "payment_providers":[{"id":"alipay_f2f","name":"支付宝当面付"}],
  "version":"v0.1.0",
  "dev":false}
 ```
+`register_email_verification` 默认 `false`。`register_email_domains` 仅包含白名单中的域名和 `*.` 通配域名，绝不包含完整邮箱地址；仅供注册提示，服务端始终校验完整白名单。
+
 `base_url` 为空时前端用 `location.origin`。`payment_providers` 只有后台当前启用的那一种收款方式（`epay` / `alipay_f2f` / `manual`），开发模式另加 `mock`。
 
 **脱敏邮箱**：所有接口里的 `email_masked`（Claude 账号邮箱）都只保留邮箱名的前三个字符和域名的最后一段，例如 `fdsiome@protonmail.com` 显示为 `fds***@***.com`。邮箱名较短时最多显示一半（`abcd@x.io` 显示为 `ab***@***.io`）。门面用户自己的登录邮箱不做脱敏。
@@ -46,11 +49,18 @@
 
 | 方法 | 路径 | 请求 | 响应 data |
 |---|---|---|---|
-| POST | `/api/auth/register` | `{email,password}`（密码 8–128） | `{user:User}`，同时登录。注册关闭 403 `registration_closed`；邮箱已存在 409 `email_taken` |
+| POST | `/api/auth/register/code` | `{email}` | `{cooldown_seconds:60}`；发送 6 位注册验证码，10 分钟内有效 |
+| POST | `/api/auth/register` | `{email,password,code?}`（密码 8–128） | `{user:User}`，同时登录。注册关闭 403 `registration_closed`；邮箱已存在 409 `email_taken` |
 | POST | `/api/auth/login` | `{email,password}` | `{user:User}`。错误 401 `invalid_credentials`；停用 403 `user_disabled`；限速 429 `too_many_attempts` |
 | POST | `/api/auth/logout` | `{}` | `{}` |
 | GET | `/api/auth/me` | — | `{user:User}` |
 | POST | `/api/auth/password` | `{old_password,new_password}` | `{}`；撤销其它会话 |
+
+注册规则仅作用于自助注册，不影响已有用户登录或管理员创建用户：
+
+- 发送验证码：注册关闭返回 403 `registration_closed`；验证开关关闭返回 409 `verification_disabled`；邮箱不合法返回 422 `invalid_email`；白名单不允许返回 422 `email_not_allowed`（「该邮箱暂不支持注册」）；邮箱已注册返回 409 `email_taken`（「该邮箱已注册」）。
+- 同邮箱 60 秒内只能发送一次，返回 429 `code_cooldown`，message 包含剩余秒数；同邮箱滚动 24 小时最多 10 次，同 IP 滚动 1 小时最多 20 次，返回 429 `code_rate_limited`。新验证码会使该邮箱之前的验证码失效；SMTP 未配置时返回 422 `mail_not_configured`。
+- 注册始终检查非空白名单。开启验证时，缺少 `code` 返回 422 `code_required`（「请输入邮箱验证码」）；错误返回 422 `code_invalid`（「验证码错误」）；过期、已用、被新码替代、未获取或累计 5 次输错返回 422 `code_expired`（「验证码已失效，请重新获取」）。验证码只能使用一次，与用户创建在同一事务内提交。
 
 `User`: `{"id":1,"email":"a@b.c","role":"user|admin","status":"active|disabled","created_at":"…"}`
 
@@ -322,6 +332,7 @@ utilization 为 0–100；窗口缺失为 `null`。
 `Settings`（全新安装也返回完整的 `payment` 文档）：`payment.active` 是当前启用的收款方式（`epay` / `alipay_f2f` / `manual`，同一时间只有一种），三个配置块各自独立保存，切换不丢配置；保存时只要求当前方式配置完整（422 `invalid_settings`，提示到具体字段）。旧数据没有 `active` 时：易支付已启用且配置完整算 `epay`，否则 `manual`。`epay.enabled` / `manual.enabled` 是旧字段，已不起作用。`epay.key`、`alipay_f2f.private_key` 读取为 `"***"`，PUT 传 `"***"` 或空保留原值。当面付只支持公钥模式，私钥接受 PKCS1/PKCS8 PEM 或裸 base64，通知地址固定为 `<base_url>/api/payments/alipay_f2f/notify`:
 ```json
 {"site_name":"AI 工作台","registration_open":true,
+ "register_email_verification":false,"register_email_whitelist":[],
  "base_concurrency":1,"concurrency_per_hosted_seat":0,"concurrency_per_rental_account":0,
  "hosted_grace_hours":24,"rental_grace_hours":0,"gateway_queue_timeout_ms":0,
  "hosted_vm_template":{"runtime_type":"docker"},
@@ -334,3 +345,5 @@ utilization 为 0–100；窗口缺失为 `null`。
 ```
 
 自检设置：`selfcheck_require_dedicated_proxy` 默认 `true`，要求独占 SOCKS5 代理；`selfcheck_require_timezone_match` 默认 `true`，要求出口地理时区与槽位时区一致；`selfcheck_max_rebuilds` 默认 `3`，控制自动重建上限；`selfcheck_recheck_minutes` 默认 `30`，控制授权前复查间隔和后台巡检周期。`GET /api/admin/settings` 返回这四个字段，`PUT` 可部分更新。
+
+注册设置：`register_email_verification` 默认 `false`，升级后保持原注册流程；SMTP 未配置或未启用时不能保存为 `true`，返回 422 `invalid_settings`（「请先在下方「邮件发送」里配置并启用 SMTP，再开启注册邮箱验证」）。`register_email_whitelist` 默认 `[]`，空列表不限制；每项为 `qq.com`（仅该域名）、`*.edu.cn`（所有子域名，不含 edu.cn 本身）或 `someone@gmail.com`（仅此地址）。忽略大小写、修剪空白、去除空行和重复，最多 200 个有效条目；域名必须含点且各标签合法，通配符只能位于开头 `*.`，完整邮箱必须为单个裸地址；不合法返回 422 `invalid_settings`。PUT 省略字段保留原值，传 `[]` 清空白名单。

@@ -1,5 +1,5 @@
 export interface User { id: number; email: string; role: 'user' | 'admin'; status: 'active' | 'disabled'; created_at: string }
-export interface PublicConfig { site_name: string; base_url: string; registration_open: boolean; payment_providers: { id: string; name: string }[]; dev: boolean; version?: string }
+export interface PublicConfig { site_name: string; base_url: string; registration_open: boolean; register_email_verification: boolean; register_email_domains: string[]; payment_providers: { id: string; name: string }[]; dev: boolean; version?: string }
 export interface ReleaseInfo { version: string; name: string; notes: string; url: string; published_at: string }
 export type UpdateStage = 'downloading' | 'verifying' | 'installing' | 'restarting' | 'failed'
 export interface UpdateJob { kind: 'update' | 'rollback'; version: string; stage: UpdateStage; done: number; total: number; error?: string; started_at: string }
@@ -36,11 +36,11 @@ export interface ManualSettings { enabled?: boolean; instructions?: string }
 export type ActivePayment = 'epay' | 'alipay_f2f' | 'manual'
 export interface AlipayF2FSettings { app_id?: string; private_key?: string; alipay_public_key?: string; sandbox?: boolean }
 export interface PaymentSettings { active?: ActivePayment; epay?: EpaySettings; alipay_f2f?: AlipayF2FSettings; manual?: ManualSettings }
-export interface Settings { site_name?: string; registration_open?: boolean; base_concurrency?: number; concurrency_per_hosted_seat?: number; concurrency_per_rental_account?: number; hosted_grace_hours?: number; rental_grace_hours?: number; gateway_queue_timeout_ms?: number; hosted_vm_template?: Record<string, unknown>; payment?: PaymentSettings; selfcheck_require_dedicated_proxy?: boolean; selfcheck_require_timezone_match?: boolean; selfcheck_max_rebuilds?: number; selfcheck_recheck_minutes?: number }
+export interface Settings { site_name?: string; registration_open?: boolean; register_email_verification?: boolean; register_email_whitelist?: string[]; base_concurrency?: number; concurrency_per_hosted_seat?: number; concurrency_per_rental_account?: number; hosted_grace_hours?: number; rental_grace_hours?: number; gateway_queue_timeout_ms?: number; hosted_vm_template?: Record<string, unknown>; payment?: PaymentSettings; selfcheck_require_dedicated_proxy?: boolean; selfcheck_require_timezone_match?: boolean; selfcheck_max_rebuilds?: number; selfcheck_recheck_minutes?: number }
 // NormalizedSettings is what the settings editor and validateSettings return: the same
 // document with every block filled in, so the form never renders an undefined field.
 export interface NormalizedSettings extends Omit<Settings, 'payment'> {
-  site_name: string; registration_open: boolean; base_concurrency: number; concurrency_per_hosted_seat: number; concurrency_per_rental_account: number; hosted_grace_hours: number; rental_grace_hours: number; gateway_queue_timeout_ms: number; hosted_vm_template: Record<string, unknown>
+  site_name: string; registration_open: boolean; register_email_verification: boolean; register_email_whitelist: string[]; base_concurrency: number; concurrency_per_hosted_seat: number; concurrency_per_rental_account: number; hosted_grace_hours: number; rental_grace_hours: number; gateway_queue_timeout_ms: number; hosted_vm_template: Record<string, unknown>
   selfcheck_require_dedicated_proxy: boolean; selfcheck_require_timezone_match: boolean; selfcheck_max_rebuilds: number; selfcheck_recheck_minutes: number
   payment: { active: ActivePayment; epay: { enabled: boolean; gateway_url: string; pid: string; key: string; types: string[] }; alipay_f2f: { app_id: string; private_key: string; alipay_public_key: string; sandbox: boolean }; manual: { enabled: boolean; instructions: string } }
 }
