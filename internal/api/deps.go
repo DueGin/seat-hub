@@ -339,27 +339,32 @@ type PaymentProviderDTO struct {
 }
 
 type SiteConfig struct {
-	SiteName         string               `json:"site_name"`
-	BaseURL          string               `json:"base_url"`
-	RegistrationOpen bool                 `json:"registration_open"`
-	PaymentProviders []PaymentProviderDTO `json:"payment_providers"`
-	Dev              bool                 `json:"dev"`
+	SiteName                  string               `json:"site_name"`
+	BaseURL                   string               `json:"base_url"`
+	RegisterEmailVerification bool                 `json:"register_email_verification"`
+	RegisterEmailDomains      []string             `json:"register_email_domains"`
+	RegisterEmailWhitelist    []string             `json:"-"`
+	RegistrationOpen          bool                 `json:"registration_open"`
+	PaymentProviders          []PaymentProviderDTO `json:"payment_providers"`
+	Dev                       bool                 `json:"dev"`
 	// Version is the running build. Open pages compare it with the version
 	// they loaded with and offer a reload after an in-site update.
 	Version string `json:"version"`
 }
 
 type SettingsPayload struct {
-	SiteName                 string          `json:"site_name"`
-	RegistrationOpen         bool            `json:"registration_open"`
-	BaseConcurrency          int             `json:"base_concurrency"`
-	ConcurrencyPerHostedSeat int             `json:"concurrency_per_hosted_seat"`
-	ConcurrencyPerRental     int             `json:"concurrency_per_rental_account"`
-	HostedGraceHours         int             `json:"hosted_grace_hours"`
-	RentalGraceHours         int             `json:"rental_grace_hours"`
-	GatewayQueueTimeoutMS    int             `json:"gateway_queue_timeout_ms"`
-	HostedVMTemplate         json.RawMessage `json:"hosted_vm_template"`
-	Payment                  json.RawMessage `json:"payment"`
+	SiteName                  string          `json:"site_name"`
+	RegisterEmailVerification bool            `json:"register_email_verification"`
+	RegisterEmailWhitelist    []string        `json:"register_email_whitelist"`
+	RegistrationOpen          bool            `json:"registration_open"`
+	BaseConcurrency           int             `json:"base_concurrency"`
+	ConcurrencyPerHostedSeat  int             `json:"concurrency_per_hosted_seat"`
+	ConcurrencyPerRental      int             `json:"concurrency_per_rental_account"`
+	HostedGraceHours          int             `json:"hosted_grace_hours"`
+	RentalGraceHours          int             `json:"rental_grace_hours"`
+	GatewayQueueTimeoutMS     int             `json:"gateway_queue_timeout_ms"`
+	HostedVMTemplate          json.RawMessage `json:"hosted_vm_template"`
+	Payment                   json.RawMessage `json:"payment"`
 
 	SelfcheckRequireDedicatedProxy bool `json:"selfcheck_require_dedicated_proxy"`
 	SelfcheckRequireTimezoneMatch  bool `json:"selfcheck_require_timezone_match"`
@@ -722,4 +727,10 @@ type JobDTO struct {
 	Payload   string `json:"payload"`
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
+}
+
+// RegistrationService issues codes and consumes them atomically with user creation.
+type RegistrationService interface {
+	Issue(ctx context.Context, email, ip, siteName string) error
+	Register(ctx context.Context, email, passwordHash, role, code string) (UserDTO, error)
 }

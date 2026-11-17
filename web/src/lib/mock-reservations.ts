@@ -23,6 +23,7 @@ function text(input: MockInput, key: string, max: number, kit: MockKit) {
   if (typeof value !== 'string' || Array.from(value.trim()).length > max) return kit.fail(422, 'invalid_reservation', '请检查填写的内容，长度超出限制')
   return value.trim()
 }
+export function mockMailConfigured() { return ready() }
 function ready() { return mail.enabled && mail.host !== '' && address(mail.from_address) && (!mail.username || passwordStored) }
 function filtered(query: URLSearchParams, kit: MockKit) {
   const product = query.get('product_id'), status = query.get('status'), email = query.get('email') ?? ''

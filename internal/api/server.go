@@ -29,10 +29,11 @@ type Server struct {
 
 // Deps is everything the HTTP layer needs. Built once in internal/app.
 type Deps struct {
-	Users    UserStore
-	Settings SettingsStore
-	Audit    AuditLog
-	Auth     AuthService
+	Users        UserStore
+	Settings     SettingsStore
+	Audit        AuditLog
+	Auth         AuthService
+	Registration RegistrationService
 
 	Catalog  CatalogService
 	Orders   OrderService
@@ -60,6 +61,7 @@ func (s *Server) Handler() http.Handler {
 
 	// Auth
 	mux.HandleFunc("POST /api/auth/register", s.handleRegister)
+	mux.HandleFunc("POST /api/auth/register/code", s.handleRegisterCode)
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
 	mux.HandleFunc("POST /api/auth/logout", s.handleLogout)
 	mux.HandleFunc("GET /api/auth/me", s.handleMe)

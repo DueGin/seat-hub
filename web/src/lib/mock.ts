@@ -8,7 +8,8 @@ import type {
 } from './types'
 import { hasUsableKeyScope } from './key-scope.ts'
 import { ticketMock } from './mock-tickets.ts'
-import { reservationMock, setReservationProducts } from './mock-reservations.ts'
+import { reservationMock, setReservationProducts, mockMailConfigured } from './mock-reservations.ts'
+import { normalizeRegistrationWhitelist, registrationEmailAllowed } from './registration-email.ts'
 import type { MockKit } from './mock-kit'
 
 type Owned<T> = { userId: number; value: T }
@@ -44,7 +45,7 @@ function setSession(id: number | null) {
 }
 
 let settings: NormalizedSettings = {
-  site_name: 'AI 工作台 演示环境', registration_open: true, base_concurrency: 1,
+  site_name: 'AI 工作台 演示环境', registration_open: true, register_email_verification: false, register_email_whitelist: [], base_concurrency: 1,
   concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0,
   hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0,
   hosted_vm_template: { runtime_type: 'docker' },
@@ -302,7 +303,7 @@ function publicConfig(): PublicConfig {
   mockJobView()
   return {
     version: mockVersion(),
-    site_name: settings.site_name, base_url: '', registration_open: settings.registration_open, dev: true,
+    site_name: settings.site_name, base_url: '', registration_open: settings.registration_open, register_email_verification: settings.register_email_verification, register_email_domains: settings.register_email_whitelist.filter(entry => !entry.includes('@')), dev: true,
     payment_providers: [
       { id: settings.payment.active, name: { epay: '易支付（演示）', alipay_f2f: '支付宝当面付（演示）', manual: '人工转账（演示）' }[settings.payment.active] },
       { id: 'mock', name: '模拟支付' },
@@ -599,6 +600,9 @@ function addUser(email: string, digest: string): User {
   return user
 }
 
+const registrationCodes = new Map<string, { issued: number; attempts: number; used: boolean }>()
+const registrationIssues: { email: string; issued: number }[] = []
+
 async function authRequest(path: string, method: string, input: Input): Promise<Response | undefined> {
   if (path === '/auth/logout' && method === 'POST') { setSession(null); return ok() }
   if (path === '/auth/me' && method === 'GET') return ok({ user: currentUser() })
@@ -609,6 +613,20 @@ async function authRequest(path: string, method: string, input: Input): Promise<
     passwords.set(user.id, await passwordDigest(passwordValue(input, 'new_password')))
     return ok()
   }
+  if (path === '/auth/register/code' && method === 'POST') {
+    if (!settings.registration_open) fail(403, 'registration_closed', '当前未开放注册')
+    if (!settings.register_email_verification) fail(409, 'verification_disabled', '当前未开启注册邮箱验证')
+    const email = emailValue(input)
+    if (!registrationEmailAllowed(email, settings.register_email_whitelist)) fail(422, 'email_not_allowed', '该邮箱暂不支持注册')
+    if (users.some(user => user.email === email)) fail(409, 'email_taken', '该邮箱已注册')
+    const now = Date.now(), previous = registrationCodes.get(email)
+    if (previous && now - previous.issued < 60_000) fail(429, 'code_cooldown', `请 ${Math.ceil((60_000 - now + previous.issued) / 1000)} 秒后再获取验证码`)
+    while (registrationIssues.length && registrationIssues[0].issued <= now - DAY) registrationIssues.shift()
+    if (registrationIssues.filter(issue => issue.email === email).length >= 10 || registrationIssues.filter(issue => issue.issued > now - 3_600_000).length >= 20) fail(429, 'code_rate_limited', '验证码获取次数过多，请稍后再试')
+    if (!mockMailConfigured()) fail(422, 'mail_not_configured', '请先启用并配置邮件发送')
+    registrationCodes.set(email, { issued: now, attempts: 0, used: false }); registrationIssues.push({ email, issued: now })
+    return ok({ cooldown_seconds: 60 })
+  }
   if ((path !== '/auth/login' && path !== '/auth/register') || method !== 'POST') return undefined
   const email = emailValue(input)
   const password = path === '/auth/register' ? passwordValue(input, 'password') : typeof input.password === 'string' ? input.password : ''
@@ -616,9 +634,22 @@ async function authRequest(path: string, method: string, input: Input): Promise<
   let user = users.find(item => item.email === email)
   if (path === '/auth/register') {
     if (!settings.registration_open) fail(403, 'registration_closed', '当前未开放注册。')
-    if (user) fail(409, 'email_taken', '此邮箱已经注册。')
+    if (!registrationEmailAllowed(email, settings.register_email_whitelist)) fail(422, 'email_not_allowed', '该邮箱暂不支持注册')
+    let verification: { issued: number; attempts: number; used: boolean } | undefined
+    if (settings.register_email_verification) {
+      const code = text(input, 'code', '')
+      if (!code) fail(422, 'code_required', '请输入邮箱验证码')
+      verification = registrationCodes.get(email)
+      if (!verification || verification.used || verification.attempts >= 5 || Date.now() - verification.issued >= 600_000) fail(422, 'code_expired', '验证码已失效，请重新获取')
+      if (code !== '123456') { verification!.attempts++; fail(422, verification!.attempts >= 5 ? 'code_expired' : 'code_invalid', verification!.attempts >= 5 ? '验证码已失效，请重新获取' : '验证码错误') }
+    }
+    if (user) fail(409, 'email_taken', '该邮箱已注册')
     const digest = await passwordDigest(password)
     if (users.some(item => item.email === email)) fail(409, 'email_taken', '此邮箱已经注册。')
+    if (verification) {
+      if (verification !== registrationCodes.get(email) || verification.used || verification.attempts >= 5 || Date.now() - verification.issued >= 600_000) fail(422, 'code_expired', '验证码已失效，请重新获取')
+      verification.used = true
+    }
     user = addUser(email, digest); setSession(user.id)
     return ok({ user }, 201)
   }
@@ -626,7 +657,6 @@ async function authRequest(path: string, method: string, input: Input): Promise<
   if (attempts && attempts.until > Date.now() && attempts.count >= 5) fail(429, 'too_many_attempts', '尝试次数过多，请一分钟后重试。')
   const digest = await passwordDigest(password)
   user = users.find(item => item.email === email)
-  if (!user && settings.registration_open) user = addUser(email, digest)
   if (!user || passwords.get(user.id) !== digest) {
     const activeAttempts = attempts && attempts.until > Date.now() ? attempts : { count: 0, until: Date.now() + 60_000 }
     activeAttempts.count++; loginAttempts.set(email, activeAttempts)
@@ -680,6 +710,12 @@ function patchSettings(input: Input) {
   if (input.site_name !== undefined) updated.site_name = limitedText(input, 'site_name', '', 120)
   if (!updated.site_name) fail(422, 'invalid_site_name', '站点名称不能为空。')
   if (input.registration_open !== undefined) updated.registration_open = boolean(input, 'registration_open', true)
+  if (input.register_email_verification !== undefined) updated.register_email_verification = boolean(input, 'register_email_verification', false)
+  if (input.register_email_whitelist !== undefined) {
+    if (!Array.isArray(input.register_email_whitelist) || !input.register_email_whitelist.every(entry => typeof entry === 'string')) fail(422, 'invalid_settings', '注册邮箱白名单须为字符串数组')
+    try { updated.register_email_whitelist = normalizeRegistrationWhitelist(input.register_email_whitelist as string[]) } catch (error) { fail(422, 'invalid_settings', error instanceof Error ? error.message : '白名单格式不正确') }
+  }
+  if (updated.register_email_verification && !mockMailConfigured()) fail(422, 'invalid_settings', '请先在下方「邮件发送」里配置并启用 SMTP，再开启注册邮箱验证')
   const numberKeys = ['base_concurrency', 'concurrency_per_hosted_seat', 'concurrency_per_rental_account', 'hosted_grace_hours', 'rental_grace_hours', 'gateway_queue_timeout_ms'] as const
   for (const key of numberKeys) if (input[key] !== undefined) updated[key] = integer(input, key)
   if (input.selfcheck_require_dedicated_proxy !== undefined) updated.selfcheck_require_dedicated_proxy = boolean(input, 'selfcheck_require_dedicated_proxy', true)

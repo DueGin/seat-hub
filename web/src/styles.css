@@ -494,3 +494,14 @@ em { font-style: normal; color: var(--accent-text); }
 @media (max-width: 640px) { .ticket-form-grid { grid-template-columns: 1fr; }.ticket-list-icon { display: none; }.ticket-list-item { align-items: flex-start; gap: 10px; }.ticket-list-item .badge { margin-top: 2px; }.ticket-message { padding: 17px; }.ticket-message > header { flex-wrap: wrap; }.ticket-message > header time { font-size: 10px; }.ticket-editor-toolbar .button { padding: 7px; font-size: 11px; }.ticket-status-tabs button { padding: 8px 11px; }.ticket-list-main p { font-size: 11px; }.ticket-markdown { font-size: 12px; }.ticket-editor-footer { font-size: 10px; } }
 
 .ticket-page h1 { overflow-wrap: anywhere; }.ticket-page .page-header > div:first-child { min-width: 0; }
+
+.registration-code-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.registration-code-row .input { flex: 1; min-width: 0; width: 0; }
+.registration-code-row .button { flex-shrink: 0; }
+#mail-settings { scroll-margin-top: 80px; }
+
+@media (max-width: 700px) {
+  .auth-brand { gap: 16px; }
+  .auth-brand > .brand { min-width: 0; flex: 1; }
+  .auth-brand > .row { flex: 0 0 auto; justify-content: flex-end; max-width: 96px; }
+}

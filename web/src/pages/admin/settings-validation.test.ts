@@ -4,7 +4,7 @@ import type { NormalizedSettings } from '@/lib/types'
 import { normalizeSettings, validateSettings } from './settings-validation.ts'
 
 function settings(): NormalizedSettings {
-  return { site_name: '测试站点', registration_open: true, base_concurrency: 1, concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0, hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0, selfcheck_require_dedicated_proxy: true, selfcheck_require_timezone_match: true, selfcheck_max_rebuilds: 3, selfcheck_recheck_minutes: 30, hosted_vm_template: {}, payment: { active: 'manual', alipay_f2f: { app_id: '', private_key: '', alipay_public_key: '', sandbox: false }, epay: { enabled: false, gateway_url: '', pid: '', key: '', types: [] }, manual: { enabled: true, instructions: '转账后请联系管理员确认收款。' } } }
+  return { site_name: '测试站点', registration_open: true, register_email_verification: false, register_email_whitelist: [], base_concurrency: 1, concurrency_per_hosted_seat: 0, concurrency_per_rental_account: 0, hosted_grace_hours: 24, rental_grace_hours: 0, gateway_queue_timeout_ms: 0, selfcheck_require_dedicated_proxy: true, selfcheck_require_timezone_match: true, selfcheck_max_rebuilds: 3, selfcheck_recheck_minutes: 30, hosted_vm_template: {}, payment: { active: 'manual', alipay_f2f: { app_id: '', private_key: '', alipay_public_key: '', sandbox: false }, epay: { enabled: false, gateway_url: '', pid: '', key: '', types: [] }, manual: { enabled: true, instructions: '转账后请联系管理员确认收款。' } } }
 }
 
 test('保留所有设置字段并解析模板及支付方式', () => {
@@ -133,4 +133,19 @@ test('当面付校验 AppID、应用私钥和支付宝公钥，已有私钥支�
     draft.payment.alipay_f2f.private_key = private_key
     assert.equal(validateSettings(draft, '{}', '[]', false, true).payment.alipay_f2f.private_key, private_key)
   }
+})
+
+test('注册验证默认关闭，白名单规范化并保留验证开关', () => {
+  assert.equal(normalizeSettings({}).register_email_verification, false)
+  assert.deepEqual(normalizeSettings({}).register_email_whitelist, [])
+  const draft = settings(); draft.register_email_verification = true; draft.register_email_whitelist = [' QQ.com ', '', 'qq.COM', '*.edu.cn', 'Someone@gmail.com']
+  const result = validateSettings(draft, '{}', '[]')
+  assert.equal(result.register_email_verification, true)
+  assert.deepEqual(result.register_email_whitelist, ['qq.com', '*.edu.cn', 'someone@gmail.com'])
+  for (const entry of ['localhost', '*qq.com', 'a.*.com', '-a.com', 'a..com', 'a_b.com', 'Name <a@gmail.com>', 'a@gmail.com,b@gmail.com']) {
+    draft.register_email_whitelist = [entry]
+    assert.throws(() => validateSettings(draft, '{}', '[]'), /白名单/)
+  }
+  draft.register_email_whitelist = Array.from({ length: 201 }, (_, i) => `d${i}.example.com`)
+  assert.throws(() => validateSettings(draft, '{}', '[]'), /200/)
 })

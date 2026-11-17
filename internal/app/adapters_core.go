@@ -15,6 +15,8 @@ import (
 
 	"github.com/DueGin/seat-hub/internal/api"
 	"github.com/DueGin/seat-hub/internal/auth"
+	"github.com/DueGin/seat-hub/internal/mail"
+	"github.com/DueGin/seat-hub/internal/signup"
 	"github.com/DueGin/seat-hub/internal/store"
 )
 
@@ -260,6 +262,9 @@ func (a *usersAdapter) fillEntitlement(ctx context.Context, userID int64, dto *a
 type settingsAdapter struct {
 	settings *store.Settings
 	audit    *store.Audit
+	mail     interface {
+		Configured(context.Context) (bool, error)
+	}
 }
 
 func (a *settingsAdapter) Get(ctx context.Context) (api.SettingsPayload, error) {
@@ -279,6 +284,22 @@ func (a *settingsAdapter) Put(ctx context.Context, p api.SettingsPayload, actorI
 	if err != nil {
 		return err
 	}
+	whitelist, err := signup.NormalizeWhitelist(p.RegisterEmailWhitelist)
+	if err != nil {
+		return api.Err(err, 422, "invalid_settings", err.Error())
+	}
+	if p.RegisterEmailVerification {
+		ready := false
+		if a.mail != nil {
+			ready, err = a.mail.Configured(ctx)
+			if err != nil {
+				return fmt.Errorf("check registration smtp: %w", err)
+			}
+		}
+		if !ready {
+			return &api.UserError{Status: 422, Code: "invalid_settings", Message: "请先在下方「邮件发送」里配置并启用 SMTP，再开启注册邮箱验证"}
+		}
+	}
 	// Payment secrets: a masked or empty value keeps the stored one.
 	merged, err := mergeSecrets(prev.Payment, p.Payment)
 	if err != nil {
@@ -294,6 +315,8 @@ func (a *settingsAdapter) Put(ctx context.Context, p api.SettingsPayload, actorI
 	site := store.Site{
 		SiteName:                       p.SiteName,
 		RegistrationOpen:               p.RegistrationOpen,
+		RegisterEmailVerification:      p.RegisterEmailVerification,
+		RegisterEmailWhitelist:         whitelist,
 		BaseConcurrency:                p.BaseConcurrency,
 		ConcurrencyPerHostedSeat:       p.ConcurrencyPerHostedSeat,
 		ConcurrencyPerRental:           p.ConcurrencyPerRental,
@@ -334,6 +357,8 @@ func toSettingsPayload(site store.Site) api.SettingsPayload {
 	return api.SettingsPayload{
 		SiteName:                       site.SiteName,
 		RegistrationOpen:               site.RegistrationOpen,
+		RegisterEmailVerification:      site.RegisterEmailVerification,
+		RegisterEmailWhitelist:         site.RegisterEmailWhitelist,
 		BaseConcurrency:                site.BaseConcurrency,
 		ConcurrencyPerHostedSeat:       site.ConcurrencyPerHostedSeat,
 		ConcurrencyPerRental:           site.ConcurrencyPerRental,
@@ -472,4 +497,34 @@ func mergeSecretMap(prev, next map[string]any) {
 			mergeSecretMap(prevMap, nextMap)
 		}
 	}
+}
+
+// registrationAdapter maps domain errors to the registration HTTP contract.
+type registrationAdapter struct{ svc *signup.Service }
+
+func registrationError(err error) error {
+	var cooldown *signup.CooldownError
+	switch {
+	case errors.As(err, &cooldown):
+		return api.Err(err, 429, "code_cooldown", cooldown.Error())
+	case errors.Is(err, signup.ErrRateLimited):
+		return api.Err(err, 429, "code_rate_limited", "验证码获取次数过多，请稍后再试")
+	case errors.Is(err, signup.ErrInvalid):
+		return api.Err(err, 422, "code_invalid", "验证码错误")
+	case errors.Is(err, signup.ErrExpired):
+		return api.Err(err, 422, "code_expired", "验证码已失效，请重新获取")
+	case errors.Is(err, store.ErrEmailTaken):
+		return api.ErrEmailTaken
+	case errors.Is(err, mail.ErrNotConfigured):
+		return api.Err(err, 422, "mail_not_configured", "请先启用并配置邮件发送")
+	default:
+		return err
+	}
+}
+func (a *registrationAdapter) Issue(ctx context.Context, email, ip, siteName string) error {
+	return registrationError(a.svc.Issue(ctx, email, ip, siteName))
+}
+func (a *registrationAdapter) Register(ctx context.Context, email, passwordHash, role, code string) (api.UserDTO, error) {
+	u, err := a.svc.Register(ctx, email, passwordHash, role, code)
+	return toUserDTO(u), registrationError(err)
 }

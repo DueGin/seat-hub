@@ -1,3 +1,4 @@
+import { normalizeRegistrationWhitelist } from '../../lib/registration-email.ts'
 import type { NormalizedSettings, Settings } from '@/lib/types'
 
 export const numericSettings = [
@@ -39,6 +40,8 @@ export function normalizeSettings(input: Settings | null | undefined): Normalize
   return {
     site_name: stringOr(source.site_name, ''),
     registration_open: booleanOr(source.registration_open, true),
+    register_email_verification: booleanOr(source.register_email_verification, false),
+    register_email_whitelist: Array.isArray(source.register_email_whitelist) ? source.register_email_whitelist.filter((value): value is string => typeof value === 'string') : [],
     base_concurrency: numberOr(source.base_concurrency, DEFAULT_NUMBERS.base_concurrency),
     concurrency_per_hosted_seat: numberOr(source.concurrency_per_hosted_seat, DEFAULT_NUMBERS.concurrency_per_hosted_seat),
     concurrency_per_rental_account: numberOr(source.concurrency_per_rental_account, DEFAULT_NUMBERS.concurrency_per_rental_account),
@@ -106,6 +109,7 @@ export function validateSettings(draft: Settings, templateJSON: string, typesJSO
   return {
     ...settings,
     site_name: settings.site_name.trim(),
+    register_email_whitelist: normalizeRegistrationWhitelist(settings.register_email_whitelist),
     hosted_vm_template: template as Record<string, unknown>,
     payment: {
       active: settings.payment.active,
