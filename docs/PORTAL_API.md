@@ -266,19 +266,19 @@ utilization 为 0–100；窗口缺失为 `null`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/admin/dashboard` | `{users, paying_users, revenue_cents_30d, orders_pending, accounts:{hosted_active, rental_active, failed}, rental_pool:{total, available, leased, maintenance}, vm2api:{ok, version, latency_ms, error}, scope_warnings:{checked_at, items:[{user_id, user_email, vm_id, pool_id, pool_name, message}]}}`。`scope_warnings` 是需要管理员处理的账号范围问题（号被 vm2api 里的外部账号池占用，见 [KEY_SCOPE.md](KEY_SCOPE.md)），每次对账重算 |
-| POST | `/api/admin/scope/recheck` | `{}` 立即排一次账号范围对账（`scope_reconcile`），处理完外部账号池后用 |
+| GET | `/api/admin/dashboard` | `{users, paying_users, revenue_cents_30d, orders_pending, accounts:{hosted_active, rental_active, failed}, rental_pool:{total, available, leased, maintenance}, vm2api:{ok, version, latency_ms, error}, scope_warnings:{checked_at, items:[{kind, user_id?, user_email?, vm_id?, key_id?, message}]}}`。警告每次对账重算，类型为 `vm_owner_conflict`、`rental_vm_taken`、`key_drifted`、`pool_in_use`，详见 [KEY_SCOPE.md](KEY_SCOPE.md) |
+| POST | `/api/admin/scope/recheck` | `{}` 立即排一次归属对账（`owner_reconcile`） |
 | GET/POST | `/api/admin/products` | 列表（含未上架）/ 新建 `Product` 字段（无 `id`、`stock`） |
 | PATCH/DELETE | `/api/admin/products/{id}` | 有订单引用时 DELETE 改为下架 |
 | GET | `/api/admin/orders?status&user_id&page` | `Order` + `user_email` |
 | POST | `/api/admin/orders/{order_no}/mark-paid` | `{trade_no?}` 人工确认收款 → 履约 |
 | POST | `/api/admin/orders/{order_no}/cancel` | pending 取消 |
 | POST | `/api/admin/orders/{order_no}/refulfill` | `fulfill_failed` 重试 |
-| GET | `/api/admin/users?q&role&status&page` | `User` + `{concurrency_total, hosted_used, hosted_total, rental_used, rental_total, vm2api_user_id, vm2api_pool_id, note, last_login_at, last_login_ip, active_sessions}`（`vm2api_user_id` 仅旧数据迁移前有值）。`q` 匹配邮箱或备注，`#12`/`12` 按用户 ID 精确匹配；`role`=`user|admin`，`status`=`active|disabled` |
+| GET | `/api/admin/users?q&role&status&page` | `User` + `{concurrency_total, hosted_used, hosted_total, rental_used, rental_total, vm2api_user_id, vm2api_username, note, last_login_at, last_login_ip, active_sessions}`（未创建 vm2api 用户时两项为空）。`q` 匹配邮箱或备注，`#12`/`12` 按用户 ID 精确匹配；`role`=`user|admin`，`status`=`active|disabled` |
 | POST | `/api/admin/users` | `{email, password?, role?, note?}` 新增用户，返回 201 `{user, password?}`。不传 `password` 时自动生成 16 位密码，只在本次响应里返回一次；邮箱已占用 409 `email_taken` |
 | GET | `/api/admin/users/{id}` | `{user, subscriptions, accounts, keys, orders, sessions:[{created_at, expires_at, ip, user_agent}], records:{orders, subscriptions, resources}}` |
-| PATCH | `/api/admin/users/{id}` | `{email?, status?, role?, note?}` 至少一项。停用时同步停用该用户的上游密钥，重新启用时一并恢复（用户自己停用的密钥保持停用）。改邮箱后用户须用新邮箱登录 |
-| DELETE | `/api/admin/users/{id}` | 删除用户及其 API 密钥（先删上游密钥，再删该用户的账号池）。有订单、订阅或账号资源的用户返回 409 `user_has_records`，只能停用 |
+| PATCH | `/api/admin/users/{id}` | `{email?, status?, role?, note?}` 至少一项。停用时同步停用 vm2api 用户及密钥，重新启用时一并恢复（用户自己停用的密钥保持停用）。改邮箱后用户须用新邮箱登录 |
+| DELETE | `/api/admin/users/{id}` | 删除门面用户及 API 密钥（先清理可访问的上游密钥，再停用 vm2api 用户，不删除上游用户）。有订单、订阅、账号资源或工单的用户返回 409 `user_has_records`，只能停用 |
 | POST | `/api/admin/users/{id}/password` | `{password?}` 重置密码，并让该用户所有设备的登录失效。不传 `password` 时自动生成，返回 `{password}`（只显示一次） |
 | POST | `/api/admin/users/{id}/sessions/revoke` | `{}` 强制下线：让该用户所有设备的登录失效，API 密钥不受影响 |
 | PATCH/DELETE | `/api/admin/users/{id}/keys/{key_id}` | 管理员停用、启用（`{status}`）或删除该用户的某个 API 密钥，例如密钥泄露时使用 |
@@ -290,9 +290,9 @@ utilization 为 0–100；窗口缺失为 `null`。
 |---|---|---|
 | POST | `/api/admin/users/{id}/grant` | `{kind, quantity, duration_days, note}` 赠送订阅（生成 provider=`grant` 的已履约订单） |
 | PATCH | `/api/admin/subscriptions/{id}` | `{expires_at?, status?:"cancelled"}` |
-| GET | `/api/admin/rental-pool` | `{items:[{vm_id, tier, status:"available|leased|maintenance", leased_to_user_id, leased_to_email, note, selfcheck:Selfcheck|null, vm:{label, email_masked, cred_status, schedule_state, tier, five_hour, seven_day}, foreign_pool?}]}`。`foreign_pool` 有值表示该号在 vm2api 的外部账号池里，不会被分配 |
-| GET | `/api/admin/rental-pool/candidates` | vm2api 中未归属、Claude、未入池的 VM：`{items:[{vm_id,label,email_masked,cred_status,schedule_state,tier,foreign_pool?}]}`，`foreign_pool` 有值的不能入池 |
-| POST | `/api/admin/rental-pool` | `{vm_ids:[…], note?}` 入池前自检，未通过返回 409 `selfcheck_failed`；号在外部账号池里返回 409 `vm_in_foreign_pool` |
+| GET | `/api/admin/rental-pool` | `{items:[{vm_id, tier, status:"available\|leased\|maintenance", leased_to_user_id, leased_to_email, note, selfcheck:Selfcheck\|null, vm:{label, email_masked, cred_status, schedule_state, tier, five_hour, seven_day}, owned_by?}]}`。`owned_by` 是意外占用该号的 vm2api 用户名（未出租但已归属，或出租给某人却归属另一个用户） |
+| GET | `/api/admin/rental-pool/candidates` | vm2api 中未归属、Claude、未入池的 VM：`{items:[{vm_id,label,email_masked,cred_status,schedule_state,tier}]}` |
+| POST | `/api/admin/rental-pool` | `{vm_ids:[…], note?}` 入池前自检，未通过返回 409 `selfcheck_failed`；号已有归属则返回 409 `vm_not_available` |
 | PATCH | `/api/admin/rental-pool/{vm_id}` | `{status:"available|maintenance", note?}`（`leased` 不可手改） |
 | DELETE | `/api/admin/rental-pool/{vm_id}` | 仅非 leased |
 | POST | `/api/admin/rental-pool/{vm_id}/selfcheck` | `{}` 重跑入池自检 → `Selfcheck`；`vm_id` 不能为空或全空白 |

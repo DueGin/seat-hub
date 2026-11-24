@@ -8,6 +8,7 @@ Claude 账号托管与租赁的门面系统，背后对接 [vm2api](https://gith
 
 - **托管**：用户通过 OAuth 授权链接把自己的 Claude 账号接入。上号前会先做槽位自检，保证一个出口 IP、一个账号、一个槽位，指纹也不重复。
 - **租赁**：从租赁池里分配平台账号，到期后自动回收。
+- **账号隔离**：每个门面用户对应一个 vm2api 用户；API 密钥可使用名下全部账号，也可指定账号。
 - **用量**：总览、用量分析，以及按账号查看的使用记录。
 - **工单**：用户提交问题（Markdown + 图片），管理员回复，邮件通知双方。
 - **预约**：未开售的商品先收集意向邮箱，开售时一键群发通知。
@@ -24,7 +25,7 @@ curl -fsSL  https://raw.githubusercontent.com/DueGin/seat-hub/main/deploy/.env.e
 vi .env && docker compose up -d
 ```
 
-反向代理、在线更新和发版流程见 [docs/DEPLOY.md](docs/DEPLOY.md)。
+需要 vm2api v1.4.041 或更新版本。反向代理、在线更新和发版流程见 [docs/DEPLOY.md](docs/DEPLOY.md)。
 
 ## 本地开发
 

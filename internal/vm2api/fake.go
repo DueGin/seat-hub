@@ -32,6 +32,8 @@ type Fake struct {
 	mu        sync.Mutex
 	sequence  uint64
 	users     map[string]User
+	passwords map[string]string
+	panels    map[string]string
 	keys      map[string]fakeKey
 	pools     map[string]Pool
 	vms       map[string]VM
@@ -82,6 +84,8 @@ func NewFake() *Fake {
 func (fake *Fake) initLocked() {
 	if fake.users == nil {
 		fake.users = make(map[string]User)
+		fake.passwords = make(map[string]string)
+		fake.panels = make(map[string]string)
 		fake.keys = make(map[string]fakeKey)
 		fake.pools = make(map[string]Pool)
 		fake.vms = make(map[string]VM)
@@ -204,6 +208,10 @@ func (fake *Fake) Ping(ctx context.Context) (Health, error) {
 }
 
 func (fake *Fake) CreateUser(ctx context.Context, username, password string) (User, error) {
+	return fake.createUser(ctx, username, password, "user")
+}
+
+func (fake *Fake) createUser(ctx context.Context, username, password, role string) (User, error) {
 	if err := fake.begin(ctx); err != nil {
 		return User{}, err
 	}
@@ -217,9 +225,26 @@ func (fake *Fake) CreateUser(ctx context.Context, username, password string) (Us
 			return User{}, fakeError(409, "username_exists", "username already exists")
 		}
 	}
-	user := User{ID: fake.nextID("usr"), Username: username, Enabled: true}
+	if role == "" {
+		role = "user"
+	}
+	user := User{ID: fake.nextID("usr"), Username: username, Role: role, Enabled: true}
 	fake.users[user.ID] = user
+	fake.passwords[user.ID] = password
 	return user, nil
+}
+
+func (fake *Fake) ListUsers(ctx context.Context) ([]User, error) {
+	if err := fake.begin(ctx); err != nil {
+		return nil, err
+	}
+	defer fake.mu.Unlock()
+	users := make([]User, 0, len(fake.users))
+	for _, user := range fake.users {
+		users = append(users, user)
+	}
+	sort.Slice(users, func(i, j int) bool { return users[i].ID < users[j].ID })
+	return users, nil
 }
 
 func (fake *Fake) SetUserEnabled(ctx context.Context, userID string, enabled bool) error {
@@ -230,6 +255,9 @@ func (fake *Fake) SetUserEnabled(ctx context.Context, userID string, enabled boo
 	user, exists := fake.users[userID]
 	if !exists {
 		return fakeMissing("user")
+	}
+	if user.Enabled != enabled {
+		fake.revokePanelLocked(userID)
 	}
 	user.Enabled = enabled
 	fake.users[userID] = user
@@ -257,7 +285,7 @@ func (fake *Fake) createKey(ctx context.Context, in CreateKeyInput, unscoped boo
 	}
 	groupType := "anthropic"
 	var scope KeyScope
-	if unscoped {
+	if unscoped || in.Scope.All {
 		groupType = "all"
 	} else {
 		var err error
@@ -304,6 +332,9 @@ func (fake *Fake) UpdateKey(ctx context.Context, keyID string, in UpdateKeyInput
 			return err
 		}
 		record.groupType, record.poolID, record.allowedVMs = "anthropic", scope.PoolID, scope.AllowedVMs
+		if scope.All {
+			record.groupType = "all"
+		}
 	}
 	if in.Name != nil {
 		name := []rune(strings.TrimSpace(*in.Name))
@@ -784,7 +815,7 @@ func (fake *Fake) UserRequestStats(ctx context.Context, userID string, from, unt
 func fakeUserWire(user User) map[string]any {
 	return map[string]any{
 		"id": user.ID, "username": user.Username, "enabled": user.Enabled,
-		"role": "user", "vm_create_quota": 0,
+		"role": user.Role, "vm_create_quota": 0,
 	}
 }
 
@@ -948,11 +979,23 @@ func (fake *Fake) Handler(masterKey string) http.Handler {
 			key = bearer
 		}
 		status, payload, err := 0, any(nil), error(nil)
-		if masterKey == "" || subtle.ConstantTimeCompare([]byte(key), []byte(masterKey)) != 1 {
-			err = fakeError(401, "unauthorized", "invalid master key")
+		request.Body = http.MaxBytesReader(writer, request.Body, 32<<10)
+		if request.URL.Path == "/api/panel/login" && request.Method == http.MethodPost {
+			status, payload, err = fake.panelLogin(request)
+		} else if masterKey != "" && subtle.ConstantTimeCompare([]byte(key), []byte(masterKey)) == 1 {
+			status, payload, err = fake.panel(request, "")
 		} else {
-			request.Body = http.MaxBytesReader(writer, request.Body, 32<<10)
-			status, payload, err = fake.panel(request)
+			fake.mu.Lock()
+			owner := fake.panels[key]
+			enabled := fake.users[owner].Enabled
+			fake.mu.Unlock()
+			if !enabled {
+				err = fakeError(401, "unauthorized", "invalid panel credentials")
+			} else if request.URL.Path != "/api/panel/api-keys" && !strings.HasPrefix(request.URL.Path, "/api/panel/api-keys/") {
+				err = fakeError(403, "forbidden", "not a tenant key route")
+			} else {
+				status, payload, err = fake.panel(request, owner)
+			}
 		}
 		if err != nil {
 			var panelError *Error
@@ -969,7 +1012,7 @@ func (fake *Fake) Handler(masterKey string) http.Handler {
 	})
 }
 
-func (fake *Fake) panel(request *http.Request) (int, any, error) {
+func (fake *Fake) panel(request *http.Request, owner string) (int, any, error) {
 	ctx, path := request.Context(), request.URL.Path
 	method := request.Method
 	if path == "/api/panel/version" && method == http.MethodGet {
@@ -978,26 +1021,21 @@ func (fake *Fake) panel(request *http.Request) (int, any, error) {
 	}
 	if path == "/api/panel/users" {
 		if method == http.MethodPost {
-			body, err := fakeDecodeBody[struct{ Username, Password string }](request)
+			body, err := fakeDecodeBody[struct{ Username, Password, Role string }](request)
 			if err != nil {
 				return 0, nil, err
 			}
-			user, err := fake.CreateUser(ctx, body.Username, body.Password)
+			user, err := fake.createUser(ctx, body.Username, body.Password, body.Role)
 			return 201, fakeOK(map[string]any{"item": fakeUserWire(user)}), err
 		}
 		if method == http.MethodGet {
-			if err := fake.begin(ctx); err != nil {
+			users, err := fake.ListUsers(ctx)
+			if err != nil {
 				return 0, nil, err
 			}
-			defer fake.mu.Unlock()
-			ids := make([]string, 0, len(fake.users))
-			for id := range fake.users {
-				ids = append(ids, id)
-			}
-			slices.Sort(ids)
-			items := make([]any, 0, len(ids))
-			for _, id := range ids {
-				items = append(items, fakeUserWire(fake.users[id]))
+			items := make([]any, 0, len(users))
+			for _, user := range users {
+				items = append(items, fakeUserWire(user))
 			}
 			return 200, fakeOK(map[string]any{"items": items}), nil
 		}
@@ -1006,20 +1044,21 @@ func (fake *Fake) panel(request *http.Request) (int, any, error) {
 		if method == http.MethodPost {
 			body, err := fakeDecodeBody[struct {
 				Name           string `json:"name"`
-				UserID         string `json:"user_id"`
 				MaxConcurrency int    `json:"max_concurrency"`
 				fakeScopeWire
 			}](request)
 			if err != nil {
 				return 0, nil, err
 			}
-			input := CreateKeyInput{Name: body.Name, UserID: body.UserID, MaxConcurrency: body.MaxConcurrency}
-			var key Key
-			if body.unscoped() {
-				key, err = fake.createKey(ctx, input, true)
-			} else if input.Scope, err = body.scope(); err == nil {
-				key, err = fake.CreateKey(ctx, input)
+			input := CreateKeyInput{Name: body.Name, UserID: owner, MaxConcurrency: body.MaxConcurrency}
+			input.Scope, err = body.scope()
+			if err == nil {
+				err = fake.validatePanelScope(owner, input.Scope)
 			}
+			if err != nil {
+				return 0, nil, err
+			}
+			key, err := fake.CreateKey(ctx, input)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -1036,7 +1075,7 @@ func (fake *Fake) panel(request *http.Request) (int, any, error) {
 			}
 			ids := make([]string, 0, len(fake.keys))
 			for id, key := range fake.keys {
-				if owner := request.URL.Query().Get("user_id"); owner == "" || key.userID == owner {
+				if key.userID == owner {
 					ids = append(ids, id)
 				}
 			}
@@ -1096,15 +1135,22 @@ func (fake *Fake) panel(request *http.Request) (int, any, error) {
 	}
 	id := parts[1]
 	if parts[0] == "users" && len(parts) == 2 && method == http.MethodPatch {
-		body, err := fakeDecodeBody[struct{ Enabled *bool }](request)
+		body, err := fakeDecodeBody[struct {
+			Enabled  *bool
+			Password *string
+		}](request)
 		if err != nil {
 			return 0, nil, err
 		}
-		if body.Enabled == nil {
-			return 0, nil, fakeError(400, "invalid_user", "enabled required")
+		if body.Enabled != nil {
+			if err := fake.SetUserEnabled(ctx, id, *body.Enabled); err != nil {
+				return 0, nil, err
+			}
 		}
-		if err := fake.SetUserEnabled(ctx, id, *body.Enabled); err != nil {
-			return 0, nil, err
+		if body.Password != nil {
+			if err := fake.SetUserPassword(ctx, id, *body.Password); err != nil {
+				return 0, nil, err
+			}
 		}
 		fake.mu.Lock()
 		user := fake.users[id]
@@ -1112,7 +1158,7 @@ func (fake *Fake) panel(request *http.Request) (int, any, error) {
 		return 200, fakeOK(map[string]any{"item": fakeUserWire(user)}), nil
 	}
 	if parts[0] == "api-keys" {
-		return fake.panelKey(request, id, parts[2:])
+		return fake.panelKey(request, owner, id, parts[2:])
 	}
 	if parts[0] == "vms" {
 		return fake.panelVM(request, id, parts[2:])
@@ -1146,8 +1192,15 @@ func (fake *Fake) panelProxy(request *http.Request, id string, suffix []string) 
 	return 0, nil, fakeMissing("route")
 }
 
-func (fake *Fake) panelKey(request *http.Request, id string, suffix []string) (int, any, error) {
+func (fake *Fake) panelKey(request *http.Request, owner, id string, suffix []string) (int, any, error) {
 	ctx := request.Context()
+	info, err := fake.GetKey(ctx, id)
+	if err != nil {
+		return 0, nil, err
+	}
+	if info.UserID != owner {
+		return 0, nil, fakeMissing("api_key")
+	}
 	if len(suffix) == 1 && suffix[0] == "stats" && request.Method == http.MethodGet {
 		usage, err := fake.KeyStats(ctx, id)
 		if err != nil {
@@ -1187,6 +1240,12 @@ func (fake *Fake) panelKey(request *http.Request, id string, suffix []string) (i
 			scope, err := body.scope()
 			if err != nil {
 				return 0, nil, err
+			}
+			if err := fake.validatePanelScope(owner, scope); err != nil {
+				return 0, nil, err
+			}
+			if owner != "" && info.PoolID != "" {
+				scope = KeyScope{PoolID: info.PoolID}
 			}
 			input.Scope = &scope
 		}

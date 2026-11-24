@@ -111,7 +111,9 @@ func (r *resolver) lookup(ctx context.Context, hash string) (*gateway.Principal,
 		return nil, err
 	}
 	p.Concurrency = concurrency
-	if accounts == 0 {
+	// Keep the first, more specific reason: a disabled key or user must be
+	// told so, not that they have no accounts.
+	if p.Active && accounts == 0 {
 		p.Active, p.Reason = false, "no_active_accounts"
 	}
 	if p.Active && scopeMode == "selected" {

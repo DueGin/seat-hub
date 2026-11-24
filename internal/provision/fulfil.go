@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/DueGin/seat-hub/internal/privacy"
+	"github.com/DueGin/seat-hub/internal/vm2api"
 )
 
 // FulfilOrder applies a settled order. It is driven by the job engine, but it
@@ -68,17 +69,17 @@ func (service *Service) allocateRental(ctx context.Context, subscriptionID int64
 	if !expiry.After(service.now()) {
 		return nil
 	}
-	owner, err := service.ServiceUser(ctx)
+	owner, err := service.EnsureUpstreamUser(ctx, userID)
 	if err != nil {
 		return err
 	}
 	// Lease first, then talk to vm2api: the upstream calls must not run inside
 	// the write transaction, and a failed claim leaves nothing half-created.
-	foreign, err := service.foreignVMIDs(ctx)
+	_, excluded, err := service.rentalAvailability(ctx)
 	if err != nil {
 		return err
 	}
-	vmIDs, err := service.claimRental(ctx, userID, subscriptionID, quantity, foreign)
+	vmIDs, err := service.claimRental(ctx, userID, subscriptionID, quantity, excluded)
 	if err != nil || len(vmIDs) == 0 {
 		return err
 	}
@@ -112,13 +113,13 @@ func (service *Service) syncAccountIdentity(ctx context.Context, vmID string) {
 }
 
 // claimRental leases the accounts a subscription is missing and commits.
-func (service *Service) claimRental(ctx context.Context, userID, subscriptionID int64, quantity int, foreign []string) ([]string, error) {
+func (service *Service) claimRental(ctx context.Context, userID, subscriptionID int64, quantity int, excluded []string) ([]string, error) {
 	tx, err := service.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin rental allocation: %w", err)
 	}
 	defer tx.Rollback()
-	vmIDs, err := claimRentalTx(ctx, tx, userID, subscriptionID, quantity, service.now(), foreign)
+	vmIDs, err := claimRentalTx(ctx, tx, userID, subscriptionID, quantity, service.now(), excluded)
 	if err != nil {
 		return nil, err
 	}
@@ -129,9 +130,8 @@ func (service *Service) claimRental(ctx context.Context, userID, subscriptionID 
 }
 
 // claimRental leases up to `quantity` minus the live accounts the subscription
-// already holds. VMs in `foreign` (held by a vm2api pool the portal does not
-// own) are skipped: they could not be put in the tenant's pool.
-func claimRentalTx(ctx context.Context, tx *sql.Tx, userID, subscriptionID int64, quantity int, now time.Time, foreign []string) ([]string, error) {
+// already holds. The upstream owner probe excludes unavailable VMs.
+func claimRentalTx(ctx context.Context, tx *sql.Tx, userID, subscriptionID int64, quantity int, now time.Time, excluded []string) ([]string, error) {
 	var held int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM resources WHERE subscription_id=? AND status NOT IN ('released','releasing')`, subscriptionID).Scan(&held); err != nil {
 		return nil, fmt.Errorf("count rented resources: %w", err)
@@ -143,11 +143,11 @@ func claimRentalTx(ctx context.Context, tx *sql.Tx, userID, subscriptionID int64
 	assigned := make([]string, 0, needed)
 	for len(assigned) < needed {
 		var vmID, tier string
-		skip := make([]any, 0, len(assigned)+len(foreign))
+		skip := make([]any, 0, len(assigned)+len(excluded))
 		for _, item := range assigned {
 			skip = append(skip, item)
 		}
-		for _, item := range foreign {
+		for _, item := range excluded {
 			skip = append(skip, item)
 		}
 		exclude := ""
@@ -216,13 +216,13 @@ func (service *Service) fulfilOrder(ctx context.Context, orderID int64) (fulfilE
 		return ErrInvalidState
 	}
 	var owner string
-	var foreign []string
+	var excluded []string
 	if kind == "rental_account" {
-		owner, err = service.ServiceUser(ctx)
+		owner, err = service.EnsureUpstreamUser(ctx, userID)
 		if err != nil {
 			return err
 		}
-		if foreign, err = service.foreignVMIDs(ctx); err != nil {
+		if _, excluded, err = service.rentalAvailability(ctx); err != nil {
 			return err
 		}
 	}
@@ -290,15 +290,15 @@ func (service *Service) fulfilOrder(ctx context.Context, orderID int64) (fulfilE
 		// available list first and leasing afterwards would let two concurrent
 		// fulfillments hand out the same VM; here the loser sees RowsAffected 0
 		// and moves on to the next candidate.
-		claimed, err := claimRentalTx(ctx, tx, userID, subscriptionID, units, now, foreign)
+		claimed, err := claimRentalTx(ctx, tx, userID, subscriptionID, units, now, excluded)
 		if err != nil {
 			return err
 		}
 		for _, vmID := range claimed {
-			assigned = append(assigned, vmID)
 			if err := service.client.SetVMOwner(ctx, vmID, &owner); err != nil {
 				return fmt.Errorf("assign rental owner: %w", err)
 			}
+			assigned = append(assigned, vmID)
 			if err := service.client.SetSchedulable(ctx, vmID, true); err != nil {
 				return fmt.Errorf("enable rental scheduling: %w", err)
 			}
@@ -338,13 +338,7 @@ func (service *Service) undoRentalAssignments(ctx context.Context, userID int64,
 		if queueErr != nil {
 			failures = append(failures, fmt.Errorf("queue rental compensation: %w", queueErr))
 		}
-		cleanupErr := service.client.SetSchedulable(ctx, vmID, false)
-		if cleanupErr == nil {
-			cleanupErr = service.SyncUserScope(ctx, userID)
-		}
-		if cleanupErr == nil {
-			cleanupErr = service.client.SetVMOwner(ctx, vmID, nil)
-		}
+		cleanupErr := service.releaseVM(ctx, Account{UserID: userID, Kind: "rental", VMID: vmID})
 		if cleanupErr != nil {
 			failures = append(failures, service.releaseError(ctx, resourceID, fmt.Errorf("undo rental owner assignment: %w", cleanupErr)))
 			continue
@@ -370,4 +364,47 @@ func (service *Service) undoRentalAssignments(ctx context.Context, userID int64,
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func (service *Service) RentalStock(ctx context.Context) (int, error) {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	count, _, err := service.rentalAvailability(ctx)
+	return count, err
+}
+
+func (service *Service) rentalAvailability(ctx context.Context) (int, []string, error) {
+	vms, err := service.client.ListVMs(ctx, vm2api.VMFilter{})
+	if err != nil {
+		return 0, nil, fmt.Errorf("check rental vm owners: %w", err)
+	}
+	stock, err := queryAll(ctx, service.db, `SELECT vm_id FROM rental_pool WHERE status='available' AND selfcheck_state='pass' ORDER BY vm_id`, func(rows *sql.Rows) (id string, err error) {
+		err = rows.Scan(&id)
+		return
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	indexed := make(map[string]vm2api.VM, len(vms))
+	for _, vm := range vms {
+		indexed[vm.ID] = vm
+	}
+	var excluded []string
+	var names map[string]string
+	for _, id := range stock {
+		vm, exists := indexed[id]
+		if exists && vm.OwnerUserID == "" && vm.Origin == "platform" && vm.Platform == "anthropic" {
+			continue
+		}
+		excluded = append(excluded, id)
+		if vm.OwnerUserID != "" {
+			if names == nil {
+				names, _ = service.ownerNames(ctx)
+			}
+			if err := service.addScopeWarning(ctx, rentalWarning(vm, names)); err != nil {
+				return 0, nil, err
+			}
+		}
+	}
+	return len(stock) - len(excluded), excluded, nil
 }

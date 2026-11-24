@@ -47,7 +47,9 @@ func TestKeyStatsIncludesDeletedPreviousKey(t *testing.T) {
 		VALUES(1,1,'stats','hash','prefix',?,'enc','active',?,?,?)`, live.ID, store.Now(), store.Now(), store.EncodeStrings([]string{old.ID, live.ID})); err != nil {
 		t.Fatal(err)
 	}
-	p := &provisionSpan{db: db.DB, keyStats: fake.KeyStats, keyLogs: fake.UserRequestLogs}
+	p := &provisionSpan{db: db.DB, keyStats: func(ctx context.Context, _ int64, id string) (vm2api.UsageBreakdown, error) {
+		return fake.KeyStats(ctx, id)
+	}, keyLogs: fake.UserRequestLogs}
 	daily, models, err := p.KeyStats(ctx, 1, 1)
 	wantDate := stamp.In(time.FixedZone("Shanghai", 8*60*60)).Format("2006-01-02")
 	if err != nil || len(daily) != 1 || daily[0].Date != wantDate || daily[0].Requests != 2 || daily[0].Tokens != 220 || len(models) != 1 || models[0].Requests != 2 || models[0].Tokens != 220 {

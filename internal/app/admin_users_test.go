@@ -257,8 +257,8 @@ func TestAdminDeletesOnlyUsersWithoutRecords(t *testing.T) {
 	if exists, _ := h.fake.KeyState(upstreamKey); exists {
 		t.Fatal("upstream key survived the user")
 	}
-	if exists, enabled := h.fake.UserEnabled(upstreamUser); !exists || !enabled {
-		t.Fatalf("shared service user must remain enabled: exists=%v enabled=%v", exists, enabled)
+	if exists, enabled := h.fake.UserEnabled(upstreamUser); !exists || enabled {
+		t.Fatalf("member must remain present and disabled: exists=%v enabled=%v", exists, enabled)
 	}
 	if erin.tryLogin("erin@example.com", password) == 200 {
 		t.Fatal("deleted user can still sign in")

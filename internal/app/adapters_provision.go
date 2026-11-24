@@ -27,7 +27,7 @@ type provisionSpan struct {
 	db       *sql.DB
 	settings *store.Settings
 	// keyStats reads one upstream key's usage from vm2api; nil disables it.
-	keyStats func(ctx context.Context, vm2apiKeyID string) (vm2api.UsageBreakdown, error)
+	keyStats func(ctx context.Context, userID int64, vm2apiKeyID string) (vm2api.UsageBreakdown, error)
 	keyLogs  func(context.Context, string, vm2api.LogQuery) (vm2api.LogPage, error)
 	// inflight reports the gateway's live request count for a user.
 	inflight func(userID int64) int
@@ -258,7 +258,10 @@ func toOnboardingDTO(ob provision.Onboarding) api.OnboardingDTO {
 		out.AuthURLExpiresAt = *ob.AuthURLExpiresAt
 	}
 	if ob.Bootstrap != nil {
-		out.Bootstrap = &api.BootstrapDTO{State: ob.Bootstrap.State, Message: ob.Bootstrap.Message}
+		out.Bootstrap = &api.BootstrapDTO{State: ob.Bootstrap.State}
+		if ob.Bootstrap.State == "failed" {
+			out.Bootstrap.Message = "账号初始化失败，请重试或联系管理员。"
+		}
 	}
 	if ob.Error != nil {
 		code, message := userOnboardingError(ob.Error.Reason)
@@ -583,8 +586,12 @@ func (p *provisionSpan) KeyStats(ctx context.Context, userID, keyID int64) ([]ap
 			continue
 		}
 		seen[id] = true
-		breakdown, err := p.keyStats(ctx, id)
-		if id != upstreamKeyID && vm2api.IsStatus(err, 404) && p.keyLogs != nil {
+		var breakdown vm2api.UsageBreakdown
+		var err error
+		if id == upstreamKeyID || p.keyLogs == nil {
+			breakdown, err = p.keyStats(ctx, userID, id)
+		}
+		if p.keyLogs != nil && (id != upstreamKeyID || vm2api.IsStatus(err, 404)) {
 			breakdown, err = p.previousKeyStats(ctx, id)
 		}
 		if err != nil {

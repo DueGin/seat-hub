@@ -55,15 +55,26 @@ func panelCallTests() []panelCallTest {
 			},
 		},
 		{
+			name: "list users", method: http.MethodGet, path: "/users",
+			response: `{"ok":true,"data":{"items":[{"id":"user-one","username":"alice","role":"user","enabled":false}]}}`,
+			invoke: func(client *HTTPClient) error {
+				users, err := client.ListUsers(ctx)
+				if err == nil && !reflect.DeepEqual(users, []User{{ID: ownerID, Username: "alice", Role: "user"}}) {
+					return fmt.Errorf("unexpected users: %+v", users)
+				}
+				return err
+			},
+		},
+		{
 			name: "disable user", method: http.MethodPatch, path: "/users/user-one", body: `{"enabled":false}`,
 			invoke: func(client *HTTPClient) error { return client.SetUserEnabled(ctx, ownerID, false) },
 		},
 		{
 			name: "create key", method: http.MethodPost, path: "/api-keys",
-			body:     `{"name":"tenant","user_id":"user-one","max_concurrency":0,"group_type":"anthropic","vm_pool_id":"pool_1234abcd"}`,
+			body:     `{"name":"tenant","max_concurrency":0,"group_type":"anthropic","vm_pool_id":"pool_1234abcd"}`,
 			response: `{"ok":true,"item":{"id":"key-one","key":"sk-vm-0123456789abcdef","key_prefix":"sk-vm-0123"}}`,
 			invoke: func(client *HTTPClient) error {
-				value, err := client.CreateKey(ctx, CreateKeyInput{Name: "tenant", UserID: ownerID, MaxConcurrency: -1, Scope: KeyScope{PoolID: "pool_1234abcd"}})
+				value, err := client.CreateKey(ctx, CreateKeyInput{Name: "tenant", MaxConcurrency: -1, Scope: KeyScope{PoolID: "pool_1234abcd"}})
 				if err == nil && value != (Key{ID: "key-one", Secret: "sk-vm-0123456789abcdef", Prefix: "sk-vm-0123"}) {
 					return fmt.Errorf("unexpected key: %+v", value)
 				}
@@ -71,11 +82,27 @@ func panelCallTests() []panelCallTest {
 			},
 		},
 		{
+			name: "create all accounts key", method: http.MethodPost, path: "/api-keys",
+			body:     `{"name":"all","max_concurrency":0,"group_type":"all","allowed_vms":[],"vm_pool_id":null}`,
+			response: `{"ok":true,"item":{"id":"key-one","key":"sk-vm-0123456789abcdef"}}`,
+			invoke: func(client *HTTPClient) error {
+				_, err := client.CreateKey(ctx, CreateKeyInput{Name: "all", Scope: KeyScope{All: true}})
+				return err
+			},
+		},
+		{
+			name: "update all accounts key", method: http.MethodPatch, path: "/api-keys/key-one",
+			body: `{"group_type":"all","allowed_vms":[],"vm_pool_id":null}`,
+			invoke: func(client *HTTPClient) error {
+				return client.UpdateKey(ctx, "key-one", UpdateKeyInput{Scope: &KeyScope{All: true}})
+			},
+		},
+		{
 			name: "create allowlist key", method: http.MethodPost, path: "/api-keys",
-			body:     `{"name":"selected","user_id":"user-one","max_concurrency":2,"group_type":"anthropic","allowed_vms":["vm-one","vm-two"],"vm_pool_id":null}`,
+			body:     `{"name":"selected","max_concurrency":2,"group_type":"anthropic","allowed_vms":["vm-one","vm-two"],"vm_pool_id":null}`,
 			response: `{"ok":true,"item":{"id":"key-one","key":"sk-vm-0123456789abcdef","key_prefix":"sk-vm-0123"}}`,
 			invoke: func(client *HTTPClient) error {
-				_, err := client.CreateKey(ctx, CreateKeyInput{Name: "selected", UserID: ownerID, MaxConcurrency: 2, Scope: KeyScope{AllowedVMs: []string{"vm-one", "vm-two"}}})
+				_, err := client.CreateKey(ctx, CreateKeyInput{Name: "selected", MaxConcurrency: 2, Scope: KeyScope{AllowedVMs: []string{"vm-one", "vm-two"}}})
 				return err
 			},
 		},
@@ -95,10 +122,10 @@ func panelCallTests() []panelCallTest {
 		},
 		{
 			name: "get key", method: http.MethodGet, path: "/api-keys/key-one/stats",
-			response: `{"ok":true,"item":{"id":"key-one","name":"name","user_id":"user-one","status":"active","max_concurrency":7,"group_type":"anthropic","allowed_vms":[],"vm_pool_id":"pool_1234abcd"}}`,
+			response: `{"ok":true,"item":{"id":"key-one","name":"name","user_id":null,"status":"active","max_concurrency":7,"group_type":"anthropic","allowed_vms":[],"vm_pool_id":"pool_1234abcd"}}`,
 			invoke: func(client *HTTPClient) error {
 				key, err := client.GetKey(ctx, "key-one")
-				want := KeyInfo{ID: "key-one", Name: "name", UserID: ownerID, Active: true, MaxConcurrency: 7, GroupType: "anthropic", PoolID: "pool_1234abcd", AllowedVMs: []string{}}
+				want := KeyInfo{ID: "key-one", Name: "name", Active: true, MaxConcurrency: 7, GroupType: "anthropic", PoolID: "pool_1234abcd", AllowedVMs: []string{}}
 				if err == nil && !reflect.DeepEqual(key, want) {
 					return fmt.Errorf("key=%+v, want=%+v", key, want)
 				}
@@ -107,9 +134,9 @@ func panelCallTests() []panelCallTest {
 		},
 		{
 			name: "list keys", method: http.MethodGet, path: "/api-keys",
-			response: `{"ok":true,"keys":[{"id":"key-one","user_id":"user-one","status":"disabled","group_type":"anthropic","allowed_vms":["vm-one"],"vm_pool_id":null},{"id":"other","user_id":"user-two","status":"active","group_type":"all","allowed_vms":[]}]}`,
+			response: `{"ok":true,"keys":[{"id":"key-one","user_id":null,"status":"disabled","group_type":"anthropic","allowed_vms":["vm-one"],"vm_pool_id":null},{"id":"other","user_id":"user-two","status":"active","group_type":"all","allowed_vms":[]}]}`,
 			invoke: func(client *HTTPClient) error {
-				keys, err := client.ListKeys(ctx, ownerID)
+				keys, err := client.ListKeys(ctx, "")
 				if err == nil && (len(keys) != 1 || keys[0].ID != "key-one" || keys[0].Active || keys[0].PoolID != "" || !reflect.DeepEqual(keys[0].AllowedVMs, []string{"vm-one"})) {
 					return fmt.Errorf("keys=%+v", keys)
 				}
@@ -121,7 +148,7 @@ func panelCallTests() []panelCallTest {
 			response: `{"ok":true,"keys":[{"id":"master","user_id":null,"status":"active","group_type":"all","allowed_vms":[]},{"id":"tenant","user_id":"user-one","status":"disabled","group_type":"anthropic","allowed_vms":["vm-one"]}]}`,
 			invoke: func(client *HTTPClient) error {
 				keys, err := client.ListKeys(ctx, "")
-				if err == nil && (len(keys) != 2 || keys[0].UserID != "" || !keys[0].Active || keys[1].Active) {
+				if err == nil && (len(keys) != 1 || keys[0].UserID != "" || !keys[0].Active) {
 					return fmt.Errorf("keys=%+v", keys)
 				}
 				return err

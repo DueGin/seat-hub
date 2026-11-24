@@ -4,7 +4,6 @@ package app
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -22,7 +21,6 @@ import (
 	"github.com/DueGin/seat-hub/internal/mail"
 	"github.com/DueGin/seat-hub/internal/order"
 	"github.com/DueGin/seat-hub/internal/payment"
-	"github.com/DueGin/seat-hub/internal/provision"
 	"github.com/DueGin/seat-hub/internal/secret"
 	"github.com/DueGin/seat-hub/internal/selfcheck"
 	"github.com/DueGin/seat-hub/internal/signup"
@@ -75,7 +73,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	vmClient := vm2api.NewHTTPClient(cfg.VM2APIBaseURL, cfg.VM2APIMasterKey, nil)
 
 	settingsAdv := &settingsAdapter{settings: settings, audit: audit}
-	catalogSvc := catalog.New(db.DB, withoutForeignPools(cachedVMHealth(vmClient), foreignPoolProbe(db.DB, vmClient)))
+	catalogSvc := catalog.New(db.DB, withoutOwnedVMs(cachedVMHealth(vmClient), ownerProbe(vmClient)))
 	orderSvc := order.New(db.DB, catalogSvc, nil)
 	paymentSvc, err := payment.NewService(db.DB, orderSvc, payment.ServiceOptions{
 		Providers: buildProviders(cfg, settingsAdv),
@@ -95,7 +93,7 @@ func New(cfg config.Config, logger *slog.Logger) (*App, error) {
 	orderSvc.SetFulfiller(prov)
 
 	usersAdv := &usersAdapter{users: users, db: db.DB, client: vmClient, sessions: sessions,
-		syncScope: prov.prov.SyncUserScope, deleteScope: prov.prov.DeleteUserScope}
+		setStatus: prov.prov.SetUserStatus, lockScope: prov.prov.LockScope, deleteKeys: prov.prov.DeleteReferencedKeysLocked}
 	usersAdv.entitle = func(ctx context.Context, userID int64) (api.AdminUserDTO, error) {
 		ent, err := prov.prov.Entitlements(ctx, userID)
 		if err != nil {
@@ -276,38 +274,35 @@ func cachedVMHealth(client vm2api.Client) catalog.HealthFunc {
 	}
 }
 
-// foreignPoolProbe reports whether a VM sits in a vm2api pool the portal does
-// not own (provision.ForeignPoolVMs), cached for 30 seconds like the health
-// probe. When the pool list cannot be read it answers false: stock stays as
-// it was, and allocation re-checks with a fresh list anyway.
-func foreignPoolProbe(db *sql.DB, client vm2api.Client) func(vmID string) bool {
+// ownerProbe uses a short-lived upstream snapshot. Allocation always probes again.
+func ownerProbe(client vm2api.Client) func(vmID string) bool {
 	var (
 		mu      sync.Mutex
-		held    map[string]vm2api.Pool
+		owned   map[string]bool
 		expires time.Time
 	)
 	return func(vmID string) bool {
 		mu.Lock()
 		defer mu.Unlock()
-		if now := time.Now(); held == nil || now.After(expires) {
+		if now := time.Now(); now.After(expires) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			foreign, err := provision.ForeignPoolVMs(ctx, db, client)
+			vms, err := client.ListVMs(ctx, vm2api.VMFilter{})
 			cancel()
-			if err != nil {
-				foreign = map[string]vm2api.Pool{}
+			if err == nil {
+				owned = make(map[string]bool, len(vms))
+				for _, vm := range vms {
+					owned[vm.ID] = vm.OwnerUserID != ""
+				}
 			}
-			held, expires = foreign, now.Add(30*time.Second)
+			expires = now.Add(30 * time.Second)
 		}
-		_, ok := held[vmID]
-		return ok
+		return owned[vmID]
 	}
 }
 
-// withoutForeignPools keeps foreign-pooled VMs out of rental stock: they are
-// skipped at allocation, so selling them would only fail the order.
-func withoutForeignPools(health catalog.HealthFunc, foreign func(string) bool) catalog.HealthFunc {
+func withoutOwnedVMs(health catalog.HealthFunc, owned func(string) bool) catalog.HealthFunc {
 	return func(vmID string) (bool, bool) {
-		if foreign(vmID) {
+		if owned(vmID) {
 			return false, true
 		}
 		return health(vmID)

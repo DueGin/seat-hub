@@ -15,9 +15,9 @@ type User struct {
 	PasswordHash      string `json:"-"`
 	Role              string `json:"role"`
 	Status            string `json:"status"`
-	VM2APIUserID      string `json:"vm2api_user_id"`
-	VM2APIPoolID      string `json:"vm2api_pool_id"`
-	VM2APIUsername    string `json:"vm2api_username"`
+	VM2APIUserID      string `json:"-"`
+	VM2APIPoolID      string `json:"-"`
+	VM2APIUsername    string `json:"-"`
 	VM2APIPasswordEnc string `json:"-"`
 	CreatedAt         string `json:"created_at"`
 	UpdatedAt         string `json:"updated_at"`

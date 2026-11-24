@@ -79,15 +79,18 @@ test('修改账号范围恢复可用性，普通更新保留范围', async () =>
   assert.deepEqual(all.envelope.data.key.scope, { mode: 'all', accounts: [], usable: true })
 })
 
-test('账号释放后指定范围失效，管理员详情同步展示范围和账号池', async () => {
+test('账号释放后指定范围失效，管理员详情同步展示范围和上游用户', async () => {
   const created = await request('/keys', 'POST', { name: '释放回归', scope: { mode: 'selected', accounts: [4] } })
   const id = created.envelope.data.key.id
   assert.equal((await request('/admin/accounts/4/release', 'POST', {})).status, 200)
   const { envelope } = await request('/admin/users/1')
-  assert.ok(envelope.data.user.vm2api_pool_id)
+  assert.equal(envelope.data.user.vm2api_username, 'portal_1')
+  assert.ok(envelope.data.user.vm2api_user_id)
+  assert.ok(!('vm2api_pool_id' in envelope.data.user))
   assert.deepEqual((envelope.data.keys as MockKey[]).find(key => key.id === id)?.scope, { mode: 'selected', accounts: [4], usable: false })
   const { envelope: empty } = await request('/admin/users/3')
-  assert.equal(empty.data.user.vm2api_pool_id, '')
+  assert.equal(empty.data.user.vm2api_username, '')
+  assert.equal(empty.data.user.vm2api_user_id, '')
   const invalid = await request(`/keys/${id}`, 'PATCH', { scope: { mode: 'selected', accounts: [1, 4] } })
   assert.equal(invalid.status, 422)
   assert.equal(invalid.envelope.error.code, 'key_scope_invalid')

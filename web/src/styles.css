@@ -169,6 +169,12 @@ legend { padding: 0 8px; color: var(--text-2); }
 .notice-success { color: var(--success); background: var(--success-soft); border-color: var(--success-border); }
 .notice-danger { color: var(--danger); background: var(--danger-soft); border-color: var(--danger-border); }
 .notice a { display: inline-flex; align-items: center; gap: 5px; margin-left: 8px; color: var(--accent-text); }
+.scope-warnings > .row { margin-top: 8px; }
+.scope-warning-items { display: grid; gap: 4px; list-style: disc; padding-inline-start: 1.4em; overflow-wrap: anywhere; }
+.scope-warning-items a { display: inline; margin: 0; text-decoration: underline; }
+.rental-owner { min-width: 150px; max-width: 250px; white-space: normal; overflow-wrap: anywhere; }
+.rental-owner .badge { white-space: normal; }
+.rental-owner .badge > span { flex-shrink: 0; }
 .selfcheck-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
 .selfcheck-list li { display: flex; align-items: flex-start; gap: 10px; line-height: 1.7; }
 .selfcheck-list li > svg { margin-top: 3px; }

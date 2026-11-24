@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -21,15 +22,18 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DueGin/seat-hub/internal/privacy"
 )
 
 type HTTPClient struct {
+	*panelKeys
 	baseURL   string
 	masterKey string
 	client    *http.Client
+	sessions  sync.Map
 }
 
 var _ Client = (*HTTPClient)(nil)
@@ -38,10 +42,16 @@ func NewHTTPClient(baseURL, masterKey string, client *http.Client) *HTTPClient {
 	if client == nil {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
-	return &HTTPClient{baseURL: strings.TrimRight(baseURL, "/"), masterKey: masterKey, client: client}
+	result := &HTTPClient{baseURL: strings.TrimRight(baseURL, "/"), masterKey: masterKey, client: client}
+	result.panelKeys = &panelKeys{call: result.call}
+	return result
 }
 
 func (client *HTTPClient) call(ctx context.Context, method, path string, query url.Values, input, output any) error {
+	return client.callAs(ctx, client.masterKey, method, path, query, input, output)
+}
+
+func (client *HTTPClient) callAs(ctx context.Context, token, method, path string, query url.Values, input, output any) error {
 	var body io.Reader
 	if input != nil {
 		encoded, err := json.Marshal(input)
@@ -58,7 +68,9 @@ func (client *HTTPClient) call(ctx context.Context, method, path string, query u
 	if err != nil {
 		return fmt.Errorf("create panel request: %w", err)
 	}
-	request.Header.Set("Authorization", "Bearer "+client.masterKey)
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
 	request.Header.Set("Accept", "application/json")
 	if input != nil {
 		request.Header.Set("Content-Type", "application/json")
@@ -130,31 +142,55 @@ func (client *HTTPClient) CreateUser(ctx context.Context, username, password str
 	return data.Item, err
 }
 
+func (client *HTTPClient) ListUsers(ctx context.Context) ([]User, error) {
+	var data struct {
+		Items []User `json:"items"`
+	}
+	if err := client.call(ctx, http.MethodGet, "/users", nil, nil, &data); err != nil {
+		return nil, err
+	}
+	return append([]User{}, data.Items...), nil
+}
+
 func (client *HTTPClient) SetUserEnabled(ctx context.Context, userID string, enabled bool) error {
 	return client.call(ctx, http.MethodPatch, "/users/"+url.PathEscape(userID), nil, map[string]bool{"enabled": enabled}, nil)
 }
 
-func (client *HTTPClient) CreateKey(ctx context.Context, input CreateKeyInput) (Key, error) {
+func (client *HTTPClient) SetUserPassword(ctx context.Context, userID, password string) error {
+	return client.call(ctx, http.MethodPatch, "/users/"+url.PathEscape(userID), nil, map[string]string{"password": password}, nil)
+}
+
+func (client *panelKeys) CreateKey(ctx context.Context, input CreateKeyInput) (Key, error) {
 	if !input.Scope.Valid() {
 		return Key{}, ErrInvalidScope
+	}
+	if input.UserID != client.owner {
+		return Key{}, errors.New("key owner does not match panel identity")
 	}
 	var data struct {
 		Item struct {
 			ID     string `json:"id"`
 			Key    string `json:"key"`
 			Prefix string `json:"key_prefix"`
+			UserID string `json:"user_id"`
 		} `json:"item"`
 	}
 	body := map[string]any{
-		"name": input.Name, "user_id": input.UserID, "max_concurrency": clampConcurrency(input.MaxConcurrency),
+		"name": input.Name, "max_concurrency": clampConcurrency(input.MaxConcurrency),
 	}
 	setKeyScope(body, input.Scope)
 	err := client.call(ctx, http.MethodPost, "/api-keys", nil, body, &data)
 	if err != nil {
 		return Key{}, err
 	}
-	if !strings.HasPrefix(data.Item.Key, "sk-vm-") || strings.ContainsAny(data.Item.Key, "…* \t\r\n") {
-		return Key{}, fmt.Errorf("decode created key: missing plaintext key")
+	if data.Item.UserID != client.owner || !strings.HasPrefix(data.Item.Key, "sk-vm-") || strings.ContainsAny(data.Item.Key, "…* \t\r\n") || data.Item.ID == "" {
+		failure := errors.New("created key response has invalid owner, id or secret")
+		if data.Item.ID != "" {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			return Key{}, errors.Join(failure, client.DeleteKey(cleanupCtx, data.Item.ID))
+		}
+		return Key{}, failure
 	}
 	return Key{ID: data.Item.ID, Secret: data.Item.Key, Prefix: data.Item.Prefix}, nil
 }
@@ -163,7 +199,7 @@ func clampConcurrency(value int) int {
 	return max(0, min(128, value))
 }
 
-func (client *HTTPClient) UpdateKey(ctx context.Context, keyID string, input UpdateKeyInput) error {
+func (client *panelKeys) UpdateKey(ctx context.Context, keyID string, input UpdateKeyInput) error {
 	body := map[string]any{}
 	if input.Scope != nil {
 		if !input.Scope.Valid() {
@@ -186,7 +222,7 @@ func (client *HTTPClient) UpdateKey(ctx context.Context, keyID string, input Upd
 	return client.call(ctx, http.MethodPatch, "/api-keys/"+url.PathEscape(keyID), nil, body, nil)
 }
 
-func (client *HTTPClient) DeleteKey(ctx context.Context, keyID string) error {
+func (client *panelKeys) DeleteKey(ctx context.Context, keyID string) error {
 	return client.call(ctx, http.MethodDelete, "/api-keys/"+url.PathEscape(keyID), nil, nil, nil)
 }
 
@@ -246,7 +282,7 @@ func (usage panelUsage) mapped() UsageBreakdown {
 	return result
 }
 
-func (client *HTTPClient) KeyStats(ctx context.Context, keyID string) (UsageBreakdown, error) {
+func (client *panelKeys) KeyStats(ctx context.Context, keyID string) (UsageBreakdown, error) {
 	var data struct {
 		Usage panelUsage `json:"usage_stats"`
 	}

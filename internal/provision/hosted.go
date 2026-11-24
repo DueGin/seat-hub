@@ -44,7 +44,7 @@ func (service *Service) ProvisionHosted(ctx context.Context, resourceID int64) e
 	if account.SelfcheckState == "exhausted" {
 		return ErrSelfcheckExhausted
 	}
-	owner, err := service.ServiceUser(ctx)
+	owner, err := service.EnsureUpstreamUser(ctx, account.UserID)
 	if err != nil {
 		return service.failResource(ctx, resourceID, err)
 	}
@@ -70,9 +70,6 @@ func (service *Service) ProvisionHosted(ctx context.Context, resourceID int64) e
 			if stopErr := service.client.SetSchedulable(cleanupCtx, vm.ID, false); stopErr != nil && !vm2api.IsStatus(stopErr, 404) {
 				return service.releaseError(cleanupCtx, resourceID, errors.Join(fmt.Errorf("save hosted vm: %w", err), stopErr))
 			}
-			if syncErr := service.SyncUserScope(cleanupCtx, account.UserID); syncErr != nil {
-				return service.releaseError(cleanupCtx, resourceID, errors.Join(fmt.Errorf("save hosted vm: %w", err), syncErr))
-			}
 			cleanupErr := service.client.DeleteVM(cleanupCtx, vm.ID)
 			return errors.Join(fmt.Errorf("save hosted vm: %w", err), cleanupErr)
 		}
@@ -97,6 +94,10 @@ func (service *Service) ProvisionHosted(ctx context.Context, resourceID int64) e
 func (service *Service) prepareHosted(ctx context.Context, account Account, owner string) error {
 	fail := func(stage string, err error) error {
 		return service.failStage(ctx, account.ID, stage, err)
+	}
+	ok, err := service.mayMutateVM(ctx, account)
+	if err != nil || !ok {
+		return fail(stageOwner, errors.Join(ErrInvalidState, err))
 	}
 	if err := service.client.SetSchedulable(ctx, account.VMID, false); err != nil {
 		return fail(stageSlot, fmt.Errorf("disable hosted scheduling: %w", err))
@@ -126,7 +127,7 @@ func (service *Service) ensureOnboardable(ctx context.Context, account Account) 
 	if err != nil {
 		return err
 	}
-	owner, err := service.ServiceUser(ctx)
+	owner, err := service.EnsureUpstreamUser(ctx, account.UserID)
 	if err != nil {
 		return err
 	}
@@ -379,6 +380,10 @@ func (service *Service) watchBootstrap(ctx context.Context, resourceID int64, de
 	case "failed":
 		return service.failResource(ctx, resourceID, fmt.Errorf("bootstrap failed: %s", bootstrap.Message))
 	case "succeeded":
+		ok, err := service.mayMutateVM(ctx, account)
+		if err != nil || !ok {
+			return service.failResource(ctx, resourceID, errors.Join(ErrInvalidState, err))
+		}
 		if err := service.client.SetSchedulable(ctx, account.VMID, true); err != nil {
 			return service.failResource(ctx, resourceID, fmt.Errorf("enable hosted scheduling: %w", err))
 		}

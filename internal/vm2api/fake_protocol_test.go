@@ -70,7 +70,8 @@ func TestFakeProtocolEnforcesOwnerAndScope(t *testing.T) {
 		{name: "allowlist own vm", members: []string{"own"}, owner: "owner", status: 200},
 		{name: "allowlist excludes own vm", members: []string{"foreign"}, owner: "owner", status: 503, code: "pool_unavailable"},
 		{name: "stopped vm", members: []string{"own"}, off: true, owner: "owner", status: 503, code: "pool_unavailable"},
-		{name: "master owner still scoped", members: []string{"foreign"}, status: 200},
+		{name: "ownerless cannot schedule owned vm", members: []string{"foreign"}, status: 503, code: "pool_unavailable"},
+		{name: "ownerless schedules platform vm", members: []string{"platform"}, status: 200},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -78,6 +79,7 @@ func TestFakeProtocolEnforcesOwnerAndScope(t *testing.T) {
 			owner, _ := fake.CreateUser(ctx, "owner", "password")
 			fake.AddVM(VM{ID: "own", OwnerUserID: owner.ID, HasCredential: true})
 			fake.AddVM(VM{ID: "foreign", OwnerUserID: "other", HasCredential: true})
+			fake.AddVM(VM{ID: "platform", HasCredential: true})
 			scope := KeyScope{AllowedVMs: tc.members}
 			if tc.pool {
 				pool, err := fake.CreatePool(ctx, "pool", tc.members)
@@ -119,7 +121,7 @@ func TestFakeProtocolEnforcesOwnerAndScope(t *testing.T) {
 			if err != nil || logs.Total != 1 || logs.Items[0].ErrorLabel != logCode {
 				t.Fatalf("logs=%+v err=%v", logs, err)
 			}
-			if status == 200 && (ownerID != "" && logs.Items[0].VMID != "own" || ownerID == "" && logs.Items[0].VMID != "foreign") {
+			if status == 200 && (ownerID != "" && logs.Items[0].VMID != "own" || ownerID == "" && logs.Items[0].VMID != "platform") {
 				t.Fatalf("wrong vm: %+v", logs.Items[0])
 			}
 		})

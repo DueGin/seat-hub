@@ -22,12 +22,13 @@ import (
 
 // usersAdapter implements api.UserStore over the SQLite repositories.
 type usersAdapter struct {
-	users       *store.Users
-	db          *sql.DB
-	client      vm2api.Client
-	sessions    *store.Sessions
-	syncScope   func(context.Context, int64) error
-	deleteScope func(context.Context, int64) error
+	users      *store.Users
+	db         *sql.DB
+	client     vm2api.Client
+	sessions   *store.Sessions
+	setStatus  func(context.Context, int64, string) error
+	lockScope  func(int64) func()
+	deleteKeys func(context.Context, int64, []string) error
 	// entitle is injected by the wiring layer (provision.Service.Entitlements).
 	// It is a function rather than a concrete service to keep this package's
 	// dependency graph acyclic.
@@ -76,13 +77,7 @@ func (a *usersAdapter) SetStatus(ctx context.Context, id int64, status string) e
 	if _, err := a.users.GetByID(ctx, id); err != nil {
 		return err
 	}
-	if err := a.users.SetStatus(ctx, id, status); err != nil {
-		return err
-	}
-	if err := a.syncScope(ctx, id); err != nil {
-		return fmt.Errorf("sync user scope: %w", err)
-	}
-	return nil
+	return a.setStatus(ctx, id, status)
 }
 func (a *usersAdapter) SetRole(ctx context.Context, id int64, role string) error {
 	return a.users.SetRole(ctx, id, role)
@@ -113,7 +108,7 @@ func (a *usersAdapter) AdminList(ctx context.Context, filter api.AdminUserFilter
 }
 
 func (a *usersAdapter) toAdminDTO(ctx context.Context, u store.User) api.AdminUserDTO {
-	dto := api.AdminUserDTO{UserDTO: toUserDTO(u), VM2APIUserID: u.VM2APIUserID, VM2APIPoolID: u.VM2APIPoolID, Note: u.Note, LastLoginAt: u.LastLoginAt, LastLoginIP: u.LastLoginIP}
+	dto := api.AdminUserDTO{UserDTO: toUserDTO(u), VM2APIUserID: u.VM2APIUserID, VM2APIUsername: u.VM2APIUsername, Note: u.Note, LastLoginAt: u.LastLoginAt, LastLoginIP: u.LastLoginIP}
 	a.fillEntitlement(ctx, u.ID, &dto)
 	if a.sessions != nil {
 		dto.ActiveSessions, _ = a.sessions.CountActive(ctx, u.ID)
@@ -155,9 +150,12 @@ func (a *usersAdapter) RevokeSessions(ctx context.Context, id int64) error {
 }
 
 // Delete removes a user that never bought anything. Upstream keys go first, so
-// a key cannot outlive its owner and keep spending. Delete the user's pool,
-// but only disable a legacy per-user identity, never the shared service user.
+// a key cannot outlive its owner and keep spending. Disable the upstream user.
 func (a *usersAdapter) Delete(ctx context.Context, id int64) error {
+	if a.lockScope != nil {
+		unlock := a.lockScope(id)
+		defer unlock()
+	}
 	u, err := a.users.GetByID(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
 		return api.Err(err, 404, "user_not_found", "用户不存在")
@@ -193,13 +191,8 @@ func (a *usersAdapter) Delete(ctx context.Context, id int64) error {
 		return err
 	}
 	if a.client != nil {
-		for _, keyID := range keys {
-			if err := a.client.DeleteKey(ctx, keyID); err != nil && !vm2api.IsStatus(err, 404) {
-				return fmt.Errorf("delete vm2api key %s: %w", keyID, err)
-			}
-		}
-		if err := a.deleteScope(ctx, id); err != nil {
-			return fmt.Errorf("delete user scope: %w", err)
+		if err := a.deleteKeys(ctx, id, keys); err != nil {
+			return fmt.Errorf("delete vm2api keys: %w", err)
 		}
 		if u.VM2APIUserID != "" {
 			if err := a.client.SetUserEnabled(ctx, u.VM2APIUserID, false); err != nil && !vm2api.IsStatus(err, 404) {

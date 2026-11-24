@@ -73,16 +73,16 @@ func EffectiveConcurrency(total int) int {
 
 // syncConcurrency only pushes max_concurrency to keys whose synced value is
 // stale. The expiry sweep calls it for every user every minute, so it must
-// stay cheap: no pool or scope traffic. Event-driven sync_concurrency jobs run
-// the full SyncUserScope instead (syncJob), and scope_reconcile backs both up.
-// It never changes a key's active flag or scope, so legacy keys are safe here.
+// stay cheap: only open a panel session when a stale member key exists.
 func (service *Service) syncConcurrency(ctx context.Context, userID int64) error {
+	unlock := service.LockScope(userID)
+	defer unlock()
 	entitlements, err := service.Entitlements(ctx, userID)
 	if err != nil {
 		return err
 	}
 	limit := EffectiveConcurrency(entitlements.Concurrency.Total)
-	rows, err := service.db.QueryContext(ctx, `SELECT id,vm2api_key_id FROM api_keys WHERE user_id=? AND status='active' AND synced_concurrency<>?`, userID, limit)
+	rows, err := service.db.QueryContext(ctx, `SELECT k.id,k.vm2api_key_id FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.user_id=? AND k.status='active' AND k.synced_concurrency<>? AND u.status='active' AND u.vm2api_user_id<>'' AND k.upstream_owner IN ('',u.vm2api_user_id)`, userID, limit)
 	if err != nil {
 		return fmt.Errorf("list keys for sync: %w", err)
 	}
@@ -104,9 +104,16 @@ func (service *Service) syncConcurrency(ctx context.Context, userID int64) error
 	if readErr != nil {
 		return fmt.Errorf("read sync keys: %w", readErr)
 	}
+	if len(keys) == 0 {
+		return nil
+	}
+	_, client, err := service.UserKeysLocked(ctx, userID)
+	if err != nil {
+		return err
+	}
 	for _, item := range keys {
 		upstream := limit
-		if err := service.client.UpdateKey(ctx, item.upstream, vm2api.UpdateKeyInput{MaxConcurrency: &upstream}); err != nil {
+		if err := client.UpdateKey(ctx, item.upstream, vm2api.UpdateKeyInput{MaxConcurrency: &upstream}); err != nil {
 			// A key deleted upstream is already gone: there is no concurrency
 			// left to clamp, and failing here would abort the caller's sweep.
 			if !vm2api.IsStatus(err, 404) {

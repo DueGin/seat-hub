@@ -122,10 +122,6 @@ func (service *Service) Create(ctx context.Context, userID int64, in api.KeyInpu
 	if err := service.checkKeyLimit(ctx, userID); err != nil {
 		return api.KeyDTO{}, "", err
 	}
-	userActive, err := service.userActive(ctx, userID)
-	if err != nil {
-		return api.KeyDTO{}, "", err
-	}
 	mode, accounts, err := service.provisioning.ValidateKeyScope(ctx, userID, in.Scope.Mode, in.Scope.Accounts)
 	if err != nil {
 		return api.KeyDTO{}, "", scopeError(err)
@@ -136,13 +132,12 @@ func (service *Service) Create(ctx context.Context, userID int64, in api.KeyInpu
 	}
 	unlock := service.provisioning.LockScope(userID)
 	defer unlock()
-	userActive, err = service.userActive(ctx, userID)
-	if err != nil {
-		return api.KeyDTO{}, "", err
+	upstreamUser, keys, err := service.provisioning.UserKeysLocked(ctx, userID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return api.KeyDTO{}, "", ErrUserNotFound
 	}
-	upstreamUser, err := service.provisioning.ServiceUser(ctx)
 	if err != nil {
-		return api.KeyDTO{}, "", fmt.Errorf("ensure service user: %w", err)
+		return api.KeyDTO{}, "", fmt.Errorf("open upstream key session: %w", err)
 	}
 	scope, usable, err := service.provisioning.KeyScopeFor(ctx, userID, mode, accounts)
 	if err != nil {
@@ -154,19 +149,16 @@ func (service *Service) Create(ctx context.Context, userID int64, in api.KeyInpu
 	}
 	plaintext := "sk-pt-" + token
 	limit := provision.EffectiveConcurrency(entitlements.Concurrency.Total)
-	upstream, err := service.client.CreateKey(ctx, vm2api.CreateKeyInput{Name: name, UserID: upstreamUser, MaxConcurrency: limit, Scope: scope})
+	if !usable {
+		return api.KeyDTO{}, "", scopeError(provision.ErrScopeEmpty)
+	}
+	upstream, err := keys.CreateKey(ctx, vm2api.CreateKeyInput{Name: name, UserID: upstreamUser, MaxConcurrency: limit, Scope: *scope})
 	if err != nil {
 		return api.KeyDTO{}, "", fmt.Errorf("create upstream key: %w", err)
 	}
-	if !usable || !userActive {
-		active := false
-		if err := service.client.UpdateKey(ctx, upstream.ID, vm2api.UpdateKeyInput{Active: &active}); err != nil {
-			return api.KeyDTO{}, "", service.discardKey(ctx, upstream.ID, fmt.Errorf("disable unusable key: %w", err))
-		}
-	}
 	encrypted, err := service.box.Seal(upstream.Secret)
 	if err != nil {
-		return api.KeyDTO{}, "", service.discardKey(ctx, upstream.ID, fmt.Errorf("encrypt upstream key: %w", err))
+		return api.KeyDTO{}, "", service.discardKey(ctx, keys, upstream.ID, fmt.Errorf("encrypt upstream key: %w", err))
 	}
 	now := store.FmtTime(service.now())
 	var id int64
@@ -177,16 +169,16 @@ func (service *Service) Create(ctx context.Context, userID int64, in api.KeyInpu
 		if errors.Is(err, sql.ErrNoRows) {
 			err = ErrKeyLimit
 		}
-		return api.KeyDTO{}, "", service.discardKey(ctx, upstream.ID, fmt.Errorf("save key: %w", err))
+		return api.KeyDTO{}, "", service.discardKey(ctx, keys, upstream.ID, fmt.Errorf("save key: %w", err))
 	}
 	return api.KeyDTO{ID: id, Name: name, Prefix: plaintext[:10], Status: "active", CreatedAt: now,
 		Scope: api.KeyScopeDTO{Mode: mode, Accounts: store.NormalizeIDs(accounts), Usable: usable}}, plaintext, nil
 }
 
-func (service *Service) discardKey(ctx context.Context, id string, cause error) error {
+func (service *Service) discardKey(ctx context.Context, keys vm2api.KeyClient, id string, cause error) error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if err := service.client.DeleteKey(cleanupCtx, id); err != nil && !vm2api.IsStatus(err, 404) {
+	if err := keys.DeleteKey(cleanupCtx, id); err != nil && !vm2api.IsStatus(err, 404) {
 		return errors.Join(cause, fmt.Errorf("discard upstream key: %w", err))
 	}
 	return cause
@@ -220,9 +212,6 @@ func (service *Service) Update(ctx context.Context, userID, id int64, in api.Key
 		return api.KeyDTO{}, fmt.Errorf("read upstream key: %w", err)
 	}
 	if in.Scope != nil {
-		if owner == "" {
-			return api.KeyDTO{}, ErrKeyMigrating
-		}
 		mode, accounts, err := service.provisioning.ValidateKeyScope(ctx, userID, in.Scope.Mode, in.Scope.Accounts)
 		if err != nil {
 			return api.KeyDTO{}, scopeError(err)
@@ -237,7 +226,17 @@ func (service *Service) Update(ctx context.Context, userID, id int64, in api.Key
 	if in.Name == nil && in.Status == nil && in.Scope == nil {
 		return item, nil
 	}
-	original, err := service.client.GetKey(ctx, upstreamID)
+	upstreamOwner, keys, err := service.provisioning.UserKeysLocked(ctx, userID)
+	if err != nil {
+		return api.KeyDTO{}, fmt.Errorf("open upstream key session: %w", err)
+	}
+	if owner != "" && owner != upstreamOwner {
+		return api.KeyDTO{}, ErrKeyMigrating
+	}
+	original, err := keys.GetKey(ctx, upstreamID)
+	if vm2api.IsStatus(err, 404) {
+		return api.KeyDTO{}, ErrKeyMigrating
+	}
 	if err != nil {
 		return api.KeyDTO{}, fmt.Errorf("read upstream key state: %w", err)
 	}
@@ -261,12 +260,12 @@ func (service *Service) Update(ctx context.Context, userID, id int64, in api.Key
 	if status != "" {
 		item.Status = status
 	}
-	if owner != "" {
+	{
 		scope, usable, err := service.provisioning.KeyScopeFor(ctx, userID, item.Scope.Mode, item.Scope.Accounts)
 		if err != nil {
 			return api.KeyDTO{}, fmt.Errorf("compute updated key scope: %w", err)
 		}
-		input.Scope, item.Scope.Usable = &scope, usable
+		input.Scope, item.Scope.Usable = scope, usable
 	}
 	userActive, err := service.userActive(ctx, userID)
 	if err != nil {
@@ -274,7 +273,7 @@ func (service *Service) Update(ctx context.Context, userID, id int64, in api.Key
 	}
 	active := item.Status == "active" && userActive && item.Scope.Usable
 	input.Active = &active
-	if err := service.client.UpdateKey(ctx, upstreamID, input); err != nil {
+	if err := keys.UpdateKey(ctx, upstreamID, input); err != nil {
 		return api.KeyDTO{}, fmt.Errorf("update upstream key: %w", err)
 	}
 	err = service.db.QueryRowContext(ctx, `UPDATE api_keys SET name=?,status=?,synced_concurrency=?,scope_mode=?,scope_accounts=?,updated_at=? WHERE id=? AND user_id=? AND status<>'deleted'
@@ -295,7 +294,7 @@ func (service *Service) Update(ctx context.Context, userID, id int64, in api.Key
 		if scope, ok := original.Scope(); ok {
 			restore.Scope = &scope
 		}
-		if cleanupErr := service.client.UpdateKey(cleanupCtx, upstreamID, restore); cleanupErr != nil {
+		if cleanupErr := keys.UpdateKey(cleanupCtx, upstreamID, restore); cleanupErr != nil {
 			return api.KeyDTO{}, errors.Join(cause, fmt.Errorf("restore upstream key: %w", cleanupErr))
 		}
 		return api.KeyDTO{}, cause
@@ -308,15 +307,15 @@ func (service *Service) Delete(ctx context.Context, userID, id int64) error {
 	defer service.mu.Unlock()
 	unlock := service.provisioning.LockScope(userID)
 	defer unlock()
-	var upstreamID string
-	err := service.db.QueryRowContext(ctx, `SELECT vm2api_key_id FROM api_keys WHERE id=? AND user_id=? AND status<>'deleted'`, id, userID).Scan(&upstreamID)
+	var upstreamID, previous string
+	err := service.db.QueryRowContext(ctx, `SELECT vm2api_key_id,previous_vm2api_key_ids FROM api_keys WHERE id=? AND user_id=? AND status<>'deleted'`, id, userID).Scan(&upstreamID, &previous)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrKeyNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("read upstream key: %w", err)
 	}
-	if err := service.client.DeleteKey(ctx, upstreamID); err != nil && !vm2api.IsStatus(err, 404) {
+	if err := service.provisioning.DeleteReferencedKeysLocked(ctx, userID, append(store.DecodeStrings(previous), upstreamID)); err != nil {
 		return fmt.Errorf("delete upstream key: %w", err)
 	}
 	if _, err := service.db.ExecContext(ctx, `UPDATE api_keys SET status='deleted',updated_at=? WHERE id=? AND user_id=?`, store.FmtTime(service.now()), id, userID); err != nil {
