@@ -8,12 +8,14 @@ import (
 )
 
 // ErrInvalidScope is returned before any request when a key scope is zero or
-// sets both a pool and an allowlist.
-var ErrInvalidScope = errors.New("vm2api: key scope must set exactly one of pool or allowed VMs")
+// sets more than one mode.
+var ErrInvalidScope = errors.New("key scope must set exactly one of all, pool or allowed vms")
 
 func setKeyScope(body map[string]any, scope KeyScope) {
 	body["group_type"] = "anthropic"
-	if scope.PoolID != "" {
+	if scope.All {
+		body["group_type"], body["allowed_vms"], body["vm_pool_id"] = "all", []string{}, nil
+	} else if scope.PoolID != "" {
 		body["vm_pool_id"] = scope.PoolID
 	} else {
 		body["allowed_vms"], body["vm_pool_id"] = scope.AllowedVMs, nil
@@ -31,15 +33,18 @@ func (key panelKeyInfo) mapped() KeyInfo {
 	return key.KeyInfo
 }
 
-func (client *HTTPClient) GetKey(ctx context.Context, keyID string) (KeyInfo, error) {
+func (client *panelKeys) GetKey(ctx context.Context, keyID string) (KeyInfo, error) {
 	var data struct {
 		Item panelKeyInfo `json:"item"`
 	}
 	err := client.call(ctx, http.MethodGet, "/api-keys/"+url.PathEscape(keyID)+"/stats", nil, nil, &data)
+	if err == nil && data.Item.UserID != client.owner {
+		err = &Error{Status: 404, Code: "api_key_not_found"}
+	}
 	return data.Item.mapped(), err
 }
 
-func (client *HTTPClient) ListKeys(ctx context.Context, userID string) ([]KeyInfo, error) {
+func (client *panelKeys) ListKeys(ctx context.Context, userID string) ([]KeyInfo, error) {
 	var data struct {
 		Keys []panelKeyInfo `json:"keys"`
 	}
@@ -48,7 +53,7 @@ func (client *HTTPClient) ListKeys(ctx context.Context, userID string) ([]KeyInf
 	}
 	keys := make([]KeyInfo, 0, len(data.Keys))
 	for _, key := range data.Keys {
-		if userID == "" || key.UserID == userID {
+		if key.UserID == client.owner && (userID == "" || key.UserID == userID) {
 			keys = append(keys, key.mapped())
 		}
 	}

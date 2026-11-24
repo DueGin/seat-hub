@@ -13,7 +13,7 @@
 │                           ├ auth / 商品 / 订单 / 支付   ├ 门面 key → vm2api key 换头 │
 │                           ├ 权益 / 资源 / 托管上号        ├ 用户级并发闸               │
 │                           └ 用量视图（读 vm2api）        └ SSE / WebSocket 原样透传   │
-│ provision（后台任务）：建密钥与账号池、建槽、分配/回收租赁号、到期回收、同步并发与范围  │
+│ provision（后台任务）：建上游用户、建槽、分配/回收租赁号、到期回收、同步并发与范围    │
 │ SQLite                                                                              │
 └──────────────────────────────────┬─────────────────────────────────────────────────┘
                                    │ Master key：/api/panel/*；用户 sk-vm-…：/v1/*
@@ -21,19 +21,19 @@
                                 vm2api
 ```
 
-- 门面只用 vm2api 的 **Master key** 调 `/api/panel/*`，永不下发给浏览器。
+- 门面用 **Master key** 管理 vm2api 用户和资源、读取用量；用对应 vm2api 用户的**面板会话**管理租户密钥。两种凭据都不下发给浏览器。需要 vm2api v1.4.041 或更新版本。
 - 用户流量：门面 key `sk-pt-…` → 查出该 key 对应的 vm2api 密钥 `sk-vm-…` → 换掉鉴权头 → 透传到 vm2api `/v1/*`。
-- **账号体系分离**：门面用户只存在于门面。vm2api 里只有一个「seat-hub 服务账号」（role=`user`），门面名下所有号和所有上游密钥都归它。vm2api 对 `user_id` 归属的密钥只会调度到该用户名下的 VM（`ownerScopeFromApiKey`），所以 Master key、其他渠道的密钥都碰不到门面的号。
-- **按密钥限定可调用的号**：每个门面用户在 vm2api 有一个账号池（`vm_pool_id`），成员是他当前持有的号。门面密钥要么绑定这个池（「全部账号」），要么用白名单只放行勾选的号（「指定账号」）。门面之间的用户隔离完全靠池成员和白名单，由 vm2api 强制执行；号被收回前先移出池和白名单。详见 [KEY_SCOPE.md](KEY_SCOPE.md)。
+- **账号体系分离**：每个门面用户按需创建一个 vm2api 用户（role=`user`），其号与上游密钥都归属于该用户。vm2api 强制按属主隔离（`ownerScopeFromApiKey`）；Master 和管理员密钥只能调度无归属的号。
+- **按密钥限定可调用的号**：「全部账号」仅受属主隔离约束，「指定账号」另有限定白名单；不再创建 vm2api 账号池。详见 [KEY_SCOPE.md](KEY_SCOPE.md)。
 
 ## 2. vm2api 原语映射
 
 | 门面概念 | vm2api 原语 |
 |---|---|
-| 服务账号 | 首次需要时 `POST /api/panel/users`（role=user，`vm_create_quota=0`）建一个，id 存 `settings.vm2api_service`。**不删除**（删除会把 `admin_assigned` 槽收回平台池） |
-| 门面用户 | 不在 vm2api 建用户；只建一个账号池 `POST /api/panel/vm-pools {name:"sh-…-u<id>", vm_ids}`，成员随持有的号同步（`PATCH /vm-pools/:id`） |
-| 门面 API key | `POST /api/panel/api-keys {name, user_id:<服务账号>, group_type:"anthropic", vm_pool_id \| allowed_vms, max_concurrency}`，明文只返回一次 → AES-GCM 加密落库。门面绝不发出 `group_type:"all"` 的密钥 |
-| 租赁账号 | 平台池里的 Claude VM，`PATCH /api/panel/vms/:id/owner {user_id:<服务账号>}` 并加入该用户的账号池；到期先移出池和白名单，再 `{user_id:null}` 收回平台池 |
+| 门面用户 | Master `POST /api/panel/users`（role=user，`vm_create_quota=0`）；`GET /users` 查归属，`PATCH /users/:id` 同步启用状态或修复已登记的凭据。只停用，不删除 |
+| 门面 API key | 以对应用户登录 `/api/panel/login` 后 `POST /api/panel/api-keys`，归属由会话确定；`group_type:"all"` 或 `group_type:"anthropic"` + `allowed_vms`，并同步 `max_concurrency`。上游密钥用 AES-GCM 加密保存 |
+| 租赁账号 | 只分配无归属的 Claude VM，Master `PATCH /api/panel/vms/:id/owner {user_id:<租户 vm2api 用户>}`；到期先关调度，再 `{user_id:null}` 收回平台池 |
+| 旧服务账号及账号池 | 启动自动迁回时清理门面引用的服务账号密钥及旧池；无密钥且无号的旧服务账号只停用 |
 | 托管席位 | 门面以 admin 身份 `POST /api/panel/vms/create`（模板来自后台设置）→ `PATCH owner` → `POST allocate-proxy` → OAuth 授权链接上号。到期/删除：先调度关，宽限期后 `DELETE /vms/:id`（凭证随槽销毁），**绝不**收回平台池 |
 | 并发 | 门面网关按用户计数（权威）；同时把每个 vm2api key 的 `max_concurrency` 同步为用户总并发（兜底） |
 | 账号真实用量 | `GET /api/panel/vms/:id`：5h/7d 利用率与重置时间、`estimate_*`、`billing.today/window_5h/window_7d`、`usage_stats`（30 天）、`cred_status`、`schedule_state`、席位占用 |
@@ -124,7 +124,7 @@ active ──凭证失效（vm2api 不可调度 oauth_*）──▶ needs_reauth
 - SQLite（`modernc.org/sqlite`，纯 Go，无 CGO），WAL。迁移文件 `internal/store/migrations/*.sql` 按序执行。
 - 密码 argon2id。会话 Cookie `portal_session`（HttpOnly、SameSite=Lax、Secure 跟随 `PORTAL_PUBLIC_BASE_URL` 是否 https），7 天。写操作要求 `Content-Type: application/json`（挡表单 CSRF）。登录限速。
 - 门面 key：`sk-pt-` + 40 位 base62；落库 `HMAC-SHA256(PORTAL_SECRET_KEY, key)` 与前 10 位展示前缀。
-- `vm2api` 密钥明文、易支付商户密钥：AES-256-GCM（密钥由 `PORTAL_SECRET_KEY` 派生）。服务账号的密码随机生成、不落库（没人用它登录）。
+- `vm2api` 密钥明文、面板用户随机密码、易支付商户密钥：AES-256-GCM（密钥由 `PORTAL_SECRET_KEY` 派生）。上游面板会话令牌只缓存在内存中。
 - 管理员：首次启动由 `PORTAL_ADMIN_EMAIL` / `PORTAL_ADMIN_PASSWORD` 灌入。
 
 ## 10. 配置（环境变量）

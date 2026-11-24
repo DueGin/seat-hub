@@ -4,7 +4,7 @@ import type {
   ModelUsage, Onboarding, Order, Overview, Page, Payment, PoolCandidate,
   PoolItem, Product, ProductKind, PublicConfig, Settings, Spend, Subscription,
   UsageLog, UsageSummary, User, NormalizedSettings, Selfcheck, SelfcheckCheck,
-  SelfcheckReport, KeyScope,
+  SelfcheckReport, KeyScope, ScopeWarning,
 } from './types'
 import { hasUsableKeyScope } from './key-scope.ts'
 import { ticketMock } from './mock-tickets.ts'
@@ -149,16 +149,17 @@ orders.push({ userId: 1, value: { order_no: 'PT202610310001', product_id: 1, pro
 orderTerms.set('PT202610310001', { unitQuantity: 5, durationDays: 30 })
 const rentalCandidates: PoolCandidate[] = Array.from({ length: 8 }, (_, index) => ({
   vm_id: `demo-vm-${index + 1}`, label: `演示资源 ${index + 1}`, email_masked: `vm${index + 1}***@***.com`, cred_status: 'valid', schedule_state: 'on', tier: index % 2 ? 'pro' : 'max',
-  // Demo: one candidate sits in a vm2api pool someone made by hand.
-  ...(index === 6 ? { foreign_pool: 'GUO' } : {}),
 }))
+const manualVMOwners = new Map([['demo-vm-2', 'demo_operator']])
 const pool: PoolItem[] = rentalCandidates.slice(0, 5).map((candidate, index) => ({
   vm_id: candidate.vm_id, tier: candidate.tier, status: index === 0 ? 'leased' : index === 4 ? 'maintenance' : 'available',
   leased_to_user_id: index === 0 ? 1 : null, leased_to_email: index === 0 ? users[0].email : null,
   note: index === 4 ? '演示：维护中的账号' : '演示资源，请勿用于真实请求',
   vm: { label: candidate.label, email_masked: candidate.email_masked, cred_status: candidate.cred_status, schedule_state: index === 4 ? 'off' : candidate.schedule_state, tier: candidate.tier, five_hour: { utilization: index * 7, resets_at: iso(3_600_000), status: 'ok' }, seven_day: { utilization: index * 11, resets_at: iso(2 * DAY), status: 'ok' } },
   selfcheck: index === 4 ? selfcheck('fail') : selfcheck('pass'),
+  owned_by: manualVMOwners.get(candidate.vm_id),
 }))
+const upstreamUsers = new Set([1, 2])
 const accountVMs = new Map<number, string>([[1, 'demo-hosted-1'], [2, 'demo-hosted-2'], [3, 'demo-hosted-3'], [4, 'demo-vm-1'], [5, 'demo-hosted-5']])
 const rentalSubscriptions = new Map<number, number>([[4, 3]])
 const onboardings = new Map<number, Onboarding>()
@@ -312,14 +313,15 @@ function publicConfig(): PublicConfig {
 }
 function productView(product: Product): Product {
   const reserved = orders.filter(item => item.value.kind === 'rental_account' && ['pending', 'paid'].includes(item.value.status)).reduce((sum, item) => sum + rentalNeeded(item.value), 0)
-  return { ...product, stock: product.kind === 'rental_account' && !product.reservation_only ? Math.max(0, pool.filter(item => item.status === 'available').length - reserved) : null }
+  return { ...product, stock: product.kind === 'rental_account' && !product.reservation_only ? Math.max(0, availableRentals().length - reserved) : null }
 }
 function subscriptionView(subscription: Subscription): Subscription {
   const ids = products.filter(product => product.enabled && !product.reservation_only && product.kind === subscription.kind && subscription.quantity % product.unit_quantity === 0).map(product => product.id)
   return { ...subscription, renewable: subscription.status !== 'cancelled' && ids.length > 0, renew_product_ids: ids }
 }
 function liveAccount(account: Account): boolean { return !['released', 'releasing'].includes(account.status) }
-function vmHasOwner(vmId: string): boolean { return accounts.some(item => liveAccount(item.value) && accountVMs.get(item.value.id) === vmId) }
+function vmHasOwner(vmId: string): boolean { return manualVMOwners.has(vmId) || accounts.some(item => liveAccount(item.value) && accountVMs.get(item.value.id) === vmId) }
+function availableRentals(): PoolItem[] { return pool.filter(item => item.status === 'available' && !vmHasOwner(item.vm_id)) }
 function overview(userId: number): Overview {
   const ownedAccounts = myValues(accounts, userId).filter(liveAccount)
   const activeSubs = myValues(subscriptions, userId).filter(item => item.status === 'active')
@@ -538,7 +540,7 @@ function fulfill(entry: Owned<Order>) {
   if (order.status !== 'paid' && order.status !== 'fulfill_failed') fail(409, 'invalid_order_status', '当前订单状态不能履约。')
   const terms = orderTerms.get(order.order_no)
   if (!terms) { order.status = 'fulfill_failed'; return }
-  const available = pool.filter(item => item.status === 'available')
+  const available = availableRentals()
   const needed = rentalNeeded(order)
   if (available.length < needed) { order.status = 'fulfill_failed'; return }
   let subscription: Subscription
@@ -563,6 +565,7 @@ function fulfill(entry: Owned<Order>) {
       resource.status = 'leased'; resource.leased_to_user_id = entry.userId; resource.leased_to_email = emailOf(entry.userId)
       const account: Account = { id: nextId(), kind: 'rental', label: resource.vm.label, email_masked: resource.vm.email_masked, status: 'active', status_reason: null, tier: resource.tier, created_at: new Date().toISOString(), expires_at: subscription.expires_at, usage: accountUsage(0), selfcheck: resource.selfcheck }
       accounts.unshift({ userId: entry.userId, value: account }); accountVMs.set(account.id, resource.vm_id); rentalSubscriptions.set(account.id, subscription.id)
+      upstreamUsers.add(entry.userId)
     }
   }
   order.status = 'fulfilled'; order.fulfilled_at = new Date().toISOString()
@@ -690,8 +693,23 @@ const mockSessions = new Map<number, number>() // user id -> signed-in devices
 function profileOf(id: number) { return userProfiles.get(id) ?? { note: '', last_login_at: '', last_login_ip: '' } }
 function adminUser(user: User): AdminUser {
   const summary = overview(user.id)
-  return { ...user, ...profileOf(user.id), active_sessions: mockSessions.get(user.id) ?? (user.id === sessionUserId ? 1 : 0), concurrency_total: user.status === 'active' ? summary.concurrency.total : 0, hosted_used: summary.hosted_seats.used, hosted_total: summary.hosted_seats.total, rental_used: summary.rental_accounts.used, rental_total: summary.rental_accounts.total, vm2api_user_id: null, vm2api_pool_id: myValues(keys, user.id).length || myValues(accounts, user.id).length ? `demo-account-${user.id}` : '' }
+  const provisioned = upstreamUsers.has(user.id)
+  return { ...user, ...profileOf(user.id), active_sessions: mockSessions.get(user.id) ?? (user.id === sessionUserId ? 1 : 0), concurrency_total: user.status === 'active' ? summary.concurrency.total : 0, hosted_used: summary.hosted_seats.used, hosted_total: summary.hosted_seats.total, rental_used: summary.rental_accounts.used, rental_total: summary.rental_accounts.total, vm2api_user_id: provisioned ? `demo-user-${user.id}` : '', vm2api_username: provisioned ? `portal_${user.id}` : '' }
 }
+function checkScopes(checked_at: string): AdminDashboard['scope_warnings'] {
+  const items: ScopeWarning[] = []
+  const account = accounts.find(item => item.value.id === 5 && liveAccount(item.value))
+  if (account) items.push({ kind: 'vm_owner_conflict', user_id: account.userId, user_email: emailOf(account.userId), vm_id: 'demo-hosted-5', message: '资源 demo-hosted-5 归属已变更，请核对账号归属。' })
+  for (const item of pool) {
+    if (item.status === 'available' && item.owned_by) items.push({ kind: 'rental_vm_taken', vm_id: item.vm_id, message: `租赁资源 ${item.vm_id} 已被占用，不会分配给新订单。` })
+  }
+  items.push(
+    { kind: 'key_drifted', user_id: 1, user_email: emailOf(1), key_id: 1, message: '旧上游密钥的归属已被手动修改，未删除；请核对后手动清理。' },
+    { kind: 'pool_in_use', message: '旧账号池仍被其他密钥引用，未删除；请核对引用关系。' },
+  )
+  return { checked_at, items }
+}
+let scopeWarnings = checkScopes(iso(-5 * 60_000))
 function dashboard(): AdminDashboard {
   const paidOrders = orders.filter(item => ['paid', 'fulfilled', 'fulfill_failed'].includes(item.value.status) && item.value.provider !== 'grant')
   return {
@@ -699,9 +717,9 @@ function dashboard(): AdminDashboard {
     revenue_cents_30d: paidOrders.filter(item => item.value.paid_at !== null && Date.parse(item.value.paid_at) >= Date.now() - 30 * DAY).reduce((sum, item) => sum + item.value.amount_cents, 0),
     orders_pending: orders.filter(item => item.value.status === 'pending').length,
     accounts: { hosted_active: accounts.filter(item => item.value.kind === 'hosted' && item.value.status === 'active').length, rental_active: accounts.filter(item => item.value.kind === 'rental' && item.value.status === 'active').length, failed: accounts.filter(item => item.value.status === 'failed').length },
-    rental_pool: { total: pool.length, available: pool.filter(item => item.status === 'available').length, leased: pool.filter(item => item.status === 'leased').length, maintenance: pool.filter(item => item.status === 'maintenance').length },
+    rental_pool: { total: pool.length, available: availableRentals().length, leased: pool.filter(item => item.status === 'leased').length, maintenance: pool.filter(item => item.status === 'maintenance').length },
     vm2api: { ok: true, version: '演示 · 无真实连接', latency_ms: 0, error: null },
-    scope_warnings: { checked_at: iso(-5 * 60_000), items: [] },
+    scope_warnings: scopeWarnings,
   }
 }
 function settingsView(): Settings { return { ...settings, payment: { ...settings.payment, epay: { ...settings.payment.epay, key: epayKeyConfigured ? '***' : '' }, alipay_f2f: { ...settings.payment.alipay_f2f, private_key: settings.payment.alipay_f2f.private_key ? '***' : '' } } } }
@@ -805,7 +823,7 @@ function adminRequest(path: string, method: string, query: URLSearchParams, inpu
   const rawId = parts[2]
   const action = parts[3]
   if (path === '/admin/dashboard' && method === 'GET') return ok(dashboard())
-  if (path === '/admin/scope/recheck' && method === 'POST') return ok({})
+  if (path === '/admin/scope/recheck' && method === 'POST') { scopeWarnings = checkScopes(new Date().toISOString()); return ok({}) }
   if (path === '/admin/system/update' && method === 'GET') return ok(mockUpdateStatus())
   if (path === '/admin/system/update' && method === 'POST') {
     if (mockJob) fail(409, 'update_in_progress', '已有更新或回滚正在进行，请稍候')
@@ -874,7 +892,7 @@ function adminRequest(path: string, method: string, query: URLSearchParams, inpu
         const duration = integer(input, 'duration_days', 1)
         limitedText(input, 'note', '', 1_000)
         if (quantity > 10_000 || duration > 3_650) fail(422, 'invalid_grant', '赠送数量或天数超出允许范围。')
-        if (grantKind === 'rental_account' && pool.filter(item => item.status === 'available').length < quantity) fail(409, 'out_of_stock', '当前可租赁库存不足。')
+        if (grantKind === 'rental_account' && availableRentals().length < quantity) fail(409, 'out_of_stock', '当前可租赁库存不足。')
         const order: Order = { order_no: orderNumber(), product_id: 0, product_name: '管理员赠送', kind: grantKind, quantity, amount_cents: 0, currency: 'CNY', provider: 'grant', status: 'paid', renew_subscription_id: null, created_at: new Date().toISOString(), paid_at: new Date().toISOString(), fulfilled_at: null, expires_at: new Date().toISOString() }
         orderTerms.set(order.order_no, { unitQuantity: 1, durationDays: duration })
         const entry = { userId: user.id, value: order }; orders.unshift(entry); fulfill(entry)
@@ -908,8 +926,6 @@ function adminRequest(path: string, method: string, query: URLSearchParams, inpu
       if (!Array.isArray(ids) || ids.length === 0 || !ids.every((value: unknown): value is string => typeof value === 'string')) fail(422, 'invalid_vm_ids', '请选择至少一个资源。')
       const note = limitedText(input, 'note', '', 1_000)
       const candidates = ids.map(id => rentalCandidates.find(candidate => candidate.vm_id === id) ?? fail(404, 'not_found', '待入池资源不存在。'))
-      const held = candidates.find(candidate => candidate.foreign_pool)
-      if (held) fail(409, 'vm_in_foreign_pool', `账号 ${held.vm_id} 在 vm2api 账号池「${held.foreign_pool}」里，租出后无法放进用户的账号池；请先在 vm2api 面板把它移出该账号池`)
       if (new Set(ids).size !== ids.length || candidates.some(candidate => pool.some(item => item.vm_id === candidate.vm_id) || vmHasOwner(candidate.vm_id))) fail(409, 'vm_unavailable', '资源已入池或已归属用户。')
       const failedCandidate = candidates.find((candidate) => candidate.vm_id === 'demo-vm-8')
       if (failedCandidate) {
@@ -1002,6 +1018,7 @@ function userRequest(path: string, method: string, query: URLSearchParams, input
     if (summary.hosted_seats.used >= summary.hosted_seats.total) fail(409, 'no_free_seat', '没有空闲托管席位，请先购买席位。')
     const account: Account = { id: nextId(), kind: 'hosted', label: limitedText(input, 'label', '新的托管账号'), email_masked: '', status: 'provisioning', status_reason: null, tier: null, created_at: new Date().toISOString(), expires_at: null, usage: null, selfcheck: selfcheck('pending') }
     accounts.unshift({ userId: user.id, value: account }); accountVMs.set(account.id, `demo-hosted-${account.id}`)
+    upstreamUsers.add(user.id)
     return ok({ account, onboarding: onboardingFor(account) }, 201)
   }
   if (parts[0] === 'hosted' && parts.length >= 2 && parts.length <= 3) {
@@ -1044,6 +1061,7 @@ function userRequest(path: string, method: string, query: URLSearchParams, input
     const secret = `sk-pt-${[...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('')}`
     const key: ApiKey = { id: nextId(), name, prefix: secret.slice(0, 12), status: 'active', created_at: new Date().toISOString(), last_used_at: null, scope }
     keys.unshift({ userId: user.id, value: key })
+    upstreamUsers.add(user.id)
     return ok({ key, secret }, 201)
   }
   if (parts[0] === 'keys' && parts.length >= 2 && parts.length <= 3 && ((parts[2] === 'stats' && method === 'GET') || (parts.length === 2 && ['PATCH', 'DELETE'].includes(method)))) {

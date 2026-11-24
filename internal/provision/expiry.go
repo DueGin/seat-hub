@@ -148,7 +148,7 @@ func (service *Service) requeueStuckReleases(ctx context.Context, now time.Time)
 
 func (service *Service) suspendResource(ctx context.Context, account Account, grace time.Duration) error {
 	if account.VMID != "" {
-		if err := service.client.SetSchedulable(ctx, account.VMID, false); err != nil && !vm2api.IsStatus(err, 404) {
+		if err := service.setAccountSchedulable(ctx, account, false); err != nil {
 			return fmt.Errorf("suspend resource scheduling: %w", err)
 		}
 	}
@@ -186,7 +186,7 @@ func (service *Service) resumeResource(ctx context.Context, account Account) err
 	}
 	status := strings.TrimPrefix(*account.StatusReason, "subscription_expired:")
 	if status == "active" && account.VMID != "" {
-		if err := service.client.SetSchedulable(ctx, account.VMID, true); err != nil && !vm2api.IsStatus(err, 404) {
+		if err := service.setAccountSchedulable(ctx, account, true); err != nil {
 			return fmt.Errorf("resume resource scheduling: %w", err)
 		}
 	}
@@ -250,14 +250,11 @@ func (service *Service) DeleteHosted(ctx context.Context, userID, resourceID int
 		return fmt.Errorf("commit hosted removal: %w", err)
 	}
 	if account.VMID != "" {
-		if err := service.client.SetSchedulable(ctx, account.VMID, false); err != nil && !vm2api.IsStatus(err, 404) {
+		if err := service.setAccountSchedulable(ctx, account, false); err != nil {
 			return service.releaseError(ctx, resourceID, fmt.Errorf("disable deleted hosted resource: %w", err))
 		}
 	}
-	if err := service.SyncUserScope(ctx, userID); err != nil {
-		return service.releaseError(ctx, resourceID, err)
-	}
-	return nil
+	return service.syncScopeAfterAdd(ctx, userID)
 }
 
 func (service *Service) releaseJob(ctx context.Context, job Job) error {
@@ -330,22 +327,8 @@ func (service *Service) ReleaseResource(ctx context.Context, resourceID int64) e
 		return fmt.Errorf("mark resource releasing: %w", err)
 	}
 	if account.VMID != "" {
-		if err := service.client.SetSchedulable(ctx, account.VMID, false); err != nil && !vm2api.IsStatus(err, 404) {
-			return service.releaseError(ctx, account.ID, fmt.Errorf("disable resource scheduling: %w", err))
-		}
-	}
-	if err := service.SyncUserScope(ctx, account.UserID); err != nil {
-		return service.releaseError(ctx, account.ID, fmt.Errorf("remove resource scope: %w", err))
-	}
-	if account.VMID != "" {
-		var releaseErr error
-		if account.Kind == "hosted" {
-			releaseErr = service.client.DeleteVM(ctx, account.VMID)
-		} else {
-			releaseErr = service.client.SetVMOwner(ctx, account.VMID, nil)
-		}
-		if releaseErr != nil && !vm2api.IsStatus(releaseErr, 404) {
-			return service.releaseError(ctx, account.ID, fmt.Errorf("release upstream resource: %w", releaseErr))
+		if err := service.releaseVM(ctx, account); err != nil {
+			return service.releaseError(ctx, account.ID, err)
 		}
 	}
 	tx, err := service.db.BeginTx(ctx, nil)
@@ -366,6 +349,40 @@ func (service *Service) ReleaseResource(ctx context.Context, resourceID int64) e
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit resource release: %w", err)
+	}
+	return service.syncScopeAfterAdd(ctx, account.UserID)
+}
+
+func (service *Service) setAccountSchedulable(ctx context.Context, account Account, enabled bool) error {
+	ok, err := service.mayMutateVM(ctx, account)
+	if err != nil || !ok {
+		return err
+	}
+	err = service.client.SetSchedulable(ctx, account.VMID, enabled)
+	if vm2api.IsStatus(err, 404) {
+		return nil
+	}
+	return err
+}
+
+func (service *Service) releaseVM(ctx context.Context, account Account) error {
+	ok, err := service.mayMutateVM(ctx, account)
+	if err != nil || !ok {
+		return err
+	}
+	if err := service.client.SetSchedulable(ctx, account.VMID, false); err != nil {
+		if vm2api.IsStatus(err, 404) {
+			return nil
+		}
+		return fmt.Errorf("disable resource scheduling: %w", err)
+	}
+	if account.Kind == "hosted" {
+		err = service.client.DeleteVM(ctx, account.VMID)
+	} else {
+		err = service.client.SetVMOwner(ctx, account.VMID, nil)
+	}
+	if err != nil && !vm2api.IsStatus(err, 404) {
+		return fmt.Errorf("release upstream resource: %w", err)
 	}
 	return nil
 }

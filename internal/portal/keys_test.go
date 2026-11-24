@@ -34,6 +34,11 @@ type keyClient struct {
 	afterUser   func()
 }
 
+func (client *keyClient) ForUser(ctx context.Context, id, name, password string) (vm2api.KeyClient, error) {
+	_, err := client.Fake.ForUser(ctx, id, name, password)
+	return client, err
+}
+
 func (client *keyClient) CreateUser(ctx context.Context, username, password string) (vm2api.User, error) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
@@ -151,15 +156,14 @@ func TestKeyCreateEncryptionAndEntitlements(t *testing.T) {
 	}
 	var keyHash, keyEnc string
 	var synced int
-	identity, err := store.LoadServiceIdentity(ctx, service.db.DB)
-	if err != nil || identity.UserID != client.creates[0].UserID || identity.Username == "" {
-		t.Fatalf("service identity = %+v, err %v", identity, err)
+	var upstreamUser, username, passwordEnc string
+	if err := service.db.QueryRow(`SELECT vm2api_user_id,vm2api_username,vm2api_password_enc FROM users WHERE id=1`).Scan(&upstreamUser, &username, &passwordEnc); err != nil || upstreamUser != client.creates[0].UserID || username != "portal_1" {
+		t.Fatalf("portal user identity: %q %q, %v", upstreamUser, username, err)
 	}
-	var legacyUser string
-	if err := service.db.QueryRow(`SELECT COALESCE(vm2api_user_id,'') FROM users WHERE id=1`).Scan(&legacyUser); err != nil || legacyUser != "" {
-		t.Fatalf("portal user acquired upstream identity: %q, %v", legacyUser, err)
+	if password, err := service.box.Open(passwordEnc); err != nil || password != client.password {
+		t.Fatal("tenant password was not sealed")
 	}
-	if item.Scope.Mode != "all" || item.Scope.Accounts == nil || !item.Scope.Usable || client.creates[0].Scope.PoolID == "" {
+	if item.Scope.Mode != "all" || item.Scope.Accounts == nil || !item.Scope.Usable || !client.creates[0].Scope.All {
 		t.Fatalf("unrestricted key: %+v, %+v", item, client.creates[0])
 	}
 	if err := service.db.QueryRow(`SELECT key_hash,vm2api_secret_enc,synced_concurrency FROM api_keys WHERE id=?`, item.ID).Scan(&keyHash, &keyEnc, &synced); err != nil {
@@ -325,9 +329,9 @@ func TestKeyPersistsUpstreamUserWhenRequestCancelled(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("create error = %v", err)
 	}
-	identity, err := store.LoadServiceIdentity(context.Background(), service.db.DB)
-	if err != nil || identity.UserID == "" {
-		t.Fatalf("service identity not saved: %+v, %v", identity, err)
+	var owner string
+	if err := service.db.QueryRow(`SELECT vm2api_user_id FROM users WHERE id=1`).Scan(&owner); err != nil || owner == "" {
+		t.Fatalf("tenant identity not saved: %q, %v", owner, err)
 	}
 	if _, _, err := service.Create(context.Background(), 1, keyInput("retry")); err != nil {
 		t.Fatal(err)
@@ -437,9 +441,9 @@ func TestKeyUsesSharedProvisioner(t *testing.T) {
 	if _, _, err := custom.Create(context.Background(), 1, keyInput("shared")); err != nil {
 		t.Fatal(err)
 	}
-	identity, err := store.LoadServiceIdentity(context.Background(), service.db.DB)
-	if err != nil || identity.UserID == "" {
-		t.Fatalf("shared provisioner service identity missing: %+v, %v", identity, err)
+	var owner string
+	if err := service.db.QueryRow(`SELECT vm2api_user_id FROM users WHERE id=1`).Scan(&owner); err != nil || owner == "" {
+		t.Fatalf("shared provisioner identity missing: %q, %v", owner, err)
 	}
 }
 
@@ -447,7 +451,11 @@ func keyInput(name string) api.KeyInput { return api.KeyInput{Name: name} }
 
 func keyAccount(t *testing.T, service *Service, client *keyClient, userID int64, vmID, status string) int64 {
 	t.Helper()
-	client.AddVM(vm2api.VM{ID: vmID, Platform: "anthropic", ScheduleState: "on"})
+	owner, err := service.provisioning.EnsureUpstreamUser(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.AddVM(vm2api.VM{ID: vmID, OwnerUserID: owner, Platform: "anthropic", ScheduleState: "on"})
 	var id int64
 	if err := service.db.QueryRow(`INSERT INTO resources(user_id,kind,vm_id,status,created_at,updated_at)
 		VALUES (?,'rental',?,?,?,?) RETURNING id`, userID, vmID, status, store.Now(), store.Now()).Scan(&id); err != nil {
@@ -480,7 +488,7 @@ func TestKeySelectedScopeLifecycle(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if scope.Mode == "all" && (upstream.PoolID == "" || len(upstream.AllowedVMs) != 0) ||
+		if scope.Mode == "all" && (upstream.GroupType != "all" || upstream.PoolID != "" || len(upstream.AllowedVMs) != 0) ||
 			scope.Mode == "selected" && (upstream.PoolID != "" || !slices.Equal(upstream.AllowedVMs, []string{"vm-b"})) {
 			t.Fatalf("updated scope = %+v", upstream)
 		}
@@ -494,23 +502,20 @@ func TestKeySelectedScopeLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	upstream, err := client.GetKey(ctx, client.keys[0].ID)
-	if err != nil || upstream.Active || upstream.PoolID == "" || len(upstream.AllowedVMs) != 0 {
+	if err != nil || upstream.Active || upstream.PoolID != "" || !slices.Equal(upstream.AllowedVMs, []string{"vm-b"}) {
 		t.Fatalf("expired selection was not closed: %+v, %v", upstream, err)
 	}
 	keySQL(t, service.db, `UPDATE users SET status='disabled' WHERE id=1`)
 	scope := api.KeyScopeInput{Mode: "selected", Accounts: []int64{first}}
-	if _, err := service.Update(ctx, 1, item.ID, api.KeyPatch{Scope: &scope}); err != nil {
-		t.Fatal(err)
+	if _, err := service.Update(ctx, 1, item.ID, api.KeyPatch{Scope: &scope}); err == nil {
+		t.Fatal("disabled user could change a key")
 	}
 	upstream, err = client.GetKey(ctx, client.keys[0].ID)
 	if err != nil || upstream.Active {
 		t.Fatalf("disabled user's key active: %+v, %v", upstream, err)
 	}
-	if _, _, err := service.Create(ctx, 1, keyInput("disabled user")); err != nil {
-		t.Fatal(err)
-	}
-	if _, active := client.KeyState(client.keys[1].ID); active {
-		t.Fatal("created active upstream key for disabled user")
+	if _, _, err := service.Create(ctx, 1, keyInput("disabled user")); err == nil || len(client.keys) != 1 {
+		t.Fatal("created upstream key for disabled user")
 	}
 }
 
@@ -537,16 +542,12 @@ func TestKeyScopeValidationAndLegacy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	keySQL(t, service.db, `UPDATE api_keys SET upstream_owner='' WHERE id=?`, item.ID)
+	keySQL(t, service.db, `UPDATE api_keys SET upstream_owner='legacy-user' WHERE id=?`, item.ID)
 	scope := api.KeyScopeInput{Mode: "selected", Accounts: []int64{owned}}
 	_, err = service.Update(ctx, 1, item.ID, api.KeyPatch{Scope: &scope})
 	keyError(t, err, 409, "key_migrating")
-	if _, err := service.Update(ctx, 1, item.ID, keyPatch("legacy renamed", "disabled")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := service.Update(ctx, 1, item.ID, keyPatch("", "active")); err != nil {
-		t.Fatal(err)
-	}
+	_, err = service.Update(ctx, 1, item.ID, keyPatch("legacy renamed", "disabled"))
+	keyError(t, err, 409, "key_migrating")
 }
 
 func TestKeyScopeUpdateRestoresUpstreamOnSaveFailure(t *testing.T) {
@@ -577,18 +578,13 @@ func TestKeyCreateClosesSelectionReleasedAfterValidation(t *testing.T) {
 	service, client := keyFixture(t)
 	ctx := context.Background()
 	account := keyAccount(t, service, client, 1, "vm-released", "active")
-	// ServiceUser runs after validation but before KeyScopeFor; simulate a
-	// release becoming visible at that boundary.
-	client.afterUser = func() {
-		keySQL(t, service.db, `UPDATE resources SET status='releasing' WHERE id=?`, account)
-	}
-	item, _, err := service.Create(ctx, 1, api.KeyInput{Scope: api.KeyScopeInput{Mode: "selected", Accounts: []int64{account}}})
-	if err != nil {
+	if err := client.SetVMOwner(ctx, "vm-released", nil); err != nil {
 		t.Fatal(err)
 	}
-	upstream, err := client.GetKey(ctx, client.keys[0].ID)
-	if err != nil || item.Scope.Usable || upstream.Active || upstream.PoolID == "" || len(upstream.AllowedVMs) != 0 {
-		t.Fatalf("released selection not closed: %+v, %+v, %v", item.Scope, upstream, err)
+	_, _, err := service.Create(ctx, 1, api.KeyInput{Scope: api.KeyScopeInput{Mode: "selected", Accounts: []int64{account}}})
+	keyError(t, err, 422, "key_scope_empty")
+	if len(client.keys) != 0 {
+		t.Fatal("created a key for a VM no longer owned by the tenant")
 	}
 }
 

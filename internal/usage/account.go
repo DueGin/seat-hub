@@ -25,9 +25,9 @@ type Service struct {
 }
 
 type cacheKey struct {
-	userID, resourceID           int64
-	vmID, ownerID, legacyOwnerID string
-	createdAt, releasedAt        time.Time
+	userID, resourceID            int64
+	vmID, ownerID, serviceOwnerID string
+	createdAt, releasedAt         time.Time
 }
 
 type cacheEntry struct {
@@ -70,7 +70,7 @@ func (service *Service) AccountUsage(ctx context.Context, userID, resourceID int
 	}
 	key := cacheKey{
 		userID: userID, resourceID: resourceID, vmID: vmID.String,
-		ownerID: identity.UserID, legacyOwnerID: ownerID.String, createdAt: createdAt.UTC(),
+		ownerID: ownerID.String, serviceOwnerID: identity.UserID, createdAt: createdAt.UTC(),
 	}
 	if released.Valid {
 		key.releasedAt, err = time.Parse(time.RFC3339, released.String)
@@ -116,7 +116,7 @@ func (service *Service) cachedAccountUsage(ctx context.Context, key cacheKey) (*
 		upstream, err := service.client.GetAccountUsage(ctx, key.vmID)
 		var result *AccountUsage
 		owner := upstream.VM.OwnerUserID
-		if err == nil && upstream.VM.ID == key.vmID && owner != "" && (owner == key.ownerID || owner == key.legacyOwnerID) {
+		if err == nil && upstream.VM.ID == key.vmID && owner != "" && (owner == key.ownerID || owner == key.serviceOwnerID) {
 			result = redactAccountUsage(upstream)
 			err = service.scopeAccountSpend(ctx, key, result)
 		}

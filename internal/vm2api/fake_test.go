@@ -69,22 +69,21 @@ func TestFakeHTTPHostedRoundTrip(t *testing.T) {
 	if err := client.SetUserEnabled(ctx, owner.ID, true); err != nil {
 		t.Fatal(err)
 	}
-	keyPool, err := client.CreatePool(ctx, "owner", nil)
+	keys, err := client.ForUser(ctx, owner.ID, owner.Username, "password")
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, err := client.CreateKey(ctx, CreateKeyInput{Name: "托管密钥", UserID: owner.ID, MaxConcurrency: 999, Scope: KeyScope{PoolID: keyPool.ID}})
+	key, err := keys.CreateKey(ctx, CreateKeyInput{Name: "托管密钥", UserID: owner.ID, MaxConcurrency: 999, Scope: KeyScope{All: true}})
 	if err != nil || !strings.HasPrefix(key.Secret, "sk-vm-") || key.Prefix != key.Secret[:10] {
 		t.Fatalf("create key = %+v, %v", key, err)
 	}
 	active, concurrency, name := false, -10, "新名称"
-	if err := client.UpdateKey(ctx, key.ID, UpdateKeyInput{Name: &name, Active: &active, MaxConcurrency: &concurrency}); err != nil {
+	if err := keys.UpdateKey(ctx, key.ID, UpdateKeyInput{Name: &name, Active: &active, MaxConcurrency: &concurrency}); err != nil {
 		t.Fatal(err)
 	}
-	statsWire := fakeTestRaw(t, fake.Handler("master"), "GET", "/api/panel/api-keys/"+key.ID+"/stats", "master", "", 200)
-	item := statsWire["item"].(map[string]any)
-	if item["status"] != "disabled" || item["max_concurrency"] != float64(0) || item["key"] == key.Secret {
-		t.Fatalf("updated key wire = %+v", item)
+	info, err := keys.GetKey(ctx, key.ID)
+	if err != nil || info.Active || info.MaxConcurrency != 0 || info.UserID != owner.ID {
+		t.Fatalf("updated key = %+v, %v", info, err)
 	}
 	vm, err := client.CreateHostedVM(ctx, "托管账号", json.RawMessage(`{"runtime_type":"docker"}`))
 	if err != nil || vm.Label != "托管账号" || vm.ScheduleState != "unschedulable" || vm.UnschedulableCode != "no_credential" {
@@ -152,7 +151,7 @@ func TestFakeHTTPHostedRoundTrip(t *testing.T) {
 	if err != nil || stats.Requests != 2 || stats.ErrorCount != 1 || stats.SuccessRate != 0.5 || stats.AvgTTFTMS != 200 || stats.P95TTFTMS != 300 {
 		t.Fatalf("stats = %+v, %v", stats, err)
 	}
-	keyUsage, err := client.KeyStats(ctx, key.ID)
+	keyUsage, err := keys.KeyStats(ctx, key.ID)
 	if err != nil || len(keyUsage.Daily) != 1 || keyUsage.Daily[0].Tokens != 110 || len(keyUsage.ByModel) != 1 || keyUsage.ByModel[0].CostUSD != 0.375 {
 		t.Fatalf("key stats = %+v, %v", keyUsage, err)
 	}
@@ -168,10 +167,10 @@ func TestFakeHTTPHostedRoundTrip(t *testing.T) {
 	if err != nil || len(pool) != 1 || pool[0].Origin != "platform" {
 		t.Fatalf("reclaimed pool = %+v, %v", pool, err)
 	}
-	if err := client.DeleteKey(ctx, key.ID); err != nil {
+	if err := keys.DeleteKey(ctx, key.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.KeyStats(ctx, key.ID); !IsStatus(err, 404) {
+	if _, err := keys.KeyStats(ctx, key.ID); !IsStatus(err, 404) {
 		t.Fatalf("deleted key = %v", err)
 	}
 	if err := client.DeleteVM(ctx, vm.ID); err != nil {
@@ -307,15 +306,17 @@ func TestFakeKeySecrecyAndHandlerErrors(t *testing.T) {
 		t.Fatalf("stored key = %+v", fake.keys[key.ID])
 	}
 	handler := fake.Handler("master")
+	login := fakeTestRaw(t, handler, "POST", "/api/panel/login", "", `{"username":"owner","password":"password"}`, 200)
+	token := login["token"].(string)
 	for _, path := range []string{"/api/panel/api-keys", "/api/panel/api-keys/" + key.ID + "/stats"} {
-		payload := fakeTestRaw(t, handler, "GET", path, "master", "", 200)
+		payload := fakeTestRaw(t, handler, "GET", path, token, "", 200)
 		encoded, err := json.Marshal(payload)
 		if err != nil || strings.Contains(string(encoded), key.Secret) {
 			t.Fatalf("plaintext leaked: %s, %v", encoded, err)
 		}
 	}
 	filtered := fakeTestRaw(t, handler, "GET", "/api/panel/api-keys?user_id="+owner.ID, "master", "", 200)
-	if filtered["total"] != float64(1) {
+	if filtered["total"] != float64(0) {
 		t.Fatalf("key owner filter = %+v", filtered)
 	}
 	for _, test := range []struct {
@@ -326,8 +327,8 @@ func TestFakeKeySecrecyAndHandlerErrors(t *testing.T) {
 		{"GET", "/api/panel/version", key.Secret, "", 401},
 		{"POST", "/api/panel/users", "master", `{`, 400},
 		{"POST", "/api/panel/users", "master", `{} {}`, 400},
-		{"PATCH", "/api/panel/api-keys/" + key.ID, "master", `{"status":"paused"}`, 400},
-		{"POST", "/api/panel/api-keys/" + key.ID + "/reveal", "master", `{}`, 409},
+		{"PATCH", "/api/panel/api-keys/" + key.ID, token, `{"status":"paused"}`, 400},
+		{"POST", "/api/panel/api-keys/" + key.ID + "/reveal", token, `{}`, 409},
 		{"GET", "/api/panel/api-keys/" + key.ID, "master", "", 404},
 		{"GET", "/api/panel/billing", "master", "", 200},
 		{"GET", "/api/panel/billing?user_id=" + owner.ID + "&from=bad", "master", "", 400},
@@ -402,6 +403,10 @@ func TestFakeConcurrentOperations(t *testing.T) {
 	server := httptest.NewServer(fake.Handler("master"))
 	t.Cleanup(server.Close)
 	client := NewHTTPClient(server.URL, "master", server.Client())
+	keys, err := client.ForUser(ctx, owner.ID, owner.Username, "password")
+	if err != nil {
+		t.Fatal(err)
+	}
 	var workers sync.WaitGroup
 	for index := range 24 {
 		workers.Go(func() {
@@ -424,7 +429,7 @@ func TestFakeConcurrentOperations(t *testing.T) {
 			if err := client.ExchangeCode(ctx, vm.ID, auth.SessionID, "code"); err != nil {
 				t.Error(err)
 			}
-			key, err := client.CreateKey(ctx, CreateKeyInput{UserID: owner.ID, Scope: KeyScope{AllowedVMs: []string{vm.ID}}})
+			key, err := keys.CreateKey(ctx, CreateKeyInput{UserID: owner.ID, Scope: KeyScope{AllowedVMs: []string{vm.ID}}})
 			if err != nil {
 				t.Error(err)
 				return
@@ -438,7 +443,7 @@ func TestFakeConcurrentOperations(t *testing.T) {
 			if _, err := client.UserRequestStats(ctx, owner.ID, time.Time{}, time.Time{}); err != nil {
 				t.Error(err)
 			}
-			if err := client.DeleteKey(ctx, key.ID); err != nil {
+			if err := keys.DeleteKey(ctx, key.ID); err != nil {
 				t.Error(err)
 			}
 			if err := client.DeleteVM(ctx, vm.ID); err != nil {

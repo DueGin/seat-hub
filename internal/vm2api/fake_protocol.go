@@ -33,7 +33,7 @@ func (fake *Fake) RecordProtocolCallWithCode(call ProtocolCall) (int, string, bo
 	var key fakeKey
 	found := false
 	for _, candidate := range fake.keys {
-		if candidate.secret != "" && candidate.secret == call.Secret && candidate.active {
+		if fake.keyActiveLocked(candidate, call.Secret) {
 			key, found = candidate, true
 			break
 		}
@@ -49,8 +49,12 @@ func (fake *Fake) RecordProtocolCallWithCode(call ProtocolCall) (int, string, bo
 		}
 	}
 	ids := make([]string, 0, len(fake.vms))
+	ownerID := key.userID
+	if role := fake.users[ownerID].Role; role == "admin" || role == "super" {
+		ownerID = ""
+	}
 	for id, vm := range fake.vms {
-		if (key.userID == "" || vm.OwnerUserID == key.userID) && vm.HasCredential && vm.ScheduleState == "on" && !vm.CredentialRejected && fake.keyAllowsVMLocked(key, vm) {
+		if vm.OwnerUserID == ownerID && vm.HasCredential && vm.ScheduleState == "on" && !vm.CredentialRejected && fake.keyAllowsVMLocked(key, vm) {
 			ids = append(ids, id)
 		}
 	}
@@ -84,11 +88,15 @@ func (fake *Fake) ProtocolKeyActive(secret string) bool {
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	for _, key := range fake.keys {
-		if key.secret != "" && key.secret == secret && key.active {
+		if fake.keyActiveLocked(key, secret) {
 			return true
 		}
 	}
 	return false
+}
+
+func (fake *Fake) keyActiveLocked(key fakeKey, secret string) bool {
+	return key.secret != "" && key.secret == secret && key.active && (key.userID == "" || fake.users[key.userID].Enabled)
 }
 
 func (fake *Fake) keyAllowsVMLocked(key fakeKey, vm VM) bool {

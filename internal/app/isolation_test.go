@@ -173,8 +173,60 @@ func TestHTTPKeyScopeIsolationAndRentalReassignment(t *testing.T) {
 		User api.AdminUserDTO `json:"user"`
 	}
 	h.mustOK(http.MethodGet, fmt.Sprintf("/api/admin/users/%d", b.ID), "", &detail)
-	if detail.User.VM2APIPoolID == "" {
-		raw, _ := json.Marshal(detail)
-		t.Fatalf("admin detail omitted pool: %s", raw)
+	if detail.User.VM2APIUserID == "" || detail.User.VM2APIUsername != fmt.Sprintf("portal_%d", b.ID) {
+		t.Fatalf("admin detail omitted upstream identity: %+v", detail.User)
+	}
+	var aOwner string
+	if err := h.app.DB.QueryRow(`SELECT vm2api_user_id FROM users WHERE id=?`, a.ID).Scan(&aOwner); err != nil {
+		t.Fatal(err)
+	}
+	if exists, enabled := h.fake.UserEnabled(aOwner); !exists || enabled || aOwner == detail.User.VM2APIUserID {
+		t.Fatalf("disabled tenant owner: %v %v, same owner: %v", exists, enabled, aOwner == detail.User.VM2APIUserID)
+	}
+}
+
+func TestUserResponsesDoNotExposeUpstreamIdentityOrKeys(t *testing.T) {
+	h := newHarness(t)
+	h.login("admin@example.com", "admin-pass-123")
+	user, password := h.createUser(`{"email":"private@example.com"}`)
+	h.mustOK(http.MethodPost, fmt.Sprintf("/api/admin/users/%d/grant", user.ID), `{"kind":"hosted_seat","quantity":1,"duration_days":30}`, nil)
+	tenant := h.session()
+	tenant.login(user.Email, password)
+	var key struct{ Key api.KeyDTO }
+	tenant.mustOK(http.MethodPost, "/api/keys", `{"name":"测试"}`, &key)
+	var owner, username, keyID, passwordEnc, orderNo string
+	if err := h.app.DB.QueryRow(`SELECT u.vm2api_user_id,u.vm2api_username,u.vm2api_password_enc,k.vm2api_key_id,o.order_no FROM users u JOIN api_keys k ON k.user_id=u.id JOIN orders o ON o.user_id=u.id WHERE u.id=?`, user.ID).Scan(&owner, &username, &passwordEnc, &keyID, &orderNo); err != nil {
+		t.Fatal(err)
+	}
+	upstreamPassword, err := h.app.Box.Open(passwordEnc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A persisted upstream error is not a trusted user-facing message.
+	leak := fmt.Sprintf("%s %s sk-vm-test-secret %s %s", owner, username, keyID, upstreamPassword)
+	if _, err := h.app.DB.Exec(`UPDATE orders SET fulfil_error=? WHERE order_no=?`, leak, orderNo); err != nil {
+		t.Fatal(err)
+	}
+	var hosted struct{ Account api.AccountDTO }
+	tenant.mustOK(http.MethodPost, "/api/hosted", `{"label":"测试托管"}`, &hosted)
+	for _, path := range []string{
+		"/api/public/config", "/api/public/products", "/api/auth/me", "/api/me/overview", "/api/me/subscriptions",
+		"/api/accounts", fmt.Sprintf("/api/accounts/%d", hosted.Account.ID), fmt.Sprintf("/api/hosted/%d/onboarding", hosted.Account.ID),
+		"/api/orders", "/api/orders/" + orderNo, "/api/keys", fmt.Sprintf("/api/keys/%d/stats", key.Key.ID),
+		"/api/usage/summary", "/api/usage/logs", "/api/tickets", "/api/tickets/unread",
+	} {
+		status, response := tenant.call(http.MethodGet, path, "", nil)
+		if status != http.StatusOK {
+			t.Fatalf("%s: status=%d, error=%+v", path, status, response.Error)
+		}
+		raw, err := json.Marshal(response)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for index, forbidden := range []string{owner, username, keyID, upstreamPassword, "sk-vm-"} {
+			if forbidden == "" || strings.Contains(string(raw), forbidden) {
+				t.Fatalf("%s contains forbidden credential field %d", path, index)
+			}
+		}
 	}
 }

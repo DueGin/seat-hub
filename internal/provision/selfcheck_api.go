@@ -75,6 +75,10 @@ func (service *Service) RecheckResource(ctx context.Context, resourceID int64, r
 		return SelfcheckState{}, ErrInvalidState
 	}
 	if rebuild {
+		ok, err := service.mayMutateVM(ctx, account)
+		if err != nil || !ok {
+			return SelfcheckState{}, errors.Join(ErrInvalidState, err)
+		}
 		if _, err := service.db.ExecContext(ctx, `UPDATE resources SET selfcheck_attempts=0,selfcheck_state='pending',updated_at=? WHERE id=?`, timestamp(service.now()), resourceID); err != nil {
 			return SelfcheckState{}, fmt.Errorf("reset self-check budget: %w", err)
 		}

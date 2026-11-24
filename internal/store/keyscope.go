@@ -10,14 +10,15 @@ import (
 )
 
 // ServiceIdentityKey is the settings row holding the vm2api service user that
-// owns every portal VM and key (docs/KEY_SCOPE.md).
+// used before the reverse migration (docs/KEY_SCOPE.md).
 const ServiceIdentityKey = "vm2api_service"
 
 // ServiceIdentity is the vm2api service user. The zero value means it has not
 // been created yet.
 type ServiceIdentity struct {
-	UserID   string `json:"user_id"`
-	Username string `json:"username"`
+	UserID      string `json:"user_id"`
+	Username    string `json:"username"`
+	PasswordEnc string `json:"password_enc,omitempty"`
 }
 
 // LoadServiceIdentity reads the service user; a missing row returns the zero

@@ -25,19 +25,16 @@ var (
 )
 
 type Service struct {
-	db     *sql.DB
-	client vm2api.Client
-	engine *Engine
-	mu     sync.Mutex
-	Now    func() time.Time
-	// Box seals upstream key secrets written by MigrateLegacyScopes. Set by
-	// app wiring; the migration fails without it.
-	Box           *secret.Box
-	checker       selfcheck.Checker
-	scopes        scopeLocks
-	pools         scopeLocks
-	serviceUserMu sync.Mutex
-	scopeWrites   sync.RWMutex
+	db        *sql.DB
+	client    vm2api.Client
+	engine    *Engine
+	mu        sync.Mutex
+	Now       func() time.Time
+	Box       *secret.Box
+	checker   selfcheck.Checker
+	scopes    sync.Map
+	legacyMu  sync.Mutex
+	warningMu sync.Mutex
 }
 
 func New(db *sql.DB, client vm2api.Client) *Service {
@@ -49,8 +46,10 @@ func New(db *sql.DB, client vm2api.Client) *Service {
 	service.engine.Register("release_resource", service.releaseJob)
 	service.engine.Register("sync_concurrency", service.syncJob)
 	service.engine.Register("sync_scope", service.scopeSyncJob)
-	service.engine.Register("scope_reconcile", func(ctx context.Context, job Job) error { return service.ReconcileScopes(ctx) })
-	service.engine.Register("scope_migrate", func(ctx context.Context, job Job) error { return service.migrateJob(ctx) })
+	service.engine.Register("owner_migrate", func(ctx context.Context, job Job) error { return service.ReconcileOwners(ctx) })
+	service.engine.Register("owner_reconcile", func(ctx context.Context, job Job) error { return service.ReconcileOwners(ctx) })
+	service.engine.Register("scope_migrate", func(context.Context, Job) error { return nil })
+	service.engine.Register("scope_reconcile", func(context.Context, Job) error { return nil })
 	service.engine.Register("sweep_expiry", func(ctx context.Context, job Job) error { return service.SweepExpiry(ctx) })
 	service.engine.Register("selfcheck_sweep", func(ctx context.Context, job Job) error { return service.SweepSelfcheck(ctx) })
 	return service
@@ -130,7 +129,7 @@ func (service *Service) syncJob(ctx context.Context, job Job) error {
 	if err != nil {
 		return err
 	}
-	return service.absorbManual(ctx, payload.UserID, service.SyncUserScope(ctx, payload.UserID))
+	return service.SyncUserScope(ctx, payload.UserID)
 }
 
 func (service *Service) scopeSyncJob(ctx context.Context, job Job) error {
@@ -138,12 +137,12 @@ func (service *Service) scopeSyncJob(ctx context.Context, job Job) error {
 	if err != nil {
 		return err
 	}
-	return service.absorbManual(ctx, payload.UserID, service.SyncUserScope(ctx, payload.UserID))
+	return service.SyncUserScope(ctx, payload.UserID)
 }
 
 func (service *Service) Run(ctx context.Context) error {
-	if _, err := service.engine.Enqueue(ctx, "scope_migrate", jobPayload{}, "scope_migrate", service.now(), 8); err != nil {
-		return fmt.Errorf("schedule scope migration: %w", err)
+	if _, err := service.engine.Enqueue(ctx, "owner_migrate", jobPayload{}, "owner_migrate", service.now(), 8); err != nil {
+		return fmt.Errorf("schedule owner migration: %w", err)
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -152,10 +151,10 @@ func (service *Service) Run(ctx context.Context) error {
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	var nextSelfcheck time.Time
-	var nextScopeReconcile time.Time
+	nextScopeReconcile := service.now().Add(10 * time.Minute)
 	for {
 		if !service.now().Before(nextScopeReconcile) {
-			if _, err := service.engine.Enqueue(workerCtx, "scope_reconcile", jobPayload{}, "scope_reconcile", service.now(), 8); err != nil {
+			if err := service.EnqueueScopeReconcile(workerCtx); err != nil {
 				cancel()
 				<-done
 				return fmt.Errorf("schedule scope reconciliation: %w", err)

@@ -226,8 +226,10 @@ function UserDetails({ user, onClose, onEdit }: { user: AdminUser; onClose: () =
           <div><dt>最近登录</dt><dd>{current.last_login_at ? `${dateTime(current.last_login_at)}` : '从未登录'}{current.last_login_ip && <span className="mono muted"> · {current.last_login_ip}</span>}</dd></div>
           <div><dt>在线设备</dt><dd>{current.active_sessions} 台</dd></div>
           <div><dt>并发</dt><dd className="mono">{number(current.concurrency_total)}</dd></div>
-          {current.vm2api_user_id && <div><dt>旧上游账号（待迁移）</dt><dd className="mono">{current.vm2api_user_id}</dd></div>}
-          <div><dt>上游账号池</dt><dd className="mono">{current.vm2api_pool_id || '未创建'}</dd></div>
+          <div><dt>上游用户</dt><dd>{current.vm2api_username || current.vm2api_user_id ? <>
+            {current.vm2api_username && <span className="mono block">{current.vm2api_username}</span>}
+            {current.vm2api_user_id && <span className="mono muted block">{current.vm2api_user_id}</span>}
+          </> : '尚未创建'}</dd></div>
         </dl>
         <div className="user-actions">
           <Button variant="secondary" onClick={() => onEdit(current)}><Pencil size={14} />编辑资料</Button>

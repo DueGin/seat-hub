@@ -262,23 +262,15 @@ func TestEndToEndPurchaseAndProxy(t *testing.T) {
 	if err := h.app.DB.QueryRow(`SELECT id FROM users WHERE email='buyer@example.com'`).Scan(&userID); err != nil {
 		t.Fatal(err)
 	}
-	identity, err := store.LoadServiceIdentity(context.Background(), h.app.DB.DB)
-	if err != nil || identity.UserID == "" {
-		t.Fatalf("service identity missing: %+v, %v", identity, err)
+	var upstream string
+	if err := h.app.DB.QueryRow(`SELECT vm2api_user_id FROM users WHERE id=?`, userID).Scan(&upstream); err != nil || upstream == "" {
+		t.Fatalf("tenant identity missing: %v", err)
 	}
-	upstream := identity.UserID
 	if _, err := h.app.DB.Exec(`INSERT INTO resources (user_id,kind,vm_id,label,status,created_at,updated_at)
 		VALUES (?,?,?,?,'active',?,?)`, userID, "rental", "vm-1", "池内账号", store.Now(), store.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.fake.SetVMOwner(context.Background(), "vm-1", &upstream); err != nil {
-		t.Fatal(err)
-	}
-	var poolID string
-	if err := h.app.DB.QueryRow(`SELECT vm2api_pool_id FROM users WHERE id=?`, userID).Scan(&poolID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := h.fake.SetPoolMembers(context.Background(), poolID, []string{"vm-1"}); err != nil {
 		t.Fatal(err)
 	}
 	// The resolver caches principals for a few seconds; a real deployment sees

@@ -424,8 +424,8 @@ type AdminUserDTO struct {
 	HostedTotal      int    `json:"hosted_total"`
 	RentalUsed       int    `json:"rental_used"`
 	RentalTotal      int    `json:"rental_total"`
-	VM2APIUserID     string `json:"vm2api_user_id"` // legacy per-user vm2api user; "" once migrated
-	VM2APIPoolID     string `json:"vm2api_pool_id"` // the user's vm2api account pool
+	VM2APIUserID     string `json:"vm2api_user_id"`
+	VM2APIUsername   string `json:"vm2api_username"`
 	BaseURL          string `json:"-"`
 	Note             string `json:"note"`
 	LastLoginAt      string `json:"last_login_at"`
@@ -644,8 +644,7 @@ type AdminDashboardDTO struct {
 	Accounts      AccountsCounts `json:"accounts"`
 	RentalPool    RentalCounts   `json:"rental_pool"`
 	VM2API        VM2APIHealth   `json:"vm2api"`
-	// ScopeWarnings are account-scope problems only an admin can fix (e.g. a
-	// VM held by a vm2api pool the portal does not own). docs/KEY_SCOPE.md.
+	// ScopeWarnings are upstream ownership or migration problems.
 	ScopeWarnings ScopeWarningsDTO `json:"scope_warnings"`
 }
 
@@ -655,11 +654,11 @@ type ScopeWarningsDTO struct {
 }
 
 type ScopeWarningDTO struct {
-	UserID    int64  `json:"user_id"`
-	UserEmail string `json:"user_email"`
-	VMID      string `json:"vm_id"`
-	PoolID    string `json:"pool_id"`
-	PoolName  string `json:"pool_name"`
+	Kind      string `json:"kind"`
+	UserID    int64  `json:"user_id,omitempty"`
+	UserEmail string `json:"user_email,omitempty"`
+	VMID      string `json:"vm_id,omitempty"`
+	KeyID     string `json:"key_id,omitempty"`
 	Message   string `json:"message"`
 }
 
@@ -692,9 +691,7 @@ type RentalPoolRowDTO struct {
 	Note           string        `json:"note"`
 	VM             *RentalVMDTO  `json:"vm"`
 	Selfcheck      *SelfcheckDTO `json:"selfcheck"`
-	// ForeignPool names the vm2api pool (not the portal's) holding this VM;
-	// such a VM is not leased until it is taken out of that pool.
-	ForeignPool string `json:"foreign_pool,omitempty"`
+	OwnedBy        string        `json:"owned_by,omitempty"`
 }
 
 type RentalVMDTO struct {
@@ -714,7 +711,6 @@ type RentalCandidateDTO struct {
 	CredStatus    string `json:"cred_status"`
 	ScheduleState string `json:"schedule_state"`
 	Tier          string `json:"tier"`
-	ForeignPool   string `json:"foreign_pool,omitempty"` // set → cannot be added
 }
 
 type JobDTO struct {

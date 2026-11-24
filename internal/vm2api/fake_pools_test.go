@@ -74,7 +74,6 @@ func TestFakePoolsHTTPRoundTrip(t *testing.T) {
 	server := httptest.NewServer(fake.Handler("master"))
 	defer server.Close()
 	client := NewHTTPClient(server.URL, "master", server.Client())
-	owner := fakeTestUser(t, client, "owner")
 	pool, err := client.CreatePool(ctx, "  owner  ", []string{"a"})
 	if err != nil || pool.Name != "owner" || !pool.Enabled {
 		t.Fatalf("pool=%+v err=%v", pool, err)
@@ -92,12 +91,12 @@ func TestFakePoolsHTTPRoundTrip(t *testing.T) {
 	if _, err := client.SetPoolMembers(ctx, pool.ID, []string{"missing"}); !IsStatus(err, 400) || ErrorCode(err) != "vm_pool_vm_unknown" {
 		t.Fatalf("unknown vm: %v", err)
 	}
-	key, err := client.CreateKey(ctx, CreateKeyInput{UserID: owner.ID, Name: "pool key", MaxConcurrency: 8, Scope: KeyScope{PoolID: pool.ID}})
+	key, err := client.CreateKey(ctx, CreateKeyInput{Name: "pool key", MaxConcurrency: 8, Scope: KeyScope{PoolID: pool.ID}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	info, err := client.GetKey(ctx, key.ID)
-	if err != nil || info.PoolID != pool.ID || info.UserID != owner.ID || !info.Active || info.GroupType != "anthropic" || info.MaxConcurrency != 8 {
+	if err != nil || info.PoolID != pool.ID || info.UserID != "" || !info.Active || info.GroupType != "anthropic" || info.MaxConcurrency != 8 {
 		t.Fatalf("info=%+v err=%v", info, err)
 	}
 	if err := client.DeletePool(ctx, pool.ID); !IsStatus(err, 409) || ErrorCode(err) != "vm_pool_in_use" {
@@ -298,8 +297,8 @@ func TestFakeHTTPAcceptsLegacyUnscopedKey(t *testing.T) {
 	if info.GroupType != "all" || info.PoolID != "" || len(info.AllowedVMs) != 0 {
 		t.Fatalf("legacy key=%+v", info)
 	}
-	if _, ok := info.Scope(); ok {
-		t.Fatal("an unscoped key must not read as a portal scope")
+	if scope, ok := info.Scope(); !ok || !scope.All {
+		t.Fatalf("legacy unscoped key should read as all: %+v", scope)
 	}
 	// A body that names a scope is still validated.
 	fakeTestRaw(t, fake.Handler("master"), "POST", "/api/panel/api-keys", "master", `{"name":"bad","user_id":"`+user.ID+`","group_type":"anthropic"}`, 400)

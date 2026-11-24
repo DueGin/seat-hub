@@ -35,7 +35,12 @@ func Open(path string) (*DB, error) {
 			return nil, fmt.Errorf("create db dir: %w", err)
 		}
 	}
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
+	// _txlock=immediate: every transaction takes the write lock at BEGIN and
+	// waits for it via busy_timeout. With the default deferred BEGIN, a
+	// transaction that reads and then writes fails at once with
+	// SQLITE_BUSY_SNAPSHOT (517) whenever another connection (a background
+	// job) commits in between, and busy_timeout cannot help.
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)&_txlock=immediate"
 	sqlDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)

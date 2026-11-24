@@ -5,7 +5,8 @@
 // implementation (http.go) maps vm2api responses into these types; the fake
 // (fake.go) backs tests and cmd/mock-vm2api.
 //
-// Panel calls use the master key (/api/panel/*). Hosted onboarding is OAuth
+// Panel admin calls use the master key; tenant key calls use a panel session.
+// Hosted onboarding is OAuth
 // authorization-link only: the flavor is fixed to "claude_code" inside the
 // implementation and no session-key / setup-token / credential-import call
 // exists on this interface. Do not add one.
@@ -23,19 +24,13 @@ type Client interface {
 	// Users (vm2api role=user, vm_create_quota=0). Never delete: deleting a
 	// vm2api user hands its admin_assigned VMs back to the platform pool.
 	CreateUser(ctx context.Context, username, password string) (User, error)
+	ListUsers(ctx context.Context) ([]User, error)
 	SetUserEnabled(ctx context.Context, userID string, enabled bool) error
+	SetUserPassword(ctx context.Context, userID, password string) error
 
-	// API keys owned by a vm2api user. Secret is only returned by CreateKey.
-	// Every portal key carries an explicit KeyScope (docs/KEY_SCOPE.md):
-	// CreateKey rejects a zero scope instead of sending group_type=all.
-	CreateKey(ctx context.Context, in CreateKeyInput) (Key, error)
-	UpdateKey(ctx context.Context, keyID string, in UpdateKeyInput) error
-	DeleteKey(ctx context.Context, keyID string) error
-	KeyStats(ctx context.Context, keyID string) (UsageBreakdown, error)
-	// GetKey reads one key's live state (404 → IsStatus(err, 404)).
-	GetKey(ctx context.Context, keyID string) (KeyInfo, error)
-	// ListKeys lists keys owned by userID ("" = every key vm2api has).
-	ListKeys(ctx context.Context, userID string) ([]KeyInfo, error)
+	// Master key operations see only ownerless keys.
+	KeyClient
+	ForUser(ctx context.Context, userID, username, password string) (KeyClient, error)
 
 	// Account pools (vm2api vm-pools). A VM belongs to at most one pool; a
 	// pool referenced by a key cannot be deleted. SetPoolMembers replaces the
@@ -78,6 +73,16 @@ type Client interface {
 	UserRequestStats(ctx context.Context, userID string, from, until time.Time) (RequestStats, error)
 }
 
+// KeyClient operates only on keys owned by the authenticated panel identity.
+type KeyClient interface {
+	CreateKey(ctx context.Context, in CreateKeyInput) (Key, error)
+	UpdateKey(ctx context.Context, keyID string, in UpdateKeyInput) error
+	DeleteKey(ctx context.Context, keyID string) error
+	KeyStats(ctx context.Context, keyID string) (UsageBreakdown, error)
+	GetKey(ctx context.Context, keyID string) (KeyInfo, error)
+	ListKeys(ctx context.Context, userID string) ([]KeyInfo, error)
+}
+
 type Health struct {
 	OK        bool   `json:"ok"`
 	Version   string `json:"version"`
@@ -87,6 +92,7 @@ type Health struct {
 type User struct {
 	ID       string `json:"id"`
 	Username string `json:"username"`
+	Role     string `json:"role"`
 	Enabled  bool   `json:"enabled"`
 }
 
@@ -107,6 +113,7 @@ type UpdateKeyInput struct {
 // KeyScope limits which VMs a key may schedule onto (docs/KEY_SCOPE.md).
 // Exactly one field is set:
 //
+//   - All: group_type=all, subject only to VM ownership.
 //   - PoolID: vm_pool_id + group_type=anthropic; the pool's live members.
 //   - AllowedVMs: group_type=anthropic + allowed_vms (non-empty), vm_pool_id
 //     cleared.
@@ -114,12 +121,16 @@ type UpdateKeyInput struct {
 // The zero value is invalid and must never reach vm2api: it would mean
 // group_type=all, i.e. every VM the key's owner can see.
 type KeyScope struct {
+	All        bool     `json:"all,omitempty"`
 	PoolID     string   `json:"pool_id,omitempty"`
 	AllowedVMs []string `json:"allowed_vms,omitempty"`
 }
 
-// Valid reports whether exactly one of PoolID / AllowedVMs is set.
+// Valid reports whether exactly one scope is set.
 func (scope KeyScope) Valid() bool {
+	if scope.All {
+		return scope.PoolID == "" && len(scope.AllowedVMs) == 0
+	}
 	return (scope.PoolID != "") != (len(scope.AllowedVMs) > 0)
 }
 
@@ -136,11 +147,13 @@ type KeyInfo struct {
 }
 
 // Scope returns the key's scope in KeyScope form; ok is false when the key
-// is not limited the way the portal limits keys (group_type=all, or a
-// non-anthropic group).
+// uses a scope the portal does not support.
 func (info KeyInfo) Scope() (scope KeyScope, ok bool) {
 	if info.PoolID != "" {
 		return KeyScope{PoolID: info.PoolID}, info.GroupType == "anthropic" || info.GroupType == "all"
+	}
+	if info.GroupType == "all" {
+		return KeyScope{All: true}, true
 	}
 	if info.GroupType != "anthropic" || len(info.AllowedVMs) == 0 {
 		return KeyScope{}, false

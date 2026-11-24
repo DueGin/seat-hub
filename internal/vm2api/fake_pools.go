@@ -157,6 +157,9 @@ func (fake *Fake) DeletePool(ctx context.Context, poolID string) error {
 }
 
 func (fake *Fake) validateScopeLocked(scope KeyScope) (KeyScope, error) {
+	if scope.All {
+		return scope, nil
+	}
 	if scope.PoolID != "" {
 		scope.PoolID = strings.TrimSpace(scope.PoolID)
 		if _, exists := fake.pools[scope.PoolID]; !exists {
@@ -199,6 +202,9 @@ func (wire fakeScopeWire) unscoped() bool {
 }
 
 func (wire fakeScopeWire) scope() (KeyScope, error) {
+	if wire.unscoped() {
+		return KeyScope{All: true}, nil
+	}
 	if wire.GroupType != nil && *wire.GroupType != "anthropic" {
 		return KeyScope{}, fakeError(400, "invalid_group_type", "分组必须为 anthropic")
 	}

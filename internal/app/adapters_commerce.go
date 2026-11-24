@@ -183,7 +183,7 @@ func toOrderDTO(o order.Order) api.OrderDTO {
 		UserID:              o.UserID,
 	}
 	if o.FulfilError != nil {
-		dto.FulfilError = *o.FulfilError
+		dto.FulfilError = "订单暂未完成，请联系管理员。"
 	}
 	return dto
 }
@@ -229,7 +229,11 @@ func (a *orderAdapter) AdminList(ctx context.Context, status string, userID int6
 	}
 	out := make([]api.OrderDTO, 0, len(items))
 	for _, o := range items {
-		out = append(out, toOrderDTO(o))
+		item := toOrderDTO(o)
+		if o.FulfilError != nil {
+			item.FulfilError = *o.FulfilError
+		}
+		out = append(out, item)
 	}
 	return out, total, nil
 }

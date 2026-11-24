@@ -49,8 +49,16 @@ func newProvisioner(
 			usage:    use,
 			db:       db.DB,
 			settings: settings,
-			keyStats: client.KeyStats,
-			keyLogs:  client.UserRequestLogs,
+			keyStats: func(ctx context.Context, userID int64, id string) (vm2api.UsageBreakdown, error) {
+				unlock := prov.LockScope(userID)
+				defer unlock()
+				_, keys, err := prov.UserKeysLocked(ctx, userID)
+				if err != nil {
+					return vm2api.UsageBreakdown{}, err
+				}
+				return keys.KeyStats(ctx, id)
+			},
+			keyLogs: client.UserRequestLogs,
 		},
 		svc:   prov,
 		keys:  keysAndAdmin,

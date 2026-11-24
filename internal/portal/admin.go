@@ -59,8 +59,10 @@ func (service *Service) Dashboard(ctx context.Context) (api.AdminDashboardDTO, e
 	}
 	result.ScopeWarnings = api.ScopeWarningsDTO{CheckedAt: warnings.CheckedAt, Items: make([]api.ScopeWarningDTO, 0, len(warnings.Items))}
 	for _, item := range warnings.Items {
-		warning := api.ScopeWarningDTO{UserID: item.UserID, VMID: item.VMID, PoolID: item.PoolID, PoolName: item.PoolName, Message: item.Message}
-		_ = service.db.QueryRowContext(ctx, `SELECT email FROM users WHERE id=?`, item.UserID).Scan(&warning.UserEmail)
+		warning := api.ScopeWarningDTO{Kind: item.Kind, UserID: item.UserID, VMID: item.VMID, KeyID: item.KeyID, Message: item.Message}
+		if item.UserID != 0 {
+			_ = service.db.QueryRowContext(ctx, `SELECT email FROM users WHERE id=?`, item.UserID).Scan(&warning.UserEmail)
+		}
 		result.ScopeWarnings.Items = append(result.ScopeWarnings.Items, warning)
 	}
 	health, err := service.client.Ping(ctx)
@@ -87,7 +89,7 @@ func adminWindow(window *vm2api.Window) *api.WindowUsage {
 
 func (service *Service) RentalPool(ctx context.Context) ([]api.RentalPoolRowDTO, error) {
 	rows, err := service.db.QueryContext(ctx, `SELECT pool.vm_id,pool.tier,pool.status,
-		resource.user_id,COALESCE(user.email,''),pool.note,pool.selfcheck_state,pool.selfcheck_checked_at FROM rental_pool AS pool
+		resource.user_id,COALESCE(user.email,''),COALESCE(user.vm2api_user_id,''),pool.note,pool.selfcheck_state,pool.selfcheck_checked_at FROM rental_pool AS pool
 		LEFT JOIN resources AS resource ON resource.id=pool.leased_resource_id
 		LEFT JOIN users AS user ON user.id=resource.user_id ORDER BY pool.vm_id`)
 	if err != nil {
@@ -95,11 +97,12 @@ func (service *Service) RentalPool(ctx context.Context) ([]api.RentalPoolRowDTO,
 	}
 	defer rows.Close()
 	items := make([]api.RentalPoolRowDTO, 0)
+	tenantOwners := make(map[string]string)
 	for rows.Next() {
 		var item api.RentalPoolRowDTO
-		var state string
+		var state, owner string
 		var checkedAt sql.NullString
-		if err := rows.Scan(&item.VMID, &item.Tier, &item.Status, &item.LeasedToUserID, &item.LeasedToEmail, &item.Note, &state, &checkedAt); err != nil {
+		if err := rows.Scan(&item.VMID, &item.Tier, &item.Status, &item.LeasedToUserID, &item.LeasedToEmail, &owner, &item.Note, &state, &checkedAt); err != nil {
 			return nil, fmt.Errorf("读取租赁池账号失败: %w", err)
 		}
 		item.Selfcheck = &api.SelfcheckDTO{State: state}
@@ -107,6 +110,7 @@ func (service *Service) RentalPool(ctx context.Context) ([]api.RentalPoolRowDTO,
 			item.Selfcheck.CheckedAt = &checkedAt.String
 		}
 		items = append(items, item)
+		tenantOwners[item.VMID] = owner
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("读取租赁池失败: %w", err)
@@ -123,13 +127,25 @@ func (service *Service) RentalPool(ctx context.Context) ([]api.RentalPoolRowDTO,
 	for _, vm := range vms {
 		byID[vm.ID] = vm
 	}
-	// Best effort: the rows are still useful when the pool list is unavailable.
-	foreign, _ := service.provisioning.ForeignPoolVMs(ctx)
+	var names map[string]string
 	for index := range items {
-		if pool, held := foreign[items[index].VMID]; held {
-			items[index].ForeignPool = pool.Name
-		}
 		if vm, exists := byID[items[index].VMID]; exists {
+			if vm.OwnerUserID != "" && (items[index].Status != "leased" || vm.OwnerUserID != tenantOwners[vm.ID]) {
+				if names == nil {
+					users, err := service.client.ListUsers(ctx)
+					if err != nil {
+						return nil, fmt.Errorf("load upstream owner names: %w", err)
+					}
+					names = make(map[string]string, len(users))
+					for _, user := range users {
+						names[user.ID] = user.Username
+					}
+				}
+				items[index].OwnedBy = names[vm.OwnerUserID]
+				if items[index].OwnedBy == "" {
+					items[index].OwnedBy = vm.OwnerUserID
+				}
+			}
 			items[index].VM = &api.RentalVMDTO{
 				Label: vm.Label, EmailMasked: privacy.MaskEmail(vm.EmailMasked), CredStatus: vm.CredStatus,
 				ScheduleState: vm.ScheduleState, Tier: vm.Tier,
@@ -166,17 +182,12 @@ func (service *Service) RentalCandidates(ctx context.Context) ([]api.RentalCandi
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("读取已归属账号失败: %w", err)
 	}
-	foreign, err := service.provisioning.ForeignPoolVMs(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("获取上游账号池失败: %w", err)
-	}
 	items := make([]api.RentalCandidateDTO, 0)
 	for _, vm := range vms {
 		if adminRentable(vm) && !excluded[vm.ID] {
 			items = append(items, api.RentalCandidateDTO{
 				VMID: vm.ID, Label: vm.Label, EmailMasked: privacy.MaskEmail(vm.EmailMasked),
 				CredStatus: vm.CredStatus, ScheduleState: vm.ScheduleState, Tier: vm.Tier,
-				ForeignPool: foreign[vm.ID].Name,
 			})
 		}
 	}
@@ -205,17 +216,10 @@ func (service *Service) RentalAdd(ctx context.Context, vmIDs []string, note stri
 	for _, vm := range vms {
 		byID[vm.ID] = vm
 	}
-	foreign, err := service.provisioning.ForeignPoolVMs(ctx)
-	if err != nil {
-		return fmt.Errorf("获取上游账号池失败: %w", err)
-	}
 	for _, vmID := range vmIDs {
 		vm, exists := byID[vmID]
 		if !exists {
 			return adminError(http.StatusNotFound, "vm_not_found", "上游账号不存在")
-		}
-		if pool, held := foreign[vmID]; held {
-			return adminError(http.StatusConflict, "vm_in_foreign_pool", fmt.Sprintf("账号 %s 在 vm2api 账号池「%s」里，租出后无法放进用户的账号池；请先在 vm2api 面板把它移出该账号池", vmID, pool.Name))
 		}
 		if !adminRentable(vm) {
 			return adminError(http.StatusConflict, "vm_not_available", "账号已归属用户或不符合入池条件")
@@ -435,15 +439,20 @@ func (service *Service) GrantSubscription(ctx context.Context, adminID, userID i
 	if err != nil {
 		return fmt.Errorf("生成赠送订单号失败: %w", err)
 	}
+	if kind == "rental_account" {
+		available, err := service.provisioning.RentalStock(ctx)
+		if err != nil {
+			return fmt.Errorf("查询租赁库存失败: %w", err)
+		}
+		if available < quantity {
+			return adminError(http.StatusConflict, "out_of_stock", "租赁池可用账号不足，无法赠送")
+		}
+	}
 	tx, err := service.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("开始赠送事务失败: %w", err)
 	}
 	defer tx.Rollback()
-	stock, err := service.rentalStock(ctx, kind, quantity)
-	if err != nil {
-		return err
-	}
 	stamp := store.FmtTime(now)
 	_, err = tx.ExecContext(ctx, `INSERT INTO products(kind,name,unit_quantity,duration_days,price_cents,
 		currency,min_qty,max_qty,enabled,created_at,updated_at)
@@ -497,28 +506,12 @@ func (service *Service) GrantSubscription(ctx context.Context, adminID, userID i
 	// A granted rental subscription entitles the user to real accounts: assign
 	// them now, after the entitlement rows are committed. Failing here leaves a
 	// subscription without stock, so the error is returned rather than swallowed.
-	if kind == "rental_account" && stock {
+	if kind == "rental_account" {
 		if err := service.provisioning.AllocateRental(ctx, subscriptionID); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// rentalStock verifies a rental grant can be honoured before anything is
-// written. It returns whether an allocation is needed at all.
-func (service *Service) rentalStock(ctx context.Context, kind string, quantity int) (bool, error) {
-	if kind != "rental_account" {
-		return false, nil
-	}
-	var available int
-	if err := service.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM rental_pool WHERE status='available' AND selfcheck_state='pass'`).Scan(&available); err != nil {
-		return false, fmt.Errorf("查询租赁库存失败: %w", err)
-	}
-	if available < quantity {
-		return false, adminError(http.StatusConflict, "out_of_stock", "租赁池可用账号不足，无法赠送")
-	}
-	return true, nil
 }
 
 func (service *Service) PatchSubscription(ctx context.Context, id int64, expiresAt *string, status string) error {

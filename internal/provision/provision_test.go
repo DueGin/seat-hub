@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/DueGin/seat-hub/internal/privacy"
+	"github.com/DueGin/seat-hub/internal/secret"
 	"github.com/DueGin/seat-hub/internal/store"
 	"github.com/DueGin/seat-hub/internal/vm2api"
 )
@@ -35,7 +36,7 @@ func provisionFixture(t *testing.T) (*Service, *vm2api.Fake, int64) {
 		t.Fatal(err)
 	}
 	now := timestamp(time.Now())
-	result, err := database.Exec(`INSERT INTO users(email,password_hash,vm2api_user_id,created_at,updated_at) VALUES ('tenant@example.com','hash',?,?,?)`, owner.ID, now, now)
+	result, err := database.Exec(`INSERT INTO users(email,password_hash,vm2api_user_id,vm2api_username,created_at,updated_at) VALUES ('tenant@example.com','hash',?,?,?,?)`, owner.ID, owner.Username, now, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,6 +45,10 @@ func provisionFixture(t *testing.T) (*Service, *vm2api.Fake, int64) {
 		t.Fatal(err)
 	}
 	service := New(database, fake)
+	service.Box, err = secret.New("test-key-0123456789abcdef-0123456789abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
 	return service, fake, userID
 }
 
@@ -126,7 +131,7 @@ func TestProvisionEntitlementsAndConcurrency(t *testing.T) {
 	if entitlements.Concurrency.Total != 16 || entitlements.HostedSeats.Used != 2 || entitlements.AccountsActive != 2 {
 		t.Fatalf("entitlements = %+v", entitlements)
 	}
-	owner, err := service.ServiceUser(ctx)
+	owner, err := service.EnsureUpstreamUser(ctx, userID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +139,7 @@ func TestProvisionEntitlementsAndConcurrency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "main", UserID: owner, Scope: scope})
+	key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "main", UserID: owner, Scope: *scope})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,9 +422,9 @@ func TestProvisionConcurrentHostedSeat(t *testing.T) {
 	}
 }
 
-func TestProvisionConcurrentServiceUser(t *testing.T) {
+func TestProvisionConcurrentTenantUser(t *testing.T) {
 	service, fake, userID := provisionFixture(t)
-	if _, err := service.db.Exec(`UPDATE users SET vm2api_user_id=NULL WHERE id=?`, userID); err != nil {
+	if _, err := service.db.Exec(`UPDATE users SET vm2api_user_id=NULL,vm2api_username=NULL WHERE id=?`, userID); err != nil {
 		t.Fatal(err)
 	}
 	var group sync.WaitGroup
@@ -429,7 +434,7 @@ func TestProvisionConcurrentServiceUser(t *testing.T) {
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			owner, err := service.ServiceUser(context.Background())
+			owner, err := service.EnsureUpstreamUser(context.Background(), userID)
 			results <- owner
 			failures <- err
 		}()
@@ -454,7 +459,7 @@ func TestProvisionConcurrentServiceUser(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := fake.CreateKey(context.Background(), vm2api.CreateKeyInput{Name: "check", UserID: owner, Scope: scope}); err != nil {
+		if _, err := fake.CreateKey(context.Background(), vm2api.CreateKeyInput{Name: "check", UserID: owner, Scope: *scope}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -730,7 +735,7 @@ func TestProvisionRentalCleanupFailureQuarantinesStock(t *testing.T) {
 	if err := service.db.QueryRow(`SELECT COUNT(*) FROM rental_pool WHERE status='maintenance'`).Scan(&maintenance); err != nil {
 		t.Fatal(err)
 	}
-	if maintenance != 2 {
+	if maintenance != 1 {
 		t.Fatalf("maintenance=%d", maintenance)
 	}
 }
@@ -793,7 +798,7 @@ func TestProvisionAuthLinkRequiresOwnerAndProxy(t *testing.T) {
 func TestProvisionSyncConcurrencyNeverWritesZero(t *testing.T) {
 	service, fake, userID := provisionFixture(t)
 	ctx := context.Background()
-	owner, err := service.ServiceUser(ctx)
+	owner, err := service.EnsureUpstreamUser(ctx, userID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -801,7 +806,7 @@ func TestProvisionSyncConcurrencyNeverWritesZero(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "zero", UserID: owner, Scope: scope})
+	key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "zero", UserID: owner, Scope: *scope})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -836,7 +841,14 @@ type failingSyncClient struct {
 	vm2api.Client
 }
 
-func (client *failingSyncClient) UpdateKey(ctx context.Context, keyID string, in vm2api.UpdateKeyInput) error {
+type failingKeySync struct{ vm2api.KeyClient }
+
+func (client *failingSyncClient) ForUser(ctx context.Context, id, name, password string) (vm2api.KeyClient, error) {
+	keys, err := client.Client.ForUser(ctx, id, name, password)
+	return failingKeySync{keys}, err
+}
+
+func (failingKeySync) UpdateKey(ctx context.Context, keyID string, in vm2api.UpdateKeyInput) error {
 	return errors.New("upstream key unavailable")
 }
 
@@ -854,7 +866,7 @@ func TestProvisionSweepIsolatesUserFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, userID := range []int64{first, second} {
-		owner, err := service.ServiceUser(ctx)
+		owner, err := service.EnsureUpstreamUser(ctx, userID)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -862,7 +874,7 @@ func TestProvisionSweepIsolatesUserFailures(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "k", UserID: owner, Scope: scope})
+		key, err := fake.CreateKey(ctx, vm2api.CreateKeyInput{Name: "k", UserID: owner, Scope: *scope})
 		if err != nil {
 			t.Fatal(err)
 		}
